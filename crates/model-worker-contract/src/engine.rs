@@ -1,4 +1,9 @@
-use crate::{ContractError, ExecutionProvider, Identifier, SanitizedText, Sha256Digest};
+use core::fmt;
+use std::sync::Arc;
+
+use crate::{
+    ContractError, ExecutionProvider, Identifier, LanguageCode, SanitizedText, Sha256Digest,
+};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct JobKey {
@@ -116,13 +121,92 @@ pub enum SampleFormat {
 }
 
 impl SampleFormat {
-    const fn bytes_per_sample(self) -> u64 {
+    pub const fn bytes_per_sample(self) -> u64 {
         match self {
             Self::PcmS16Le => 2,
             Self::PcmF32Le => 4,
         }
     }
 }
+
+#[derive(Clone)]
+pub enum AudioPayload {
+    PcmS16Le(Arc<[i16]>),
+    PcmF32Le(Arc<[f32]>),
+}
+
+impl AudioPayload {
+    #[must_use]
+    pub const fn sample_format(&self) -> SampleFormat {
+        match self {
+            Self::PcmS16Le(_) => SampleFormat::PcmS16Le,
+            Self::PcmF32Le(_) => SampleFormat::PcmF32Le,
+        }
+    }
+
+    #[must_use]
+    pub fn sample_count(&self) -> usize {
+        match self {
+            Self::PcmS16Le(samples) => samples.len(),
+            Self::PcmF32Le(samples) => samples.len(),
+        }
+    }
+
+    pub fn payload_bytes(&self) -> Result<u64, ContractError> {
+        u64::try_from(self.sample_count())
+            .ok()
+            .and_then(|samples| samples.checked_mul(self.sample_format().bytes_per_sample()))
+            .ok_or(ContractError::AudioPayloadLengthMismatch)
+    }
+
+    #[must_use]
+    pub fn pcm_s16_le(&self) -> Option<&[i16]> {
+        match self {
+            Self::PcmS16Le(samples) => Some(samples),
+            Self::PcmF32Le(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn pcm_f32_le(&self) -> Option<&[f32]> {
+        match self {
+            Self::PcmS16Le(_) => None,
+            Self::PcmF32Le(samples) => Some(samples),
+        }
+    }
+}
+
+impl fmt::Debug for AudioPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(match self {
+                Self::PcmS16Le(_) => "PcmS16Le",
+                Self::PcmF32Le(_) => "PcmF32Le",
+            })
+            .field("sample_count", &self.sample_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AudioPayload {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PcmS16Le(left), Self::PcmS16Le(right)) => left == right,
+            (Self::PcmF32Le(left), Self::PcmF32Le(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right.iter())
+                        .all(|(left, right)| left.to_bits() == right.to_bits())
+            }
+            (Self::PcmS16Le(_), Self::PcmF32Le(_)) | (Self::PcmF32Le(_), Self::PcmS16Le(_)) => {
+                false
+            }
+        }
+    }
+}
+
+impl Eq for AudioPayload {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioFormat {
@@ -152,6 +236,8 @@ pub struct AudioChunk {
     pub capture_epoch_ids: Vec<Identifier>,
     pub source_ranges: Vec<SourceRange>,
     pub payload_bytes: u64,
+    pub payload_sha256: Option<Sha256Digest>,
+    pub payload: Option<AudioPayload>,
 }
 
 impl AudioChunk {
@@ -174,6 +260,22 @@ impl AudioChunk {
         }
         if self.payload_bytes > max_audio_chunk_bytes {
             return Err(ContractError::AudioChunkTooLarge);
+        }
+        let payload_sha256 = self
+            .payload_sha256
+            .ok_or(ContractError::MissingAudioPayloadDigest)?;
+        if payload_sha256.is_zero() {
+            return Err(ContractError::InvalidAudioPayloadDigest);
+        }
+        let payload = self
+            .payload
+            .as_ref()
+            .ok_or(ContractError::MissingAudioPayload)?;
+        if payload.sample_format() != self.format.sample_format {
+            return Err(ContractError::AudioPayloadTypeMismatch);
+        }
+        if payload.payload_bytes()? != self.payload_bytes {
+            return Err(ContractError::AudioPayloadLengthMismatch);
         }
         if self.media_end_sample <= self.media_start_sample {
             return Err(ContractError::InvalidMediaRange);
@@ -231,6 +333,33 @@ impl AudioChunk {
             return Err(ContractError::InvalidSourceRange);
         }
         Ok(())
+    }
+
+    fn replay_snapshot(&self) -> Self {
+        Self {
+            sequence: self.sequence,
+            media_start_sample: self.media_start_sample,
+            media_end_sample: self.media_end_sample,
+            timeline_rate: self.timeline_rate,
+            format: self.format,
+            capture_epoch_ids: self.capture_epoch_ids.clone(),
+            source_ranges: self.source_ranges.clone(),
+            payload_bytes: self.payload_bytes,
+            payload_sha256: self.payload_sha256,
+            payload: None,
+        }
+    }
+
+    fn semantically_eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence
+            && self.media_start_sample == other.media_start_sample
+            && self.media_end_sample == other.media_end_sample
+            && self.timeline_rate == other.timeline_rate
+            && self.format == other.format
+            && self.capture_epoch_ids == other.capture_epoch_ids
+            && self.source_ranges == other.source_ranges
+            && self.payload_bytes == other.payload_bytes
+            && self.payload_sha256 == other.payload_sha256
     }
 
     pub(crate) fn validate_metadata_bounds(
@@ -457,6 +586,377 @@ impl StableWorkerError {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct TranscriptText(String);
+
+impl TranscriptText {
+    pub const MAX_BYTES: usize = 1_048_576;
+
+    pub fn new(value: &str) -> Result<Self, ContractError> {
+        if value.is_empty() || value.len() > Self::MAX_BYTES {
+            return Err(ContractError::InvalidTranscriptText);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for TranscriptText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TranscriptText")
+            .field("byte_len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FixedPointConfidence(u32);
+
+impl FixedPointConfidence {
+    pub const PARTS_PER_MILLION: u32 = 1_000_000;
+
+    pub const fn from_parts_per_million(value: u32) -> Result<Self, ContractError> {
+        if value <= Self::PARTS_PER_MILLION {
+            Ok(Self(value))
+        } else {
+            Err(ContractError::InvalidConfidence)
+        }
+    }
+
+    #[must_use]
+    pub const fn parts_per_million(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptProvenance {
+    pub engine_id: Identifier,
+    pub engine_version: Identifier,
+    pub runtime_id: Identifier,
+    pub runtime_version: Identifier,
+    pub runtime_sha256: Sha256Digest,
+    pub package_lock_sha256: Sha256Digest,
+    pub model_id: Identifier,
+    pub model_sha256: Sha256Digest,
+    pub model_manifest_sha256: Sha256Digest,
+    pub parameter_sha256: Sha256Digest,
+    pub execution_provider: ExecutionProvider,
+    pub quantization: Identifier,
+}
+
+impl TranscriptProvenance {
+    #[must_use]
+    pub fn from_descriptor(descriptor: &crate::EngineDescriptor) -> Self {
+        Self {
+            engine_id: descriptor.engine_id.clone(),
+            engine_version: descriptor.engine_version.clone(),
+            runtime_id: descriptor.runtime_id.clone(),
+            runtime_version: descriptor.runtime_version.clone(),
+            runtime_sha256: descriptor.runtime_sha256,
+            package_lock_sha256: descriptor.package_lock_sha256,
+            model_id: descriptor.model_id.clone(),
+            model_sha256: descriptor.model_sha256,
+            model_manifest_sha256: descriptor.model_manifest_sha256,
+            parameter_sha256: descriptor.parameter_sha256,
+            execution_provider: descriptor.execution_provider,
+            quantization: descriptor.quantization.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptResult {
+    pub original_transcript: TranscriptText,
+    pub raw_language: SanitizedText,
+    pub normalized_language: LanguageCode,
+    pub confidence: Option<FixedPointConfidence>,
+    pub provenance: TranscriptProvenance,
+}
+
+impl TranscriptResult {
+    pub(crate) fn validate_against(
+        &self,
+        descriptor: &crate::EngineDescriptor,
+        limits: crate::WorkerLimits,
+    ) -> Result<(), ContractError> {
+        let provenance = &self.provenance;
+        if provenance.engine_id != descriptor.engine_id
+            || provenance.engine_version != descriptor.engine_version
+            || provenance.runtime_id != descriptor.runtime_id
+            || provenance.runtime_version != descriptor.runtime_version
+            || provenance.runtime_sha256 != descriptor.runtime_sha256
+            || provenance.package_lock_sha256 != descriptor.package_lock_sha256
+            || provenance.model_id != descriptor.model_id
+            || provenance.model_sha256 != descriptor.model_sha256
+            || provenance.model_manifest_sha256 != descriptor.model_manifest_sha256
+            || provenance.parameter_sha256 != descriptor.parameter_sha256
+            || provenance.execution_provider != descriptor.execution_provider
+            || provenance.quantization != descriptor.quantization
+            || descriptor
+                .languages
+                .binary_search(&self.normalized_language)
+                .is_err()
+        {
+            return Err(ContractError::InvalidBackendOutcome);
+        }
+        if self.response_allocation_budget_bytes()? > limits.max_control_message_bytes {
+            return Err(ContractError::ControlMessageTooLarge);
+        }
+        Ok(())
+    }
+
+    fn response_allocation_budget_bytes(&self) -> Result<u64, ContractError> {
+        // Worst-case response-envelope identifiers, numeric fields, enum tags,
+        // optional confidence, and fixed digest storage. Variable result fields
+        // are then added exactly without claiming a wire encoding.
+        let mut bytes = 1_024_u64;
+        add_bytes(
+            &mut bytes,
+            u64::try_from(self.original_transcript.as_str().len())
+                .map_err(|_| ContractError::ControlMessageTooLarge)?,
+        )?;
+        add_bytes(
+            &mut bytes,
+            u64::try_from(self.raw_language.as_str().len())
+                .map_err(|_| ContractError::ControlMessageTooLarge)?,
+        )?;
+        add_bytes(
+            &mut bytes,
+            u64::try_from(self.normalized_language.as_str().len())
+                .map_err(|_| ContractError::ControlMessageTooLarge)?,
+        )?;
+        for identifier in [
+            &self.provenance.engine_id,
+            &self.provenance.engine_version,
+            &self.provenance.runtime_id,
+            &self.provenance.runtime_version,
+            &self.provenance.model_id,
+            &self.provenance.quantization,
+        ] {
+            add_identifier_bytes(&mut bytes, identifier)?;
+        }
+        add_bytes(&mut bytes, 5 * 32)?;
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendFailure {
+    pub code: Identifier,
+    pub retryable: bool,
+    pub sanitized_detail: Option<SanitizedText>,
+}
+
+impl BackendFailure {
+    #[must_use]
+    pub const fn new(
+        code: Identifier,
+        retryable: bool,
+        sanitized_detail: Option<SanitizedText>,
+    ) -> Self {
+        Self {
+            code,
+            retryable,
+            sanitized_detail,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BackendActionToken(u64);
+
+#[derive(Debug, Eq, PartialEq)]
+struct BackendAudioIdentity {
+    sequence: u64,
+    format: AudioFormat,
+    payload_bytes: u64,
+    payload_sha256: Sha256Digest,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BackendBinding {
+    token: BackendActionToken,
+    delivery_session_epoch: Identifier,
+    job: JobKey,
+    message_id: Identifier,
+    message_sequence: u64,
+    audio: Vec<BackendAudioIdentity>,
+}
+
+impl BackendBinding {
+    fn stamp_outcome(&self) -> Self {
+        Self {
+            token: BackendActionToken(self.token.0),
+            delivery_session_epoch: self.delivery_session_epoch.clone(),
+            job: self.job.clone(),
+            message_id: self.message_id.clone(),
+            message_sequence: self.message_sequence,
+            audio: self
+                .audio
+                .iter()
+                .map(|identity| BackendAudioIdentity {
+                    sequence: identity.sequence,
+                    format: identity.format,
+                    payload_bytes: identity.payload_bytes,
+                    payload_sha256: identity.payload_sha256,
+                })
+                .collect(),
+        }
+    }
+}
+
+pub struct BackendAction {
+    binding: BackendBinding,
+    audio_chunks: Vec<AudioChunk>,
+}
+
+impl BackendAction {
+    pub(crate) fn new(
+        token: u64,
+        delivery_session_epoch: Identifier,
+        job: JobKey,
+        message_id: Identifier,
+        message_sequence: u64,
+        audio_chunks: Vec<AudioChunk>,
+    ) -> Result<Self, ContractError> {
+        if token == 0 || message_sequence == 0 || audio_chunks.is_empty() {
+            return Err(ContractError::InvalidBackendAction);
+        }
+        let mut audio = Vec::with_capacity(audio_chunks.len());
+        for chunk in &audio_chunks {
+            let payload_sha256 = chunk
+                .payload_sha256
+                .ok_or(ContractError::InvalidBackendAction)?;
+            let payload = chunk
+                .payload
+                .as_ref()
+                .ok_or(ContractError::InvalidBackendAction)?;
+            if payload_sha256.is_zero()
+                || payload.sample_format() != chunk.format.sample_format
+                || payload.payload_bytes()? != chunk.payload_bytes
+            {
+                return Err(ContractError::InvalidBackendAction);
+            }
+            audio.push(BackendAudioIdentity {
+                sequence: chunk.sequence,
+                format: chunk.format,
+                payload_bytes: chunk.payload_bytes,
+                payload_sha256,
+            });
+        }
+        Ok(Self {
+            binding: BackendBinding {
+                token: BackendActionToken(token),
+                delivery_session_epoch,
+                job,
+                message_id,
+                message_sequence,
+                audio,
+            },
+            audio_chunks,
+        })
+    }
+
+    #[must_use]
+    pub fn job(&self) -> &JobKey {
+        &self.binding.job
+    }
+
+    #[must_use]
+    pub fn delivery_session_epoch(&self) -> &Identifier {
+        &self.binding.delivery_session_epoch
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> &Identifier {
+        &self.binding.message_id
+    }
+
+    #[must_use]
+    pub const fn message_sequence(&self) -> u64 {
+        self.binding.message_sequence
+    }
+
+    #[must_use]
+    pub fn audio_chunks(&self) -> &[AudioChunk] {
+        &self.audio_chunks
+    }
+
+    #[must_use]
+    pub fn completed(&self, result: TranscriptResult) -> BackendOutcome {
+        BackendOutcome {
+            binding: self.binding.stamp_outcome(),
+            payload: BackendOutcomePayload::Completed(Box::new(result)),
+        }
+    }
+
+    #[must_use]
+    pub fn failed(&self, failure: BackendFailure) -> BackendOutcome {
+        BackendOutcome {
+            binding: self.binding.stamp_outcome(),
+            payload: BackendOutcomePayload::Failed(failure),
+        }
+    }
+}
+
+impl fmt::Debug for BackendAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendAction")
+            .field(
+                "delivery_session_epoch",
+                &self.binding.delivery_session_epoch,
+            )
+            .field("job", &self.binding.job)
+            .field("message_id", &self.binding.message_id)
+            .field("message_sequence", &self.binding.message_sequence)
+            .field("audio", &self.binding.audio)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BackendOutcomePayload {
+    Completed(Box<TranscriptResult>),
+    Failed(BackendFailure),
+}
+
+pub struct BackendOutcome {
+    binding: BackendBinding,
+    payload: BackendOutcomePayload,
+}
+
+impl BackendOutcome {
+    pub(crate) fn resolve(
+        self,
+        action: BackendAction,
+    ) -> Result<BackendOutcomePayload, ContractError> {
+        if self.binding != action.binding {
+            return Err(ContractError::BackendOutcomeBindingMismatch);
+        }
+        Ok(self.payload)
+    }
+}
+
+impl fmt::Debug for BackendOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendOutcome")
+            .field("payload", &self.payload)
+            .finish_non_exhaustive()
+    }
+}
+
+pub trait ModelBackend: Send {
+    fn execute(&mut self, action: &BackendAction) -> BackendOutcome;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerCommand {
     Describe,
@@ -588,6 +1088,7 @@ pub enum WorkerEvent {
     Final {
         segment_id: Identifier,
         last_audio_sequence: u64,
+        result: TranscriptResult,
     },
     Failure {
         segment_id: Identifier,
@@ -666,7 +1167,24 @@ impl WorkerRequest {
             && self.context.segment_id == other.context.segment_id
             && self.context.cancel_scope_id == other.context.cancel_scope_id
             && self.context.deadline.clock_domain_id == other.context.deadline.clock_domain_id
-            && self.command == other.command
+            && match (&self.command, &other.command) {
+                (WorkerCommand::AcceptAudio(left), WorkerCommand::AcceptAudio(right)) => {
+                    left.semantically_eq(right)
+                }
+                _ => self.command == other.command,
+            }
+    }
+
+    pub(crate) fn replay_snapshot(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            command: match &self.command {
+                WorkerCommand::AcceptAudio(chunk) => {
+                    WorkerCommand::AcceptAudio(chunk.replay_snapshot())
+                }
+                command => command.clone(),
+            },
+        }
     }
 
     pub(crate) fn validate_static(
@@ -1044,11 +1562,13 @@ impl WorkerResponse {
                 WorkerEvent::Final {
                     segment_id,
                     last_audio_sequence,
+                    result,
                 },
             ) => {
                 self.has_job_target()
                     && *last_audio_sequence != 0
                     && self.segment_id.as_ref() == Some(segment_id)
+                    && result.validate_against(expected_descriptor, limits).is_ok()
             }
             (WorkerCommand::FlushSegment, WorkerEvent::Failure { segment_id, error }) => {
                 self.valid_failure(segment_id, error)

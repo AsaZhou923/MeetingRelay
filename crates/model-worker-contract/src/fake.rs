@@ -1,15 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine::RequestValidation;
+use crate::engine::{AudioPayload, BackendOutcomePayload, RequestValidation};
 use crate::{
-    Architecture, AudioChunk, AudioFormat, AudioGap, AudioSource, CancelReason, CancelTarget,
-    Cancellation, CapabilitySet, ContractError, ContractPurpose, ErrorCategory, ErrorSeverity,
-    HelloRequest, HelloResponse, Identifier, JobKey, MinorExtensionPolicy, MonotonicDeadline,
-    NetworkPolicy, NotCancellableReason, OperatingSystem, Platform, PrepareRequest, RecoveryAction,
-    ReplayJobState, RequestContext, ResourceEstimate, SampleFormat, SourceRange, StableWorkerError,
-    StableWorkerErrorSpec, TransportKind, WORKER_PROTOCOL_V1, WorkerCommand, WorkerEvent,
-    WorkerLimits, WorkerManifest, WorkerRequest, WorkerResponse, WorkerRole,
+    Architecture, AudioChunk, AudioFormat, AudioGap, AudioSource, BackendAction, BackendFailure,
+    BackendOutcome, CancelReason, CancelTarget, Cancellation, CapabilitySet, ContractError,
+    ContractPurpose, EngineDescriptor, ErrorCategory, ErrorSeverity, FixedPointConfidence,
+    HelloRequest, HelloResponse, Identifier, JobKey, MinorExtensionPolicy, ModelBackend,
+    MonotonicDeadline, NetworkPolicy, NotCancellableReason, OperatingSystem, Platform,
+    PrepareRequest, RecoveryAction, ReplayJobState, RequestContext, ResourceEstimate, SampleFormat,
+    SanitizedText, SourceRange, StableWorkerError, StableWorkerErrorSpec, TranscriptProvenance,
+    TranscriptResult, TranscriptText, TransportKind, WORKER_PROTOCOL_V1, WorkerCommand,
+    WorkerEvent, WorkerLimits, WorkerManifest, WorkerRequest, WorkerResponse, WorkerRole,
 };
 
 pub const DEFAULT_FAKE_CLOCK_DOMAIN_ID: &str = "core-fixture-clock";
@@ -17,6 +21,64 @@ const DELIVERY_SESSION_EPOCH_PREFIX: &str = "fixture-delivery-session";
 static NEXT_DELIVERY_SESSION_EPOCH: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_NOW_NS: u64 = 100;
 const DEFAULT_DEADLINE_NS: u64 = 10_000;
+
+#[derive(Debug)]
+struct DeterministicFakeBackend {
+    descriptor: EngineDescriptor,
+}
+
+impl DeterministicFakeBackend {
+    fn new(descriptor: &EngineDescriptor) -> Self {
+        Self {
+            descriptor: descriptor.clone(),
+        }
+    }
+
+    fn contract_failure(action: &BackendAction) -> BackendOutcome {
+        action.failed(BackendFailure::new(
+            Identifier::new("FIXTURE_BACKEND_CONTRACT")
+                .expect("fixture backend error identifier is constant-valid"),
+            false,
+            None,
+        ))
+    }
+}
+
+impl ModelBackend for DeterministicFakeBackend {
+    fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
+        let Some(language) = self.descriptor.languages.first().cloned() else {
+            return Self::contract_failure(action);
+        };
+        let Some(last_chunk) = action.audio_chunks().last() else {
+            return Self::contract_failure(action);
+        };
+        let Some(payload_sha256) = last_chunk.payload_sha256 else {
+            return Self::contract_failure(action);
+        };
+        let digest = payload_sha256.to_lower_hex();
+        let transcript = format!(
+            "fixture transcript {} {}",
+            action.job().segment_id,
+            &digest[..16]
+        );
+        let Ok(original_transcript) = TranscriptText::new(&transcript) else {
+            return Self::contract_failure(action);
+        };
+        let Ok(raw_language) = SanitizedText::new(language.as_str()) else {
+            return Self::contract_failure(action);
+        };
+        let Ok(confidence) = FixedPointConfidence::from_parts_per_million(1_000_000) else {
+            return Self::contract_failure(action);
+        };
+        action.completed(TranscriptResult {
+            original_transcript,
+            raw_language,
+            normalized_language: language,
+            confidence: Some(confidence),
+            provenance: TranscriptProvenance::from_descriptor(&self.descriptor),
+        })
+    }
+}
 
 pub trait WorkerEndpoint {
     fn handshake(&mut self, request: HelloRequest) -> Result<HelloResponse, ContractError>;
@@ -48,13 +110,14 @@ enum ShutdownState {
     Complete,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct JobState {
     last_stream_sequence: Option<u64>,
     last_real_audio_sequence: Option<u64>,
     last_media_end_sample: Option<u64>,
     last_progress_sequence: Option<u64>,
     pending_progress: VecDeque<PendingProgress>,
+    pending_audio: Vec<AudioChunk>,
     terminal: Option<JobTerminal>,
 }
 
@@ -157,8 +220,13 @@ impl DeliveryLedger {
             .checked_add(1)
             .ok_or(ContractError::QueueInvariant)?;
         self.order.push_back(sequence);
-        self.entries
-            .insert(sequence, ReplayEntry { request, outcome });
+        self.entries.insert(
+            sequence,
+            ReplayEntry {
+                request: request.replay_snapshot(),
+                outcome,
+            },
+        );
         while self.order.len() > self.capacity {
             let expired = self
                 .order
@@ -173,7 +241,7 @@ impl DeliveryLedger {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct FakeWorker {
     manifest: WorkerManifest,
     limits: WorkerLimits,
@@ -189,6 +257,8 @@ struct FakeWorker {
     progress_sequence: u64,
     restart_count: u32,
     response_sequence: u64,
+    next_backend_token: u64,
+    pending_audio_bytes: u64,
     shutdown_state: ShutdownState,
 }
 
@@ -215,6 +285,8 @@ impl FakeWorker {
             progress_sequence: 0,
             restart_count: 0,
             response_sequence: 0,
+            next_backend_token: 0,
+            pending_audio_bytes: 0,
             shutdown_state: ShutdownState::Running,
         })
     }
@@ -256,7 +328,96 @@ impl FakeWorker {
         {
             return Err(ContractError::JobIdentityRetired);
         }
+        if let WorkerCommand::AcceptAudio(chunk) = &request.command {
+            self.pending_audio_bytes
+                .checked_add(chunk.payload_bytes)
+                .filter(|bytes| *bytes <= self.limits.max_pending_audio_bytes)
+                .ok_or(ContractError::PendingAudioCreditExhausted)?;
+        }
         Ok(())
+    }
+
+    fn required_delivery_units(&self, request: &WorkerRequest) -> Result<usize, ContractError> {
+        match &request.command {
+            WorkerCommand::Cancel { .. } => self.cancel_delivery_units(&request.cancellation()?),
+            WorkerCommand::Restart => {
+                if !self.pending_replay.is_empty() {
+                    return Err(ContractError::ReplayBatchPending);
+                }
+                self.restart_count
+                    .checked_add(1)
+                    .ok_or(ContractError::QueueInvariant)?;
+                let jobs = self.jobs.len();
+                let batch = jobs.min(self.limits.max_replay_events_per_batch as usize);
+                Ok(batch + usize::from(jobs > batch) + 1)
+            }
+            WorkerCommand::Shutdown => {
+                if !self.pending_replay.is_empty() {
+                    return Err(ContractError::ReplayBatchPending);
+                }
+                let batch = self
+                    .jobs
+                    .len()
+                    .min(self.limits.max_replay_events_per_batch as usize);
+                Ok(batch + 1)
+            }
+            WorkerCommand::PollReplay => {
+                let pending = self.pending_replay.len();
+                let batch = pending.min(self.limits.max_replay_events_per_batch as usize);
+                let has_status = pending > batch;
+                let completes_shutdown = !has_status
+                    && pending == batch
+                    && self.shutdown_state == ShutdownState::Draining;
+                Ok((batch + usize::from(has_status || completes_shutdown)).max(1))
+            }
+            _ => Ok(1),
+        }
+    }
+
+    fn cancel_delivery_units(&self, cancellation: &Cancellation) -> Result<usize, ContractError> {
+        if !self.prepared {
+            return Err(ContractError::NotPrepared);
+        }
+        if let Some(existing) = self.cancellations.get(&cancellation.scope_id) {
+            if existing.target != cancellation.target || existing.reason != cancellation.reason {
+                return Err(ContractError::CancelScopeConflict);
+            }
+            return Ok(existing.events.len().max(1));
+        }
+        if self.cancellations.len() >= self.limits.max_cancellation_scopes as usize {
+            return Err(ContractError::CancellationRegistryFull);
+        }
+        match &cancellation.target {
+            CancelTarget::Job(job) => {
+                self.ensure_job_capacity(job)?;
+                Ok(
+                    match self.jobs.get(job).and_then(|state| state.terminal.as_ref()) {
+                        Some(
+                            JobTerminal::Final
+                            | JobTerminal::Failure
+                            | JobTerminal::Cancelled { .. },
+                        ) => 1,
+                        None => 2,
+                    },
+                )
+            }
+            CancelTarget::Meeting(meeting_id) => {
+                let jobs = self
+                    .jobs
+                    .iter()
+                    .filter(|(job, state)| {
+                        &job.meeting_id == meeting_id && state.terminal.is_none()
+                    })
+                    .count();
+                if jobs > self.limits.max_cancel_jobs_per_batch as usize {
+                    return Err(ContractError::CancellationBatchTooLarge);
+                }
+                if jobs == 0 {
+                    return Err(ContractError::NoActiveJobs);
+                }
+                jobs.checked_mul(2).ok_or(ContractError::QueueInvariant)
+            }
+        }
     }
 
     fn process(
@@ -338,6 +499,11 @@ impl FakeWorker {
             self.limits.max_capture_epochs_per_chunk,
             self.limits.max_source_ranges_per_chunk,
         )?;
+        let next_pending_audio_bytes = self
+            .pending_audio_bytes
+            .checked_add(chunk.payload_bytes)
+            .filter(|bytes| *bytes <= self.limits.max_pending_audio_bytes)
+            .ok_or(ContractError::PendingAudioCreditExhausted)?;
         let first_progress = self
             .progress_sequence
             .checked_add(1)
@@ -350,6 +516,8 @@ impl FakeWorker {
         state.last_stream_sequence = Some(chunk.sequence);
         state.last_real_audio_sequence = Some(chunk.sequence);
         state.last_media_end_sample = Some(chunk.media_end_sample);
+        state.pending_audio.push(chunk.clone());
+        self.pending_audio_bytes = next_pending_audio_bytes;
         for progress_sequence in [first_progress, second_progress] {
             while state.pending_progress.len() >= self.limits.max_pending_progress_per_job as usize
             {
@@ -438,13 +606,10 @@ impl FakeWorker {
             None => {}
         }
 
-        if let Some(last_audio_sequence) = state.last_real_audio_sequence {
-            state.pending_progress.clear();
-            state.terminal = Some(JobTerminal::Final);
-            return Ok(vec![WorkerEvent::Final {
-                segment_id: key.segment_id,
-                last_audio_sequence,
-            }]);
+        if state.last_real_audio_sequence.is_some() {
+            // Audio-bearing flushes are admitted as a non-cloneable backend action
+            // by the transport before this synchronous control path is reached.
+            return Err(ContractError::QueueInvariant);
         }
 
         let error = StableWorkerError::try_from_spec(StableWorkerErrorSpec {
@@ -466,6 +631,175 @@ impl FakeWorker {
             segment_id: key.segment_id,
             error,
         }])
+    }
+
+    fn begin_backend_action(
+        &mut self,
+        request: &WorkerRequest,
+    ) -> Result<Option<BackendAction>, ContractError> {
+        if !matches!(request.command, WorkerCommand::FlushSegment) {
+            return Ok(None);
+        }
+        self.preflight(request)?;
+        if !self.prepared {
+            return Err(ContractError::NotPrepared);
+        }
+        let key = request.context.job_key()?;
+        self.ensure_job_capacity(&key)?;
+        let state = self.jobs.entry(key.clone()).or_default();
+        match &state.terminal {
+            Some(JobTerminal::Cancelled { .. }) => return Err(ContractError::Cancelled),
+            Some(JobTerminal::Final | JobTerminal::Failure) => {
+                return Err(ContractError::TerminalAlreadyEmitted);
+            }
+            None => {}
+        }
+        if state.last_real_audio_sequence.is_none() {
+            return Ok(None);
+        }
+
+        let token = self
+            .next_backend_token
+            .checked_add(1)
+            .ok_or(ContractError::InvalidBackendAction)?;
+        let audio_chunks = std::mem::take(&mut state.pending_audio);
+        state.pending_progress.clear();
+        let action = BackendAction::new(
+            token,
+            request.context.delivery_session_epoch.clone(),
+            key,
+            request.context.message_id.clone(),
+            request.context.message_sequence,
+            audio_chunks,
+        )?;
+        self.next_backend_token = token;
+        Ok(Some(action))
+    }
+
+    fn complete_backend_action(
+        &mut self,
+        request: &WorkerRequest,
+        action: BackendAction,
+        outcome: BackendOutcome,
+    ) -> Result<Vec<WorkerResponse>, ContractError> {
+        let job = action.job().clone();
+        let last_audio_sequence = action
+            .audio_chunks()
+            .last()
+            .map(|chunk| chunk.sequence)
+            .ok_or(ContractError::InvalidBackendAction)?;
+        let released_audio_bytes =
+            action
+                .audio_chunks()
+                .iter()
+                .try_fold(0_u64, |total, chunk| {
+                    total
+                        .checked_add(chunk.payload_bytes)
+                        .ok_or(ContractError::QueueInvariant)
+                })?;
+
+        let (terminal, event) = match outcome.resolve(action) {
+            Ok(BackendOutcomePayload::Completed(result))
+                if result
+                    .validate_against(&self.manifest.descriptor, self.limits)
+                    .is_ok() =>
+            {
+                (
+                    JobTerminal::Final,
+                    WorkerEvent::Final {
+                        segment_id: job.segment_id.clone(),
+                        last_audio_sequence,
+                        result: *result,
+                    },
+                )
+            }
+            Ok(BackendOutcomePayload::Completed(_)) | Err(_) => (
+                JobTerminal::Failure,
+                self.backend_failure_event(
+                    request,
+                    Identifier::new("MODEL_INVALID_OUTCOME")?,
+                    "model.invalid_outcome",
+                    false,
+                    None,
+                )?,
+            ),
+            Ok(BackendOutcomePayload::Failed(failure)) => {
+                let BackendFailure {
+                    code,
+                    retryable,
+                    sanitized_detail,
+                } = failure;
+                (
+                    JobTerminal::Failure,
+                    self.backend_failure_event(
+                        request,
+                        code,
+                        "model.backend_failure",
+                        retryable,
+                        sanitized_detail,
+                    )?,
+                )
+            }
+        };
+
+        let state = self
+            .jobs
+            .get_mut(&job)
+            .ok_or(ContractError::QueueInvariant)?;
+        if state.terminal.is_some() || !state.pending_audio.is_empty() {
+            return Err(ContractError::QueueInvariant);
+        }
+        state.pending_progress.clear();
+        state.terminal = Some(terminal);
+        self.pending_audio_bytes = self
+            .pending_audio_bytes
+            .checked_sub(released_audio_bytes)
+            .ok_or(ContractError::QueueInvariant)?;
+        self.wrap_events(request, vec![event])
+    }
+
+    fn backend_failure_event(
+        &self,
+        request: &WorkerRequest,
+        code: Identifier,
+        user_message_key: &str,
+        retryable: bool,
+        sanitized_detail: Option<SanitizedText>,
+    ) -> Result<WorkerEvent, ContractError> {
+        let recovery_actions = if retryable {
+            vec![
+                RecoveryAction::Retry,
+                RecoveryAction::RestartWorker,
+                RecoveryAction::ChooseAnotherEngine,
+            ]
+        } else {
+            vec![
+                RecoveryAction::RestartWorker,
+                RecoveryAction::ChooseAnotherEngine,
+            ]
+        };
+        let error = StableWorkerError::try_from_spec(StableWorkerErrorSpec {
+            code,
+            category: ErrorCategory::Model,
+            severity: ErrorSeverity::Error,
+            retryable,
+            user_message_key: Identifier::new(user_message_key)?,
+            recovery_actions,
+            correlation_id: request.context.message_id.clone(),
+            correlation_sequence: request.context.message_sequence,
+            meeting_id: request.context.meeting_id.clone(),
+            segment_id: request.context.segment_id.clone(),
+            subsystem: Identifier::new("model-worker")?,
+            sanitized_detail,
+        })?;
+        Ok(WorkerEvent::Failure {
+            segment_id: request
+                .context
+                .segment_id
+                .clone()
+                .ok_or(ContractError::MissingRequestIdentity)?,
+            error,
+        })
     }
 
     fn cancel(&mut self, cancellation: Cancellation) -> Result<Vec<WorkerEvent>, ContractError> {
@@ -520,7 +854,6 @@ impl FakeWorker {
             }
         };
 
-        let mut projected = self.clone();
         let mut events = Vec::with_capacity(jobs.len().saturating_mul(2));
         let cancellation = Cancellation {
             scope_id: cancel_scope_id.clone(),
@@ -528,9 +861,9 @@ impl FakeWorker {
             reason,
         };
         for job in &jobs {
-            events.extend(projected.cancel_job(job.clone(), &cancellation, false)?);
+            events.extend(self.cancel_job(job.clone(), &cancellation, false)?);
         }
-        projected.cancellations.insert(
+        self.cancellations.insert(
             cancel_scope_id,
             CancellationRecord {
                 target,
@@ -539,7 +872,6 @@ impl FakeWorker {
                 events: events.clone(),
             },
         );
-        *self = projected;
         Ok(events)
     }
 
@@ -596,9 +928,19 @@ impl FakeWorker {
             }
             None => {
                 state.pending_progress.clear();
+                let released_audio_bytes = state
+                    .pending_audio
+                    .iter()
+                    .try_fold(0_u64, |total, chunk| total.checked_add(chunk.payload_bytes))
+                    .ok_or(ContractError::QueueInvariant)?;
+                state.pending_audio.clear();
                 state.terminal = Some(JobTerminal::Cancelled {
                     cancellation: cancellation.clone(),
                 });
+                self.pending_audio_bytes = self
+                    .pending_audio_bytes
+                    .checked_sub(released_audio_bytes)
+                    .ok_or(ContractError::QueueInvariant)?;
                 Ok(vec![
                     WorkerEvent::CancelRequested {
                         job: job.clone(),
@@ -626,6 +968,13 @@ impl FakeWorker {
             .checked_add(1)
             .ok_or(ContractError::QueueInvariant)?;
         self.pending_replay = self.replay_snapshot();
+        let released_audio_bytes = self.jobs.values().try_fold(0_u64, |total, state| {
+            state.pending_audio.iter().try_fold(total, |total, chunk| {
+                total
+                    .checked_add(chunk.payload_bytes)
+                    .ok_or(ContractError::QueueInvariant)
+            })
+        })?;
         for state in self.jobs.values_mut() {
             if state.terminal.is_none() {
                 *state = JobState::default();
@@ -633,6 +982,10 @@ impl FakeWorker {
                 state.pending_progress.clear();
             }
         }
+        self.pending_audio_bytes = self
+            .pending_audio_bytes
+            .checked_sub(released_audio_bytes)
+            .ok_or(ContractError::QueueInvariant)?;
         self.prepared = false;
         self.restart_count = next_restart_count;
         let mut events = self.poll_replay()?;
@@ -678,6 +1031,10 @@ impl FakeWorker {
             return Err(ContractError::ReplayBatchPending);
         }
         self.pending_replay = self.replay_snapshot();
+        for state in self.jobs.values_mut() {
+            state.pending_audio.clear();
+        }
+        self.pending_audio_bytes = 0;
         self.prepared = false;
         self.shutdown_state = ShutdownState::Draining;
         self.poll_replay()
@@ -784,21 +1141,37 @@ impl FakeWorker {
     }
 }
 
-#[derive(Clone, Debug)]
 struct EndpointCore {
     worker: FakeWorker,
     delivery: DeliveryLedger,
+    backend: Box<dyn ModelBackend>,
     handshaken: bool,
 }
 
+impl fmt::Debug for EndpointCore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EndpointCore")
+            .field("worker", &self.worker)
+            .field("delivery", &self.delivery)
+            .field("handshaken", &self.handshaken)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EndpointCore {
-    fn new(manifest: WorkerManifest, limits: WorkerLimits) -> Result<Self, ContractError> {
+    fn new<B: ModelBackend + 'static>(
+        manifest: WorkerManifest,
+        limits: WorkerLimits,
+        backend: B,
+    ) -> Result<Self, ContractError> {
         let epoch_nonce = NEXT_DELIVERY_SESSION_EPOCH.fetch_add(1, Ordering::Relaxed);
         let session_epoch =
             Identifier::new(&format!("{DELIVERY_SESSION_EPOCH_PREFIX}-{epoch_nonce}"))?;
         Ok(Self {
             worker: FakeWorker::new(manifest, limits, session_epoch.clone())?,
             delivery: DeliveryLedger::new(session_epoch, limits.max_replay_entries as usize),
+            backend: Box::new(backend),
             handshaken: false,
         })
     }
@@ -846,16 +1219,6 @@ impl EndpointCore {
         self.delivery.inspect(request, self.worker.limits)
     }
 
-    fn require_live_deadline(&self, request: &WorkerRequest) -> Result<(), ContractError> {
-        if request.context.deadline.clock_domain_id != self.worker.clock_domain_id {
-            return Err(ContractError::ClockDomainMismatch);
-        }
-        if request.context.deadline.deadline_ns <= self.worker.now_ns {
-            return Err(ContractError::DeadlineExpired);
-        }
-        Ok(())
-    }
-
     fn require_admissible_state(&self, request: &WorkerRequest) -> Result<(), ContractError> {
         if !matches!(request.command, WorkerCommand::PollReplay) {
             match self.worker.shutdown_state {
@@ -884,17 +1247,34 @@ impl EndpointCore {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingDelivery {
     request: WorkerRequest,
-    outcome: Result<Vec<WorkerResponse>, ContractError>,
-    replay: bool,
-    queue_depth_at_admission: u32,
+    state: PendingDeliveryState,
+}
+
+#[derive(Debug)]
+enum PendingDeliveryState {
+    Frozen(Result<Vec<WorkerResponse>, ContractError>),
+    Backend(BackendAction),
 }
 
 impl PendingDelivery {
     const fn sequence(&self) -> u64 {
         self.request.context.message_sequence
+    }
+
+    fn coalesced_submission(&self) -> Result<(), ContractError> {
+        match &self.state {
+            PendingDeliveryState::Frozen(outcome) => {
+                outcome.as_ref().map(|_| ()).map_err(|error| *error)
+            }
+            PendingDeliveryState::Backend(_) => Ok(()),
+        }
+    }
+
+    const fn has_backend_action(&self) -> bool {
+        matches!(self.state, PendingDeliveryState::Backend(_))
     }
 }
 
@@ -904,8 +1284,10 @@ fn delivery_units(outcome: &Result<Vec<WorkerResponse>, ContractError>) -> usize
         .map_or(0, |responses| responses.len().max(1))
 }
 
-#[derive(Clone, Debug)]
-pub struct DirectFakeTransport {
+/// Contract-owned in-process session. Admission, replay, worker state, and the
+/// injected backend are owned by one non-`Clone` semantic source.
+#[derive(Debug)]
+pub struct DirectWorkerSession {
     core: EndpointCore,
     pending: VecDeque<PendingDelivery>,
     new_command_count: usize,
@@ -914,22 +1296,31 @@ pub struct DirectFakeTransport {
     delivery_capacity: usize,
 }
 
-impl DirectFakeTransport {
-    pub fn new(manifest: WorkerManifest, limits: WorkerLimits) -> Result<Self, ContractError> {
+impl DirectWorkerSession {
+    pub fn new<B: ModelBackend + 'static>(
+        manifest: WorkerManifest,
+        limits: WorkerLimits,
+        backend: B,
+    ) -> Result<Self, ContractError> {
+        let core = EndpointCore::new(manifest, limits, backend)?;
+        Ok(Self::from_core(core, limits))
+    }
+
+    fn from_core(core: EndpointCore, limits: WorkerLimits) -> Self {
         let command_capacity = limits.max_pending_commands as usize;
         let delivery_capacity = limits.max_pending_deliveries as usize;
-        Ok(Self {
-            core: EndpointCore::new(manifest, limits)?,
+        Self {
+            core,
             pending: VecDeque::with_capacity(delivery_capacity),
             new_command_count: 0,
             pending_delivery_units: 0,
             command_capacity,
             delivery_capacity,
-        })
+        }
     }
 }
 
-impl WorkerEndpoint for DirectFakeTransport {
+impl WorkerEndpoint for DirectWorkerSession {
     fn handshake(&mut self, request: HelloRequest) -> Result<HelloResponse, ContractError> {
         self.core.handshake(request, TransportKind::InProcess)
     }
@@ -943,7 +1334,7 @@ impl WorkerEndpoint for DirectFakeTransport {
             .find(|pending| pending.sequence() == request.context.message_sequence)
         {
             if pending.request.semantically_eq(&request) {
-                return pending.outcome.clone().map(|_| ());
+                return pending.coalesced_submission();
             }
             return Err(ContractError::MessageIdConflict);
         }
@@ -955,41 +1346,75 @@ impl WorkerEndpoint for DirectFakeTransport {
                     return Err(ContractError::ResponseQueueFull);
                 }
                 self.pending.push_back(PendingDelivery {
-                    request,
-                    outcome,
-                    replay: true,
-                    queue_depth_at_admission: 0,
+                    request: request.replay_snapshot(),
+                    state: PendingDeliveryState::Frozen(outcome),
                 });
                 self.pending_delivery_units += units;
                 Ok(())
             }
             Admission::New => {
                 self.core.require_admissible_state(&request)?;
-                self.core.require_live_deadline(&request)?;
+                if let Err(error) = self.core.worker.preflight(&request) {
+                    if error.consumes_message_sequence() {
+                        self.core.record(request.replay_snapshot(), Err(error))?;
+                    }
+                    return Err(error);
+                }
+                let required_delivery_units =
+                    match self.core.worker.required_delivery_units(&request) {
+                        Ok(units) => units,
+                        Err(error) => {
+                            if error.consumes_message_sequence() {
+                                self.core.record(request.replay_snapshot(), Err(error))?;
+                            }
+                            return Err(error);
+                        }
+                    };
                 if self.new_command_count >= self.command_capacity {
                     return Err(ContractError::QueueFull);
                 }
-                let mut projected_worker = self.core.worker.clone();
+                if self
+                    .pending_delivery_units
+                    .saturating_add(required_delivery_units)
+                    > self.delivery_capacity
+                {
+                    return Err(ContractError::ResponseQueueFull);
+                }
                 let queue_depth_at_admission = u32::try_from(self.new_command_count)
                     .map_err(|_| ContractError::QueueInvariant)?;
-                let outcome = projected_worker.process(request.clone(), queue_depth_at_admission);
+                let backend_action = match self.core.worker.begin_backend_action(&request) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        if error.consumes_message_sequence() {
+                            self.core.record(request.replay_snapshot(), Err(error))?;
+                        }
+                        return Err(error);
+                    }
+                };
+                let outcome = if let Some(action) = backend_action {
+                    let backend_outcome = self.core.backend.execute(&action);
+                    self.core
+                        .worker
+                        .complete_backend_action(&request, action, backend_outcome)
+                } else {
+                    self.core
+                        .worker
+                        .process(request.clone(), queue_depth_at_admission)
+                };
                 if let Err(error) = outcome
                     && !error.consumes_message_sequence()
                 {
                     return Err(error);
                 }
                 let units = delivery_units(&outcome);
-                if self.pending_delivery_units.saturating_add(units) > self.delivery_capacity {
-                    return Err(ContractError::ResponseQueueFull);
+                if units > required_delivery_units {
+                    return Err(ContractError::QueueInvariant);
                 }
                 self.core.record(request.clone(), outcome.clone())?;
                 outcome.as_ref().map_err(|error| *error)?;
-                self.core.worker = projected_worker;
                 self.pending.push_back(PendingDelivery {
-                    request,
-                    outcome,
-                    replay: false,
-                    queue_depth_at_admission,
+                    request: request.replay_snapshot(),
+                    state: PendingDeliveryState::Frozen(outcome),
                 });
                 self.new_command_count += 1;
                 self.pending_delivery_units += units;
@@ -1002,7 +1427,10 @@ impl WorkerEndpoint for DirectFakeTransport {
         self.core.require_handshake()?;
         let mut responses = Vec::new();
         for pending in self.pending.drain(..) {
-            responses.extend(pending.outcome?);
+            match pending.state {
+                PendingDeliveryState::Frozen(outcome) => responses.extend(outcome?),
+                PendingDeliveryState::Backend(_) => return Err(ContractError::QueueInvariant),
+            }
         }
         self.new_command_count = 0;
         self.pending_delivery_units = 0;
@@ -1015,7 +1443,7 @@ impl WorkerEndpoint for DirectFakeTransport {
     }
 }
 
-impl FakeClockControl for DirectFakeTransport {
+impl FakeClockControl for DirectWorkerSession {
     fn set_now_ns(&mut self, now_ns: u64) -> Result<(), ContractError> {
         if !self.pending.is_empty() {
             return Err(ContractError::ClockAdvanceWithPending);
@@ -1024,8 +1452,10 @@ impl FakeClockControl for DirectFakeTransport {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct InMemoryQueuedTransport {
+/// Contract-owned queued session. `submit` admits a backend action without
+/// executing it; `drain` consumes that exact action once through the same core.
+#[derive(Debug)]
+pub struct QueuedWorkerSession {
     core: EndpointCore,
     pending: VecDeque<PendingDelivery>,
     new_command_count: usize,
@@ -1034,22 +1464,31 @@ pub struct InMemoryQueuedTransport {
     delivery_capacity: usize,
 }
 
-impl InMemoryQueuedTransport {
-    pub fn new(manifest: WorkerManifest, limits: WorkerLimits) -> Result<Self, ContractError> {
+impl QueuedWorkerSession {
+    pub fn new<B: ModelBackend + 'static>(
+        manifest: WorkerManifest,
+        limits: WorkerLimits,
+        backend: B,
+    ) -> Result<Self, ContractError> {
+        let core = EndpointCore::new(manifest, limits, backend)?;
+        Ok(Self::from_core(core, limits))
+    }
+
+    fn from_core(core: EndpointCore, limits: WorkerLimits) -> Self {
         let command_capacity = limits.max_pending_commands as usize;
         let delivery_capacity = limits.max_pending_deliveries as usize;
-        Ok(Self {
-            core: EndpointCore::new(manifest, limits)?,
+        Self {
+            core,
             pending: VecDeque::with_capacity(delivery_capacity),
             new_command_count: 0,
             pending_delivery_units: 0,
             command_capacity,
             delivery_capacity,
-        })
+        }
     }
 }
 
-impl WorkerEndpoint for InMemoryQueuedTransport {
+impl WorkerEndpoint for QueuedWorkerSession {
     fn handshake(&mut self, request: HelloRequest) -> Result<HelloResponse, ContractError> {
         self.core.handshake(request, TransportKind::IsolatedProcess)
     }
@@ -1063,9 +1502,12 @@ impl WorkerEndpoint for InMemoryQueuedTransport {
             .find(|pending| pending.sequence() == request.context.message_sequence)
         {
             if pending.request.semantically_eq(&request) {
-                return pending.outcome.clone().map(|_| ());
+                return pending.coalesced_submission();
             }
             return Err(ContractError::MessageIdConflict);
+        }
+        if self.pending.iter().any(PendingDelivery::has_backend_action) {
+            return Err(ContractError::BackendActionInFlight);
         }
         match self.core.inspect(&request)? {
             Admission::Replay(outcome) => {
@@ -1075,44 +1517,78 @@ impl WorkerEndpoint for InMemoryQueuedTransport {
                     return Err(ContractError::ResponseQueueFull);
                 }
                 self.pending.push_back(PendingDelivery {
-                    request,
-                    outcome,
-                    replay: true,
-                    queue_depth_at_admission: 0,
+                    request: request.replay_snapshot(),
+                    state: PendingDeliveryState::Frozen(outcome),
                 });
                 self.pending_delivery_units += units;
                 Ok(())
             }
             Admission::New => {
                 self.core.require_admissible_state(&request)?;
-                self.core.require_live_deadline(&request)?;
+                if let Err(error) = self.core.worker.preflight(&request) {
+                    if error.consumes_message_sequence() {
+                        self.core.record(request.replay_snapshot(), Err(error))?;
+                    }
+                    return Err(error);
+                }
+                let required_delivery_units =
+                    match self.core.worker.required_delivery_units(&request) {
+                        Ok(units) => units,
+                        Err(error) => {
+                            if error.consumes_message_sequence() {
+                                self.core.record(request.replay_snapshot(), Err(error))?;
+                            }
+                            return Err(error);
+                        }
+                    };
                 if self.new_command_count >= self.command_capacity {
                     return Err(ContractError::QueueFull);
                 }
-                let mut projected_worker = self.core.worker.clone();
-                for pending in self.pending.iter().filter(|pending| !pending.replay) {
-                    projected_worker
-                        .process(pending.request.clone(), pending.queue_depth_at_admission)?;
+                if self
+                    .pending_delivery_units
+                    .saturating_add(required_delivery_units)
+                    > self.delivery_capacity
+                {
+                    return Err(ContractError::ResponseQueueFull);
                 }
                 let queue_depth_at_admission = u32::try_from(self.new_command_count)
                     .map_err(|_| ContractError::QueueInvariant)?;
-                let outcome = projected_worker.process(request.clone(), queue_depth_at_admission);
+                let backend_action = match self.core.worker.begin_backend_action(&request) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        if error.consumes_message_sequence() {
+                            self.core.record(request.replay_snapshot(), Err(error))?;
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Some(action) = backend_action {
+                    self.pending.push_back(PendingDelivery {
+                        request: request.replay_snapshot(),
+                        state: PendingDeliveryState::Backend(action),
+                    });
+                    self.new_command_count += 1;
+                    self.pending_delivery_units += required_delivery_units;
+                    return Ok(());
+                }
+                let outcome = self
+                    .core
+                    .worker
+                    .process(request.clone(), queue_depth_at_admission);
                 if let Err(error) = outcome
                     && !error.consumes_message_sequence()
                 {
                     return Err(error);
                 }
                 let units = delivery_units(&outcome);
-                if self.pending_delivery_units.saturating_add(units) > self.delivery_capacity {
-                    return Err(ContractError::ResponseQueueFull);
+                if units > required_delivery_units {
+                    return Err(ContractError::QueueInvariant);
                 }
                 self.core.record(request.clone(), outcome.clone())?;
                 outcome.as_ref().map_err(|error| *error)?;
                 self.pending.push_back(PendingDelivery {
-                    request,
-                    outcome,
-                    replay: false,
-                    queue_depth_at_admission,
+                    request: request.replay_snapshot(),
+                    state: PendingDeliveryState::Frozen(outcome),
                 });
                 self.new_command_count += 1;
                 self.pending_delivery_units += units;
@@ -1123,38 +1599,23 @@ impl WorkerEndpoint for InMemoryQueuedTransport {
 
     fn drain(&mut self) -> Result<Vec<WorkerResponse>, ContractError> {
         self.core.require_handshake()?;
-        let mut projected_worker = self.core.worker.clone();
         let mut responses = Vec::new();
-        for pending in &self.pending {
-            if pending.replay {
-                responses.extend(pending.outcome.clone()?);
-                continue;
+        for pending in self.pending.drain(..) {
+            match pending.state {
+                PendingDeliveryState::Frozen(outcome) => responses.extend(outcome?),
+                PendingDeliveryState::Backend(action) => {
+                    let backend_outcome = self.core.backend.execute(&action);
+                    let outcome = self.core.worker.complete_backend_action(
+                        &pending.request,
+                        action,
+                        backend_outcome,
+                    );
+                    self.core
+                        .record(pending.request.replay_snapshot(), outcome.clone())?;
+                    responses.extend(outcome?);
+                }
             }
-            let live_heartbeat_sequence = projected_worker.heartbeat_sequence;
-            if matches!(pending.request.command, WorkerCommand::Health) {
-                projected_worker.heartbeat_sequence = pending
-                    .outcome
-                    .as_ref()
-                    .ok()
-                    .and_then(|responses| responses.first())
-                    .and_then(|response| match response.event() {
-                        WorkerEvent::Health {
-                            heartbeat_sequence, ..
-                        } => Some(*heartbeat_sequence),
-                        _ => None,
-                    })
-                    .ok_or(ContractError::QueueInvariant)?;
-            }
-            let actual =
-                projected_worker.process(pending.request.clone(), pending.queue_depth_at_admission);
-            projected_worker.heartbeat_sequence = live_heartbeat_sequence;
-            if actual != pending.outcome {
-                return Err(ContractError::QueueInvariant);
-            }
-            responses.extend(actual?);
         }
-        self.core.worker = projected_worker;
-        self.pending.clear();
         self.new_command_count = 0;
         self.pending_delivery_units = 0;
         Ok(responses)
@@ -1166,12 +1627,114 @@ impl WorkerEndpoint for InMemoryQueuedTransport {
     }
 }
 
-impl FakeClockControl for InMemoryQueuedTransport {
+impl FakeClockControl for QueuedWorkerSession {
     fn set_now_ns(&mut self, now_ns: u64) -> Result<(), ContractError> {
         if !self.pending.is_empty() {
             return Err(ContractError::ClockAdvanceWithPending);
         }
         self.core.worker.set_now_ns(now_ns)
+    }
+}
+
+fn require_contract_fixture_manifest(manifest: &WorkerManifest) -> Result<(), ContractError> {
+    if manifest.role == WorkerRole::ContractFixture {
+        Ok(())
+    } else {
+        Err(ContractError::ContractFixtureRequired)
+    }
+}
+
+fn require_contract_fixture_hello(request: &HelloRequest) -> Result<(), ContractError> {
+    if request.purpose == ContractPurpose::ContractFixture
+        && request.expected.role == WorkerRole::ContractFixture
+    {
+        Ok(())
+    } else {
+        Err(ContractError::ContractFixtureRequired)
+    }
+}
+
+/// Deterministic contract-fixture wrapper. It cannot be constructed with a
+/// product candidate manifest and never accepts a product-purpose handshake.
+#[derive(Debug)]
+pub struct DirectFakeTransport {
+    session: DirectWorkerSession,
+}
+
+impl DirectFakeTransport {
+    pub fn new(manifest: WorkerManifest, limits: WorkerLimits) -> Result<Self, ContractError> {
+        require_contract_fixture_manifest(&manifest)?;
+        let backend = DeterministicFakeBackend::new(&manifest.descriptor);
+        Ok(Self {
+            session: DirectWorkerSession::new(manifest, limits, backend)?,
+        })
+    }
+}
+
+impl WorkerEndpoint for DirectFakeTransport {
+    fn handshake(&mut self, request: HelloRequest) -> Result<HelloResponse, ContractError> {
+        require_contract_fixture_hello(&request)?;
+        self.session.handshake(request)
+    }
+
+    fn submit(&mut self, request: WorkerRequest) -> Result<(), ContractError> {
+        self.session.submit(request)
+    }
+
+    fn drain(&mut self) -> Result<Vec<WorkerResponse>, ContractError> {
+        self.session.drain()
+    }
+
+    fn heartbeat(&mut self) -> Result<WorkerEvent, ContractError> {
+        self.session.heartbeat()
+    }
+}
+
+impl FakeClockControl for DirectFakeTransport {
+    fn set_now_ns(&mut self, now_ns: u64) -> Result<(), ContractError> {
+        self.session.set_now_ns(now_ns)
+    }
+}
+
+/// Deterministic queued contract-fixture wrapper with the same fail-closed
+/// role and purpose checks as [`DirectFakeTransport`].
+#[derive(Debug)]
+pub struct InMemoryQueuedTransport {
+    session: QueuedWorkerSession,
+}
+
+impl InMemoryQueuedTransport {
+    pub fn new(manifest: WorkerManifest, limits: WorkerLimits) -> Result<Self, ContractError> {
+        require_contract_fixture_manifest(&manifest)?;
+        let backend = DeterministicFakeBackend::new(&manifest.descriptor);
+        Ok(Self {
+            session: QueuedWorkerSession::new(manifest, limits, backend)?,
+        })
+    }
+}
+
+impl WorkerEndpoint for InMemoryQueuedTransport {
+    fn handshake(&mut self, request: HelloRequest) -> Result<HelloResponse, ContractError> {
+        require_contract_fixture_hello(&request)?;
+        self.session.handshake(request)
+    }
+
+    fn submit(&mut self, request: WorkerRequest) -> Result<(), ContractError> {
+        self.session.submit(request)
+    }
+
+    fn drain(&mut self) -> Result<Vec<WorkerResponse>, ContractError> {
+        self.session.drain()
+    }
+
+    fn heartbeat(&mut self) -> Result<WorkerEvent, ContractError> {
+        self.session.heartbeat()
+    }
+}
+
+impl FakeClockControl for InMemoryQueuedTransport {
+    fn set_now_ns(&mut self, now_ns: u64) -> Result<(), ContractError> {
+        self.session.set_now_ns(now_ns)
     }
 }
 
@@ -1589,7 +2152,7 @@ fn validate_conformance_transcript(
         }
     ) || !matches!(
         responses[4].event(),
-        WorkerEvent::Final { segment_id, last_audio_sequence: 1 }
+        WorkerEvent::Final { segment_id, last_audio_sequence: 1, .. }
             if segment_id.as_str() == "segment-a"
     ) || !matches!(
         responses[5].event(),
@@ -1649,7 +2212,7 @@ fn validate_conformance_transcript(
         WorkerEvent::AudioAccepted { sequence: 1 }
     ) || !matches!(
         responses[15].event(),
-        WorkerEvent::Final { segment_id, last_audio_sequence: 1 }
+        WorkerEvent::Final { segment_id, last_audio_sequence: 1, .. }
             if segment_id.as_str() == "segment-c"
     ) || !matches!(
         responses[16].event(),
@@ -1809,5 +2372,7 @@ fn audio_chunk(sequence: u64, media_start_sample: u64) -> Result<AudioChunk, Con
             sample_rate_hz: 16_000,
         }],
         payload_bytes: 640,
+        payload_sha256: Some(crate::Sha256Digest::from_bytes([17; 32])),
+        payload: Some(AudioPayload::PcmS16Le(Arc::from([0_i16; 320]))),
     })
 }

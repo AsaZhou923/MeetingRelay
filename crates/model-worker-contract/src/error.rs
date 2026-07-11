@@ -7,6 +7,7 @@ pub enum ContractError {
     InvalidIdentifier,
     InvalidLanguageCode,
     InvalidSanitizedText,
+    InvalidTranscriptText,
     InvalidSha256,
     InvalidProtocolVersion,
     ProtocolMismatch,
@@ -62,6 +63,12 @@ pub enum ContractError {
     InvalidResourceEstimate,
     NotPrepared,
     AudioChunkTooLarge,
+    MissingAudioPayload,
+    MissingAudioPayloadDigest,
+    InvalidAudioPayloadDigest,
+    AudioPayloadTypeMismatch,
+    AudioPayloadLengthMismatch,
+    PendingAudioCreditExhausted,
     ControlMessageTooLarge,
     AudioMetadataTooLarge,
     CancellationBatchTooLarge,
@@ -83,6 +90,12 @@ pub enum ContractError {
     CancelScopeConflict,
     Cancelled,
     DeadlineExpired,
+    InvalidConfidence,
+    InvalidBackendAction,
+    BackendActionInFlight,
+    BackendOutcomeBindingMismatch,
+    InvalidBackendOutcome,
+    BackendFailure,
     ShutdownDraining,
     Shutdown,
     QueueInvariant,
@@ -103,6 +116,9 @@ impl fmt::Display for ContractError {
                 Self::InvalidLanguageCode => "language code is invalid",
                 Self::InvalidSanitizedText => {
                     "sanitized detail must be bounded printable text without controls"
+                }
+                Self::InvalidTranscriptText => {
+                    "transcript text must be non-empty and within its explicit byte bound"
                 }
                 Self::InvalidSha256 => "SHA-256 must be 64 lowercase hexadecimal characters",
                 Self::InvalidProtocolVersion => "protocol version is not supported",
@@ -186,6 +202,22 @@ impl fmt::Display for ContractError {
                 }
                 Self::NotPrepared => "worker is not prepared",
                 Self::AudioChunkTooLarge => "audio chunk exceeds the negotiated limit",
+                Self::MissingAudioPayload => "audio chunk is missing its owned PCM payload",
+                Self::MissingAudioPayloadDigest => {
+                    "audio chunk is missing its caller-provided payload digest"
+                }
+                Self::InvalidAudioPayloadDigest => {
+                    "audio chunk payload digest cannot be the all-zero digest"
+                }
+                Self::AudioPayloadTypeMismatch => {
+                    "audio payload representation differs from its declared sample format"
+                }
+                Self::AudioPayloadLengthMismatch => {
+                    "audio payload length differs from its declared media range"
+                }
+                Self::PendingAudioCreditExhausted => {
+                    "aggregate pending audio exceeds the negotiated credit"
+                }
                 Self::ControlMessageTooLarge => {
                     "semantic control envelope exceeds the negotiated limit"
                 }
@@ -221,6 +253,22 @@ impl fmt::Display for ContractError {
                 }
                 Self::Cancelled => "worker operation was cancelled",
                 Self::DeadlineExpired => "request deadline has expired",
+                Self::InvalidConfidence => {
+                    "fixed-point confidence exceeds one million parts per million"
+                }
+                Self::InvalidBackendAction => {
+                    "backend action is empty or has inconsistent semantic identity"
+                }
+                Self::BackendActionInFlight => {
+                    "a backend action is already in flight for this worker session"
+                }
+                Self::BackendOutcomeBindingMismatch => {
+                    "backend outcome does not belong to the consumed backend action"
+                }
+                Self::InvalidBackendOutcome => {
+                    "backend outcome conflicts with the negotiated engine contract"
+                }
+                Self::BackendFailure => "model backend reported a stable execution failure",
                 Self::ShutdownDraining => {
                     "worker shutdown is draining replay facts; only replay polling is accepted"
                 }
@@ -254,11 +302,18 @@ impl ContractError {
                 | Self::ClockAdvanceWithPending
                 | Self::ClockRollback
                 | Self::DeadlineExpired
+                | Self::MissingAudioPayload
+                | Self::MissingAudioPayloadDigest
+                | Self::InvalidAudioPayloadDigest
+                | Self::AudioPayloadTypeMismatch
+                | Self::AudioPayloadLengthMismatch
                 | Self::ControlMessageTooLarge
                 | Self::AudioMetadataTooLarge
+                | Self::PendingAudioCreditExhausted
                 | Self::QueueFull
                 | Self::RetiredJobKeyCapacityFull
                 | Self::ResponseQueueFull
+                | Self::BackendActionInFlight
                 | Self::ShutdownDraining
                 | Self::Shutdown
         )

@@ -1,17 +1,19 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use meetingrelay_model_worker_contract::{
-    Architecture, AudioChunk, AudioFormat, AudioGap, AudioSource, CancelReason, CancelTarget,
-    Cancellation, Capability, CapabilitySet, ContractError, ContractPurpose,
+    Architecture, AudioChunk, AudioFormat, AudioGap, AudioPayload, AudioSource, CancelReason,
+    CancelTarget, Cancellation, Capability, CapabilitySet, ContractError, ContractPurpose,
     DEFAULT_FAKE_CLOCK_DOMAIN_ID, DirectFakeTransport, EngineDescriptor, ErrorCategory,
-    ErrorSeverity, ExecutionProvider, FakeClockControl, GapReason, HelloRequest, HelloResponse,
-    Identifier, InMemoryQueuedTransport, JobKey, LanguageCode, MinorExtensionPolicy,
-    MonotonicDeadline, NetworkPolicy, NotCancellableReason, OperatingSystem, Platform,
-    PrepareRequest, RecoveryAction, ReplayJobState, RequestContext, ResourceEstimate,
+    ErrorSeverity, ExecutionProvider, FakeClockControl, FixedPointConfidence, GapReason,
+    HelloRequest, HelloResponse, Identifier, InMemoryQueuedTransport, JobKey, LanguageCode,
+    MinorExtensionPolicy, MonotonicDeadline, NetworkPolicy, NotCancellableReason, OperatingSystem,
+    Platform, PrepareRequest, RecoveryAction, ReplayJobState, RequestContext, ResourceEstimate,
     ResourceEstimateStatus, SampleFormat, SanitizedText, Sha256Digest, SourceRange,
-    StableWorkerError, StableWorkerErrorSpec, TransportKind, WORKER_PROTOCOL_V1, WorkerCommand,
-    WorkerEndpoint, WorkerEvent, WorkerLimits, WorkerManifest, WorkerProtocolVersion,
-    WorkerRequest, WorkerResponse, WorkerRole, run_deterministic_fixture_conformance,
+    StableWorkerError, StableWorkerErrorSpec, TranscriptProvenance, TranscriptResult,
+    TranscriptText, TransportKind, WORKER_PROTOCOL_V1, WorkerCommand, WorkerEndpoint, WorkerEvent,
+    WorkerLimits, WorkerManifest, WorkerProtocolVersion, WorkerRequest, WorkerResponse, WorkerRole,
+    run_deterministic_fixture_conformance,
 };
 
 fn digest(byte: u8) -> Sha256Digest {
@@ -37,6 +39,7 @@ fn limits() -> WorkerLimits {
     WorkerLimits {
         max_control_message_bytes: 65_536,
         max_audio_chunk_bytes: 1_048_576,
+        max_pending_audio_bytes: 4_194_304,
         max_capture_epochs_per_chunk: 8,
         max_source_ranges_per_chunk: 32,
         max_in_flight_jobs: 4,
@@ -83,6 +86,33 @@ fn manifest() -> WorkerManifest {
         executable_sha256: digest(5),
         schema_registry_sha256: digest(6),
         descriptor: descriptor(),
+    }
+}
+
+fn transcript_result() -> TranscriptResult {
+    let descriptor = descriptor();
+    TranscriptResult {
+        original_transcript: TranscriptText::new("fixture transcript").expect("fixture transcript"),
+        raw_language: SanitizedText::new("English").expect("fixture raw language"),
+        normalized_language: language("en"),
+        confidence: Some(
+            FixedPointConfidence::from_parts_per_million(875_000)
+                .expect("fixture fixed-point confidence"),
+        ),
+        provenance: TranscriptProvenance {
+            engine_id: descriptor.engine_id,
+            engine_version: descriptor.engine_version,
+            runtime_id: descriptor.runtime_id,
+            runtime_version: descriptor.runtime_version,
+            runtime_sha256: descriptor.runtime_sha256,
+            package_lock_sha256: descriptor.package_lock_sha256,
+            model_id: descriptor.model_id,
+            model_sha256: descriptor.model_sha256,
+            model_manifest_sha256: descriptor.model_manifest_sha256,
+            parameter_sha256: descriptor.parameter_sha256,
+            execution_provider: descriptor.execution_provider,
+            quantization: descriptor.quantization,
+        },
     }
 }
 
@@ -229,6 +259,8 @@ fn chunk(sequence: u64, media_start_sample: u64) -> AudioChunk {
             sample_rate_hz: 16_000,
         }],
         payload_bytes: 640,
+        payload_sha256: Some(digest(10)),
+        payload: Some(AudioPayload::PcmS16Le(Arc::from([0_i16; 320]))),
     }
 }
 
@@ -741,17 +773,10 @@ fn oracle_and_product_process_boundaries_are_disjoint() {
 fn deterministic_fixture_oracle_rejects_non_fixture_purpose_or_role_before_handshake() {
     let mut candidate_manifest = manifest();
     candidate_manifest.role = WorkerRole::NativeCandidate;
-    let mut candidate_hello = hello_request();
-    candidate_hello.purpose = ContractPurpose::ProductShellCandidate;
-    candidate_hello.expected = candidate_manifest.clone();
-    assert_eq!(
-        run_deterministic_fixture_conformance(
-            DirectFakeTransport::new(candidate_manifest, limits())
-                .expect("candidate-shaped endpoint constructor"),
-            candidate_hello,
-        ),
+    assert!(matches!(
+        DirectFakeTransport::new(candidate_manifest, limits()),
         Err(ContractError::ContractFixtureRequired)
-    );
+    ));
 
     let mut wrong_purpose = hello_request();
     wrong_purpose.purpose = ContractPurpose::OracleOnly;
@@ -1319,6 +1344,7 @@ fn worker_response_command_event_matrix_and_numeric_domains_fail_closed() {
         WorkerEvent::Final {
             segment_id: target.segment_id.clone(),
             last_audio_sequence: 0,
+            result: transcript_result(),
         },
     );
 

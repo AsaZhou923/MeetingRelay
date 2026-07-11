@@ -10,17 +10,19 @@ mod identity;
 mod protocol;
 
 pub use engine::{
-    AudioChunk, AudioFormat, AudioGap, AudioSource, CancelReason, CancelTarget, Cancellation,
-    ErrorCategory, ErrorSeverity, GapReason, JobKey, MonotonicDeadline, NotCancellableReason,
+    AudioChunk, AudioFormat, AudioGap, AudioPayload, AudioSource, BackendAction, BackendFailure,
+    BackendOutcome, CancelReason, CancelTarget, Cancellation, ErrorCategory, ErrorSeverity,
+    FixedPointConfidence, GapReason, JobKey, ModelBackend, MonotonicDeadline, NotCancellableReason,
     PrepareRequest, RecoveryAction, ReplayJobState, RequestContext, ResourceEstimate,
     ResourceEstimateStatus, SampleFormat, SourceRange, StableWorkerError, StableWorkerErrorSpec,
-    WorkerCommand, WorkerEvent, WorkerRequest, WorkerResponse, WorkerResponseSpec,
+    TranscriptProvenance, TranscriptResult, TranscriptText, WorkerCommand, WorkerEvent,
+    WorkerRequest, WorkerResponse, WorkerResponseSpec,
 };
 pub use error::ContractError;
 pub use fake::{
-    ConformanceTranscript, DEFAULT_FAKE_CLOCK_DOMAIN_ID, DirectFakeTransport, FakeClockControl,
-    InMemoryQueuedTransport, WorkerEndpoint, run_deterministic_fixture_conformance,
-    run_deterministic_fixture_conformance_with_clock,
+    ConformanceTranscript, DEFAULT_FAKE_CLOCK_DOMAIN_ID, DirectFakeTransport, DirectWorkerSession,
+    FakeClockControl, InMemoryQueuedTransport, QueuedWorkerSession, WorkerEndpoint,
+    run_deterministic_fixture_conformance, run_deterministic_fixture_conformance_with_clock,
 };
 pub use identity::{Identifier, LanguageCode, SanitizedText, Sha256Digest};
 pub use protocol::{

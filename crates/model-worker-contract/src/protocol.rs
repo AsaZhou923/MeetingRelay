@@ -302,6 +302,7 @@ impl CapabilitySet {
 pub struct WorkerLimits {
     pub max_control_message_bytes: u64,
     pub max_audio_chunk_bytes: u64,
+    pub max_pending_audio_bytes: u64,
     pub max_capture_epochs_per_chunk: u32,
     pub max_source_ranges_per_chunk: u32,
     pub max_in_flight_jobs: u32,
@@ -321,6 +322,7 @@ pub struct WorkerLimits {
 impl WorkerLimits {
     pub const MAX_CONTROL_MESSAGE_BYTES: u64 = 1_048_576;
     pub const MAX_AUDIO_CHUNK_BYTES: u64 = 4_194_304;
+    pub const MAX_PENDING_AUDIO_BYTES: u64 = 268_435_456;
     pub const MAX_CAPTURE_EPOCHS_PER_CHUNK: u32 = 256;
     pub const MAX_SOURCE_RANGES_PER_CHUNK: u32 = 4_096;
     pub const MAX_IN_FLIGHT_JOBS: u32 = 1_024;
@@ -346,6 +348,8 @@ impl WorkerLimits {
             || self.max_control_message_bytes > Self::MAX_CONTROL_MESSAGE_BYTES
             || self.max_audio_chunk_bytes == 0
             || self.max_audio_chunk_bytes > Self::MAX_AUDIO_CHUNK_BYTES
+            || self.max_pending_audio_bytes < self.max_audio_chunk_bytes
+            || self.max_pending_audio_bytes > Self::MAX_PENDING_AUDIO_BYTES
             || self.max_capture_epochs_per_chunk == 0
             || self.max_capture_epochs_per_chunk > Self::MAX_CAPTURE_EPOCHS_PER_CHUNK
             || self.max_source_ranges_per_chunk < self.max_capture_epochs_per_chunk
@@ -387,6 +391,7 @@ impl WorkerLimits {
     const fn fits_within(self, offered: Self) -> bool {
         self.max_control_message_bytes <= offered.max_control_message_bytes
             && self.max_audio_chunk_bytes <= offered.max_audio_chunk_bytes
+            && self.max_pending_audio_bytes <= offered.max_pending_audio_bytes
             && self.max_capture_epochs_per_chunk <= offered.max_capture_epochs_per_chunk
             && self.max_source_ranges_per_chunk <= offered.max_source_ranges_per_chunk
             && self.max_in_flight_jobs <= offered.max_in_flight_jobs
