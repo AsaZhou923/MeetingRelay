@@ -16,6 +16,10 @@ import {
   encodeCanonicalJsonLine,
 } from "./canonical-json.mjs";
 import {
+  FIXTURE_LOGICAL_CLOCK_DOMAIN_ID,
+  observationClockDomainId,
+} from "./clock-domain.mjs";
+import {
   DURATION_MS,
   FIXTURE_ID,
   SAMPLE_RATE_HZ,
@@ -35,7 +39,6 @@ const DEFAULT_OUTPUT_ROOT = path.join(
 const MAX_U64 = (1n << 64n) - 1n;
 const MAX_U32 = 2 ** 32 - 1;
 const ROOT_CAUSE_ID = "cmd_meetingrelay_fixture_replay_v1";
-const CLOCK_DOMAIN_ID = "meetingrelay.fixture.logical.v1";
 const SCRIPTED_COMMIT_ENDPOINT = "meetingrelay.harness.scripted-commit.v1";
 const TRACE_ID = `harness_trace_${FIXTURE_ID}_1`;
 const MEETING_ID = `harness_mtg_${FIXTURE_ID}`;
@@ -251,7 +254,7 @@ function buildInput(fixture) {
       revision: 0,
       sequence: "1",
       logical_monotonic_ns: "0",
-      clock_domain_id: CLOCK_DOMAIN_ID,
+      clock_domain_id: FIXTURE_LOGICAL_CLOCK_DOMAIN_ID,
       trace_point: "capture.ingress",
       evidence: buildEvidence(),
       payload: {
@@ -288,7 +291,7 @@ function buildDecision(input) {
       revision: input.revision,
       sequence: input.sequence,
       logical_monotonic_ns: String(DURATION_MS * 1_000_000),
-      clock_domain_id: CLOCK_DOMAIN_ID,
+      clock_domain_id: FIXTURE_LOGICAL_CLOCK_DOMAIN_ID,
       trace_point: "commit.ack",
       evidence: buildEvidence(),
       payload: {
@@ -330,7 +333,7 @@ function buildObservation(source, sourceLedgerKind, ledgerSequence, runId, obser
     revision: source.revision,
     sequence: source.sequence,
     observed_monotonic_ns: String(observedMonotonicNs),
-    clock_domain_id: `node.hrtime.${runId}`,
+    clock_domain_id: observationClockDomainId(runId),
     trace_point: source.trace_point,
     evidence: buildEvidence(),
     payload,
@@ -529,7 +532,7 @@ function validateDeterministicRecord(record, label, kind, prefix) {
     throw new Error(`${label}.ledger_kind must be ${kind}`);
   }
   assertCanonicalU64(record.logical_monotonic_ns, `${label}.logical_monotonic_ns`);
-  if (record.clock_domain_id !== CLOCK_DOMAIN_ID) {
+  if (record.clock_domain_id !== FIXTURE_LOGICAL_CLOCK_DOMAIN_ID) {
     throw new Error(`${label}.clock_domain_id differs`);
   }
   assertNonEmptyString(record.event_id, `${label}.event_id`);
@@ -634,7 +637,7 @@ function validateObservation(observation, source, sourceKind, expectedSequence) 
   }
   if (
     observation.observation_id !== `obs_${observation.run_id}_${observation.ledger_sequence}` ||
-    observation.clock_domain_id !== `node.hrtime.${observation.run_id}`
+    observation.clock_domain_id !== observationClockDomainId(observation.run_id)
   ) {
     throw new Error(`${label} observation or clock-domain identity differs`);
   }

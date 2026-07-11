@@ -14,6 +14,8 @@
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",
     "phase0:provider:test": "node --test tools/phase0-harness/provider-harness.test.mjs",
     "phase0:provider:validate": "node tools/phase0-harness/validate-provider-harness.mjs",
+    "phase0:clock:test": "node --test tools/phase0-harness/clock-calibration.test.mjs",
+    "phase0:clock:validate": "node tools/phase0-harness/validate-clock-calibration.mjs",
     "tauri": "pnpm --dir apps/desktop tauri"
   }
 }
