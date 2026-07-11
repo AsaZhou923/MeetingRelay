@@ -72,6 +72,12 @@ jobs:
           pnpm phase0:ledgers:validate
         timeout-minutes: 5
 
+      - name: Test and validate Phase 0 provider harness
+        run: |
+          pnpm phase0:provider:test
+          pnpm phase0:provider:validate
+        timeout-minutes: 5
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
         timeout-minutes: 5
