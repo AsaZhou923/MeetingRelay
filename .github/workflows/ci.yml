@@ -66,6 +66,12 @@ jobs:
           pnpm phase0:fixtures:validate
         timeout-minutes: 5
 
+      - name: Test and validate WP-0.4 candidate artifact contract
+        run: |
+          pnpm phase0:candidate-artifacts:test
+          pnpm phase0:candidate-artifacts:validate
+        timeout-minutes: 5
+
       - name: Test and validate Phase 0 replay ledgers
         run: |
           pnpm phase0:ledgers:test
