@@ -1,0 +1,12 @@
+{
+  "name": "meetingrelay-workspace",
+  "version": "0.0.1",
+  "private": true,
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "desktop:dev": "pnpm --dir apps/desktop dev",
+    "desktop:build": "pnpm --dir apps/desktop build",
+    "desktop:typecheck": "pnpm --dir apps/desktop typecheck",
+    "tauri": "pnpm --dir apps/desktop tauri"
+  }
+}

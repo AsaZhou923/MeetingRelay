@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="MeetingRelay application icon">
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#0b1020" />
+  <rect x="104" y="200" width="56" height="152" rx="28" fill="#60a5fa" />
+  <rect x="192" y="152" width="56" height="200" rx="28" fill="#3b82f6" />
+  <rect x="280" y="112" width="56" height="240" rx="28" fill="#2563eb" />
+  <path d="M304 384h72l-28 28 34 34 86-86-86-86-34 34 28 28h-72z" fill="#93c5fd" />
+</svg>
