@@ -84,6 +84,12 @@ jobs:
           pnpm phase0:clock:validate
         timeout-minutes: 5
 
+      - name: Test and validate Phase 0 queue and resource harness
+        run: |
+          pnpm phase0:resources:test
+          pnpm phase0:resources:validate
+        timeout-minutes: 5
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
         timeout-minutes: 5

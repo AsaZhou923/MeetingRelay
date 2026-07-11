@@ -16,6 +16,8 @@
     "phase0:provider:validate": "node tools/phase0-harness/validate-provider-harness.mjs",
     "phase0:clock:test": "node --test tools/phase0-harness/clock-calibration.test.mjs",
     "phase0:clock:validate": "node tools/phase0-harness/validate-clock-calibration.mjs",
+    "phase0:resources:test": "node --test tools/phase0-harness/queue-resource-harness.test.mjs",
+    "phase0:resources:validate": "node tools/phase0-harness/validate-queue-resource-harness.mjs",
     "tauri": "pnpm --dir apps/desktop tauri"
   }
 }

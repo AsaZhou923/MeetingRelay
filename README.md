@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.3 Phase 0 harness work**. WP-0.3.1 through WP-0.3.4 established evidence, fixture, ledger, and provider-stub contracts; WP-0.3.5 calibrates the actual Node monotonic observation clock. Calibration records raw read pairs, descriptive overhead/observed-step diagnostics, and explicit capability gaps without numeric pass thresholds. It does not claim recording, ASR, translation, persistence, production UI behavior, a product provider, an independent clock-error bound, or formal `PERF-RT-*` evidence.
+MeetingRelay is currently in **WP-0.3 Phase 0 harness work**. WP-0.3.1 through WP-0.3.5 established evidence, fixture, ledger, provider-stub, and monotonic-clock contracts. WP-0.3.6 adds a deterministic synthetic queue evidence surface plus actual Node process/system resource snapshots. Queue outcomes are bounded and conserved; unavailable Windows metrics stay explicit `null + unsupported/unavailable` values instead of fabricated zeros. This work does not claim recording, ASR, translation, persistence, production UI behavior, a product queue, a resource budget, or formal `PERF-RT-*` evidence.
 
 ## Prerequisites
 
@@ -27,6 +27,8 @@ pnpm phase0:provider:test
 pnpm phase0:provider:validate
 pnpm phase0:clock:test
 pnpm phase0:clock:validate
+pnpm phase0:resources:test
+pnpm phase0:resources:validate
 pnpm tauri -- --version
 ```
 
@@ -46,6 +48,8 @@ pnpm phase0:provider:test
 pnpm phase0:provider:validate
 pnpm phase0:clock:test
 pnpm phase0:clock:validate
+pnpm phase0:resources:test
+pnpm phase0:resources:validate
 pnpm --dir apps/desktop test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -63,5 +67,7 @@ IPC and ledger uint64/ns values use canonical unsigned decimal strings. The ledg
 The provider harness performs two clean, byte-identical virtual-clock runs under ignored `target/wp-0.3/provider-harness/`. Version 1.0 intentionally accepts only the committed empty fault plan; any non-empty or unknown fault step fails before the first emission. Logical offsets are ordering inputs, not latency observations or performance evidence.
 
 Clock calibration performs two actual `process.hrtime.bigint()` runs under ignored `target/wp-0.3/ct-clock-cal-001/`. Each run has its own `node.hrtime.<run_id>` domain and cannot be subtracted from another run. Runtime artifact byte equality is explicitly not required. `observed_resolution` and `observed_quantization` are descriptive values from this sample only; reference-clock error stays `null` because no independent reference clock exists.
+
+The queue/resource harness writes two runs under ignored `target/wp-0.3/ct-resource-harness-001/`. Its fixed-capacity `Q-HARNESS-COALESCE` scenario uses a logical clock and must produce byte-identical queue artifacts. Mutually exclusive dequeue, drop, merge, cancel, and remaining-depth outcomes conserve every enqueued item; retry and full counters describe attempts only. Only an interim item identified as a `superseded_revision` may use the scripted drop/coalescing path. Actual resource snapshots use one `node.hrtime.<run_id>` domain per run and are validated for canonical encoding, capability/schema projection, observation-clock ordering, and checksums rather than cross-run byte equality. Per-core CPU arrays preserve each snapshot's order but do not claim stable core identity across samples. The harness does not use sleep, wall-clock time, or a network and does not establish production sampling cadence, resource limits, or product queue behavior.
 
 Commit-specific completion requires the `Phase 0 Contract CI` workflow to be green on the pinned `windows-2022` runner. Local success alone is not release evidence. These checks validate only the bootstrap and harness-contract boundaries and do not claim session, audio, ASR, translation, persistence, UI paint, or other product capability.
