@@ -66,6 +66,12 @@ jobs:
           pnpm phase0:fixtures:validate
         timeout-minutes: 5
 
+      - name: Test and validate Phase 0 replay ledgers
+        run: |
+          pnpm phase0:ledgers:test
+          pnpm phase0:ledgers:validate
+        timeout-minutes: 5
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
         timeout-minutes: 5

@@ -10,6 +10,8 @@
     "phase0:fixtures:generate": "node tools/phase0-harness/generate-fixtures.mjs",
     "phase0:fixtures:test": "node --test tools/phase0-harness/fixture-contract.test.mjs",
     "phase0:fixtures:validate": "node tools/phase0-harness/validate-fixtures.mjs",
+    "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
+    "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",
     "tauri": "pnpm --dir apps/desktop tauri"
   }
 }
