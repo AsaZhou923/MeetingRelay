@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.3 Phase 0 harness work**. WP-0.3.1 adds the evidence/trace eligibility contract on top of the completed Windows x64, Tauri 2, Rust, and pnpm bootstrap. It does not contain or claim any product features or performance result: recording, ASR, translation, persistence, production UI behavior, and formal `PERF-RT-*` evidence remain out of scope.
+MeetingRelay is currently in **WP-0.3 Phase 0 harness work**. WP-0.3.1 completed the evidence/trace eligibility contract; WP-0.3.2 adds one consent-safe, byte-reproducible calibration fixture and its checksum validator. It does not contain or claim any product features or performance result: recording, ASR, translation, persistence, production UI behavior, and formal `PERF-RT-*` evidence remain out of scope.
 
 ## Prerequisites
 
@@ -19,6 +19,8 @@ pnpm install
 pnpm desktop:typecheck
 pnpm desktop:dev
 pnpm desktop:build
+pnpm phase0:fixtures:test
+pnpm phase0:fixtures:validate
 pnpm tauri -- --version
 ```
 
@@ -30,6 +32,8 @@ Run the complete Phase 0 verification surface from the repository root:
 
 ```powershell
 pnpm install --frozen-lockfile
+pnpm phase0:fixtures:test
+pnpm phase0:fixtures:validate
 pnpm --dir apps/desktop test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

@@ -1,0 +1,224 @@
+{
+  "$id": "https://meetingrelay.local/schemas/fixture-manifest-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "fixtures": {
+      "items": {
+        "$ref": "#/$defs/fixture"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "manifest_revision": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "1.0"
+    }
+  },
+  "required": [
+    "fixtures",
+    "manifest_revision",
+    "schema_version"
+  ],
+  "title": "MeetingRelay Phase 0 Fixture Registry",
+  "type": "object",
+  "$defs": {
+    "asset": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)|\\\\"
+          },
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "audio": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "const": 1
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/uint64String"
+        },
+        "integrated_lufs": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "integrated_lufs_status": {
+          "const": "not-applicable-calibration-pulse"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "pcm_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "sample_format": {
+          "const": "s16le"
+        },
+        "sample_rate_hz": {
+          "const": 16000
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channels",
+        "duration_ms",
+        "integrated_lufs",
+        "integrated_lufs_status",
+        "path",
+        "pcm_sha256",
+        "sample_format",
+        "sample_rate_hz",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "fixture": {
+      "additionalProperties": false,
+      "properties": {
+        "audio": {
+          "$ref": "#/$defs/audio"
+        },
+        "contains_human_voice": {
+          "const": false
+        },
+        "contains_meeting_content": {
+          "const": false
+        },
+        "contains_personal_data": {
+          "const": false
+        },
+        "created_at": {
+          "format": "date",
+          "type": "string"
+        },
+        "fault_plan": {
+          "$ref": "#/$defs/asset"
+        },
+        "fixture_id": {
+          "pattern": "^FX-[A-Z0-9]+-[A-Z0-9]+-[0-9]{3}-v[1-9][0-9]*$",
+          "type": "string"
+        },
+        "language": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "privacy_class": {
+          "const": "public-safe"
+        },
+        "provider_script": {
+          "$ref": "#/$defs/asset"
+        },
+        "provenance": {
+          "additionalProperties": false,
+          "properties": {
+            "consent_record": {
+              "type": "null"
+            },
+            "generator": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "generator_version": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "synthetic"
+            },
+            "license": {
+              "const": "project-generated"
+            },
+            "source_url": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "consent_record",
+            "generator",
+            "generator_version",
+            "kind",
+            "license",
+            "source_url"
+          ],
+          "type": "object"
+        },
+        "purpose": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "reference": {
+          "$ref": "#/$defs/asset"
+        },
+        "reviewed_by": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tier": {
+          "const": "calibration"
+        }
+      },
+      "required": [
+        "audio",
+        "contains_human_voice",
+        "contains_meeting_content",
+        "contains_personal_data",
+        "created_at",
+        "fault_plan",
+        "fixture_id",
+        "language",
+        "privacy_class",
+        "provider_script",
+        "provenance",
+        "purpose",
+        "reference",
+        "reviewed_by",
+        "revision",
+        "tier"
+      ],
+      "type": "object"
+    },
+    "uint64String": {
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    }
+  }
+}

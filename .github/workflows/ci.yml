@@ -41,12 +41,29 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
 
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.95.0-
+
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
         timeout-minutes: 10
 
       - name: Test desktop bootstrap contract
         run: pnpm --dir apps/desktop test
+        timeout-minutes: 5
+
+      - name: Test and validate Phase 0 fixtures
+        run: |
+          pnpm phase0:fixtures:test
+          pnpm phase0:fixtures:validate
         timeout-minutes: 5
 
       - name: Check Rust formatting

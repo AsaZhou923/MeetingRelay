@@ -1,0 +1,14 @@
+{
+  "contains_speech": false,
+  "content_class": "calibration-pulse-only",
+  "fixture_id": "FX-UND-CAL-001-v1",
+  "pulse_duration_samples": "80",
+  "pulse_start_samples": [
+    "4000",
+    "16000",
+    "28000"
+  ],
+  "schema_version": "1.0",
+  "timeline_rate": 16000,
+  "transcript": null
+}

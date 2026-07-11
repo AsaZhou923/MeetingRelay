@@ -7,6 +7,9 @@
     "desktop:dev": "pnpm --dir apps/desktop dev",
     "desktop:build": "pnpm --dir apps/desktop build",
     "desktop:typecheck": "pnpm --dir apps/desktop typecheck",
+    "phase0:fixtures:generate": "node tools/phase0-harness/generate-fixtures.mjs",
+    "phase0:fixtures:test": "node --test tools/phase0-harness/fixture-contract.test.mjs",
+    "phase0:fixtures:validate": "node tools/phase0-harness/validate-fixtures.mjs",
     "tauri": "pnpm --dir apps/desktop tauri"
   }
 }
