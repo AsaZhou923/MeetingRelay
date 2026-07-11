@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.2 benchmark-only bootstrap**. This workspace establishes the Windows x64, Tauri 2, Rust, and pnpm build boundary needed by later validation work. It does not contain or claim any product features: recording, ASR, translation, persistence, and production UI behavior remain out of scope for this work package.
+MeetingRelay is currently in **WP-0.3 Phase 0 harness work**. WP-0.3.1 adds the evidence/trace eligibility contract on top of the completed Windows x64, Tauri 2, Rust, and pnpm bootstrap. It does not contain or claim any product features or performance result: recording, ASR, translation, persistence, production UI behavior, and formal `PERF-RT-*` evidence remain out of scope.
 
 ## Prerequisites
 
@@ -26,7 +26,7 @@ The desktop commands delegate to `apps/desktop`. The Tauri command forwards addi
 
 ## Verification
 
-Run the complete WP-0.2 verification surface from the repository root:
+Run the complete Phase 0 verification surface from the repository root:
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -44,4 +44,4 @@ pnpm --dir apps/desktop tauri build --no-bundle
 
 IPC uint64/ns values use canonical unsigned decimal strings, and frontend contract tests plus the Tauri mock IPC test cover the shared command-name contract.
 
-Commit-specific completion requires the `WP-0.2 Bootstrap CI` workflow to be green on the pinned `windows-2022` runner. Local success alone is not release evidence. These checks validate only the benchmark bootstrap boundary and do not claim session, audio, ASR, translation, persistence, or other product capability.
+Commit-specific completion requires the `Phase 0 Contract CI` workflow to be green on the pinned `windows-2022` runner. Local success alone is not release evidence. These checks validate only the bootstrap and harness-contract boundaries and do not claim session, audio, ASR, translation, persistence, UI paint, or other product capability.

@@ -1,4 +1,4 @@
-name: WP-0.2 Bootstrap CI
+name: Phase 0 Contract CI
 
 on:
   pull_request:
@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  bootstrap:
-    name: Windows bootstrap
+  phase0-contract:
+    name: Windows Phase 0 contracts
     runs-on: windows-2022
     timeout-minutes: 60
 

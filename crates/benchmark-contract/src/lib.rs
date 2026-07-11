@@ -2,6 +2,17 @@
 //!
 //! This crate intentionally contains no capture, session, model, or product code.
 
+mod decimal;
+mod evidence;
+mod timepoint;
+
+pub use decimal::{CanonicalU64, ParseCanonicalU64Error};
+pub use evidence::{EvidenceClaim, EvidenceError, EvidenceStage, MetricId};
+pub use timepoint::{
+    EndpointKind, SegmentJoinKey, SegmentJoinKeyError, TracePoint, TranslationJoinKey,
+    TranslationJoinKeyError,
+};
+
 /// Version of the bootstrap benchmark contract exposed by the desktop shell.
 pub const CONTRACT_VERSION: &str = "meetingrelay.phase0.bootstrap.v1";
 
