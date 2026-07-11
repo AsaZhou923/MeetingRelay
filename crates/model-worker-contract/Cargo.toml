@@ -1,0 +1,11 @@
+[package]
+name = "meetingrelay-model-worker-contract"
+description = "Transport-neutral model worker contract for MeetingRelay Phase 0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

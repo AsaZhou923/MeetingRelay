@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.3 Phase 0 harness work**. WP-0.3.1 through WP-0.3.5 established evidence, fixture, ledger, provider-stub, and monotonic-clock contracts. WP-0.3.6 adds a deterministic synthetic queue evidence surface plus actual Node process/system resource snapshots. Queue outcomes are bounded and conserved; unavailable Windows metrics stay explicit `null + unsupported/unavailable` values instead of fabricated zeros. This work does not claim recording, ASR, translation, persistence, production UI behavior, a product queue, a resource budget, or formal `PERF-RT-*` evidence.
+MeetingRelay is currently in **WP-0.4.1 model-worker contract work**. WP-0.3.1 through WP-0.3.7 completed the deterministic Phase 0 fixture, ledger, provider, clock, queue/resource, and integrated harness gates. WP-0.4.1 adds one std-only Rust semantic contract for replaceable model workers and exercises it through direct and in-memory queued fake transports. It deliberately contains no wire codec, named-pipe framing, model SDK, real candidate, candidate ranking, recording, ASR result, translation, persistence, production UI behavior, resource budget, or formal `PERF-RT-*` evidence.
 
 ## Prerequisites
 
@@ -29,6 +29,7 @@ pnpm phase0:clock:test
 pnpm phase0:clock:validate
 pnpm phase0:resources:test
 pnpm phase0:resources:validate
+cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 pnpm tauri -- --version
 ```
 
@@ -50,6 +51,7 @@ pnpm phase0:clock:test
 pnpm phase0:clock:validate
 pnpm phase0:resources:test
 pnpm phase0:resources:validate
+cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 pnpm --dir apps/desktop test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

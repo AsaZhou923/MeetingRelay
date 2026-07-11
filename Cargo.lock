@@ -1613,6 +1613,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "meetingrelay-model-worker-contract"
+version = "0.0.1"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

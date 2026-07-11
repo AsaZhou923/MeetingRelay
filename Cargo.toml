@@ -2,6 +2,7 @@
 members = [
   "apps/desktop/src-tauri",
   "crates/benchmark-contract",
+  "crates/model-worker-contract",
 ]
 resolver = "3"
 
