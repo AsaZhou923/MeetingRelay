@@ -71,14 +71,17 @@ test("explicit archive acquisition uses the HTTPS-only curl path", async () => {
   const materializer = await readFile(MATERIALIZER_PATH, "utf8");
   assert.doesNotMatch(materializer, /\bInvoke-WebRequest\b/);
   assert.doesNotMatch(materializer, /Get-Command\s+curl\.exe/);
+  assert.doesNotMatch(materializer, /&\s+tar(?:\.exe)?\b/);
   assert.match(
     materializer,
     /& \$curlPath `\r?\n\s+--disable `\r?\n\s+--proto '=https'/,
     "--disable must be the first curl argument so curlrc files cannot weaken the transfer policy",
   );
   for (const required of [
-    'Join-Path $env:SystemRoot "System32\\curl.exe"',
-    'Assert-RegularFile -Path $curlPath -Label "Windows system curl.exe"',
+    'ValidateSet("curl.exe", "tar.exe")',
+    'Resolve-WindowsSystemToolPath -Name "curl.exe"',
+    'Resolve-WindowsSystemToolPath -Name "tar.exe"',
+    'Assert-RegularFile -Path $toolPath -Label "Windows system $Name"',
     "--disable",
     "--proto '=https'",
     "--proto-redir '=https'",

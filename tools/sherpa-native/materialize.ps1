@@ -206,6 +206,17 @@ function Get-LowerSha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Resolve-WindowsSystemToolPath {
+    param([Parameter(Mandatory = $true)][ValidateSet("curl.exe", "tar.exe")][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        throw "SystemRoot is required to locate trusted Windows system tools"
+    }
+    $toolPath = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot "System32\$Name"))
+    Assert-RegularFile -Path $toolPath -Label "Windows system $Name"
+    return $toolPath
+}
+
 function Invoke-LockedHttpsDownload {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -217,11 +228,7 @@ function Invoke-LockedHttpsDownload {
     if (-not $Url.StartsWith("https://github.com/", [StringComparison]::Ordinal)) {
         throw "Locked download URL is not an allowed GitHub HTTPS URL: $Url"
     }
-    if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
-        throw "SystemRoot is required to locate the trusted Windows curl.exe"
-    }
-    $curlPath = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot "System32\curl.exe"))
-    Assert-RegularFile -Path $curlPath -Label "Windows system curl.exe"
+    $curlPath = Resolve-WindowsSystemToolPath -Name "curl.exe"
     Write-Host "SHERPA_ARCHIVE_DOWNLOAD_START name=$Name expected_bytes=$ExpectedSizeBytes"
     & $curlPath `
         --disable `
@@ -269,11 +276,13 @@ function Assert-SafeArchiveListing {
     )
 
     Assert-RegularFile -Path $ArchivePath -Label "archive"
-    $entries = @(& tar -tjf $ArchivePath)
+    $tarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
+    Write-Host "SHERPA_ARCHIVE_LISTING_START path=$ArchivePath"
+    $entries = @(& $tarPath -tjf $ArchivePath)
     if ($LASTEXITCODE -ne 0 -or $entries.Count -eq 0) {
         throw "Unable to inspect archive path listing: $ArchivePath"
     }
-    $verboseEntries = @(& tar -tvjf $ArchivePath)
+    $verboseEntries = @(& $tarPath -tvjf $ArchivePath)
     if ($LASTEXITCODE -ne 0 -or $verboseEntries.Count -ne $entries.Count) {
         throw "Unable to inspect archive entry types: $ArchivePath"
     }
@@ -321,6 +330,7 @@ function Assert-SafeArchiveListing {
             throw "Archive omits a sealed inventory file: $expectedFile"
         }
     }
+    Write-Host "SHERPA_ARCHIVE_LISTING_COMPLETE path=$ArchivePath"
 }
 
 function Assert-ExtractedInventory {
@@ -424,8 +434,9 @@ function Get-VerifiedExtraction {
     New-SafeCacheDirectory -Path $temporary
     try {
         Assert-WithinCache -Value $temporary -Label "pre-extraction directory"
+        $tarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
         Write-Host "SHERPA_ARCHIVE_EXTRACTION_START name=$($Archive.name)"
-        & tar -xjf $ArchivePath -C $temporary
+        & $tarPath -xjf $ArchivePath -C $temporary
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to extract locked archive: $ArchivePath"
         }
@@ -449,9 +460,7 @@ if ($MyInvocation.InvocationName -eq ".") {
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw "Node.js is required to validate the committed asset lock"
 }
-if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
-    throw "tar with bzip2 support is required to materialize sherpa assets"
-}
+$null = Resolve-WindowsSystemToolPath -Name "tar.exe"
 
 & node (Join-Path $scriptRoot "validate-lock.mjs") $lockPath
 if ($LASTEXITCODE -ne 0) {

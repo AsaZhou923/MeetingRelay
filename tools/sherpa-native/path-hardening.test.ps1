@@ -15,6 +15,8 @@ $archiveRoot = Join-Path $archiveInput "locked-root"
 $archivePath = Join-Path $testRoot "hardlink.tar.bz2"
 $overlapRoot = Join-Path $testRoot "overlap-source"
 $overlapLibDir = Join-Path $overlapRoot "lib"
+. (Join-Path $scriptRoot "materialize.ps1")
+$systemTarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
 
 function Assert-TestRootBoundary {
     $resolved = [IO.Path]::GetFullPath($testRoot)
@@ -126,11 +128,10 @@ try {
         Write-Output "ARCHIVE_HARDLINK_REGRESSION=SKIP (hard-link creation unavailable)"
         return
     }
-    & tar -cjf $archivePath -C $archiveInput "locked-root"
+    & $systemTarPath -cjf $archivePath -C $archiveInput "locked-root"
     if ($LASTEXITCODE -ne 0) {
         throw "Could not create the hard-link regression archive"
     }
-    . (Join-Path $scriptRoot "materialize.ps1")
     $inventory = @(
         [PSCustomObject]@{ path = "first.bin" },
         [PSCustomObject]@{ path = "second.bin" }
