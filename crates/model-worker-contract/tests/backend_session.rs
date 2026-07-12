@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 use meetingrelay_model_worker_contract::{
     Architecture, AudioChunk, AudioFormat, AudioPayload, AudioSource, BackendAction,
     BackendFailure, BackendOutcome, CancelReason, CapabilitySet, ContractError, ContractPurpose,
-    DirectFakeTransport, DirectWorkerSession, EngineDescriptor, ExecutionProvider,
-    FixedPointConfidence, HelloRequest, Identifier, InMemoryQueuedTransport, JobKey, LanguageCode,
-    ModelBackend, MonotonicDeadline, OperatingSystem, Platform, PrepareRequest,
-    QueuedWorkerSession, RequestContext, SampleFormat, SanitizedText, Sha256Digest, SourceRange,
-    TranscriptProvenance, TranscriptResult, TranscriptText, TransportKind, WORKER_PROTOCOL_V1,
-    WorkerCommand, WorkerEndpoint, WorkerEvent, WorkerLimits, WorkerManifest, WorkerRequest,
-    WorkerResponse, WorkerRole,
+    DirectFakeTransport, DirectWorkerSession, EngineDescriptor, ErrorCategory, ErrorSeverity,
+    ExecutionProvider, FixedPointConfidence, HelloRequest, Identifier, InMemoryQueuedTransport,
+    JobKey, LanguageCode, ModelBackend, MonotonicDeadline, OperatingSystem, Platform,
+    PrepareRequest, QueuedWorkerSession, RecoveryAction, RequestContext, SampleFormat,
+    SanitizedText, Sha256Digest, SourceRange, TranscriptProvenance, TranscriptResult,
+    TranscriptText, TransportKind, WORKER_PROTOCOL_V1, WorkerCommand, WorkerEndpoint, WorkerEvent,
+    WorkerLimits, WorkerManifest, WorkerRequest, WorkerResponse, WorkerRole,
 };
 
 const CLOCK_DOMAIN: &str = "core-fixture-clock";
@@ -262,6 +262,10 @@ impl CountingBackend {
 }
 
 impl ModelBackend for CountingBackend {
+    fn prepare(&mut self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
     fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
         let outcome = {
             let mut state = self.state.lock().expect("probe lock");
@@ -286,6 +290,95 @@ impl ModelBackend for CountingBackend {
     }
 }
 
+struct PanicOnceBackend {
+    calls: Arc<Mutex<usize>>,
+    result: TranscriptResult,
+}
+
+impl PanicOnceBackend {
+    fn new(calls: Arc<Mutex<usize>>) -> Self {
+        Self {
+            calls,
+            result: transcript_result("en"),
+        }
+    }
+}
+
+impl ModelBackend for PanicOnceBackend {
+    fn prepare(&mut self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
+    fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
+        let call = {
+            let mut calls = self.calls.lock().expect("panic backend call lock");
+            *calls += 1;
+            *calls
+        };
+        if call == 1 {
+            panic!("sensitive-backend-panic-payload");
+        }
+        action.completed(self.result.clone())
+    }
+}
+
+enum PlannedPreparation {
+    Success,
+    Failure(BackendFailure),
+    Panic,
+}
+
+#[derive(Default)]
+struct PreparationProbe {
+    calls: usize,
+    plans: VecDeque<PlannedPreparation>,
+}
+
+struct PreparationBackend {
+    state: Arc<Mutex<PreparationProbe>>,
+    result: TranscriptResult,
+}
+
+impl PreparationBackend {
+    fn new(
+        plans: impl IntoIterator<Item = PlannedPreparation>,
+    ) -> (Self, Arc<Mutex<PreparationProbe>>) {
+        let state = Arc::new(Mutex::new(PreparationProbe {
+            calls: 0,
+            plans: plans.into_iter().collect(),
+        }));
+        (
+            Self {
+                state: Arc::clone(&state),
+                result: transcript_result("en"),
+            },
+            state,
+        )
+    }
+}
+
+impl ModelBackend for PreparationBackend {
+    fn prepare(&mut self) -> Result<(), BackendFailure> {
+        let plan = {
+            let mut state = self.state.lock().expect("preparation probe lock");
+            state.calls += 1;
+            state
+                .plans
+                .pop_front()
+                .unwrap_or(PlannedPreparation::Success)
+        };
+        match plan {
+            PlannedPreparation::Success => Ok(()),
+            PlannedPreparation::Failure(failure) => Err(failure),
+            PlannedPreparation::Panic => panic!("sensitive-backend-prepare-panic-payload"),
+        }
+    }
+
+    fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
+        action.completed(self.result.clone())
+    }
+}
+
 struct StaleOutcomeBackend {
     calls: Arc<Mutex<usize>>,
     stale_first_outcome: Option<BackendOutcome>,
@@ -307,6 +400,10 @@ impl StaleOutcomeBackend {
 }
 
 impl ModelBackend for StaleOutcomeBackend {
+    fn prepare(&mut self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
     fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
         let call = {
             let mut calls = self.calls.lock().expect("stale backend call lock");
@@ -356,6 +453,10 @@ impl SharedStaleOutcomeBackend {
 }
 
 impl ModelBackend for SharedStaleOutcomeBackend {
+    fn prepare(&mut self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
     fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
         let mut state = self.state.lock().expect("shared stale backend lock");
         state.calls += 1;
@@ -457,9 +558,98 @@ fn queued_harness(
     (Harness::new(endpoint, worker_limits), state)
 }
 
+fn direct_preparation_harness(
+    plans: impl IntoIterator<Item = PlannedPreparation>,
+) -> (Harness<DirectWorkerSession>, Arc<Mutex<PreparationProbe>>) {
+    let (backend, state) = PreparationBackend::new(plans);
+    let endpoint = DirectWorkerSession::new(manifest(), limits(), backend)
+        .expect("direct prepare constructor");
+    (Harness::new(endpoint, limits()), state)
+}
+
+fn queued_preparation_harness(
+    plans: impl IntoIterator<Item = PlannedPreparation>,
+) -> (Harness<QueuedWorkerSession>, Arc<Mutex<PreparationProbe>>) {
+    let (backend, state) = PreparationBackend::new(plans);
+    let endpoint = QueuedWorkerSession::new(manifest(), limits(), backend)
+        .expect("queued prepare constructor");
+    (Harness::new(endpoint, limits()), state)
+}
+
+fn preparation_call_count(state: &Arc<Mutex<PreparationProbe>>) -> usize {
+    state.lock().expect("preparation probe lock").calls
+}
+
 fn only_event(responses: &[WorkerResponse]) -> &WorkerEvent {
     assert_eq!(responses.len(), 1);
     responses[0].event()
+}
+
+fn assert_backend_panic_failure(responses: &[WorkerResponse]) {
+    assert!(matches!(
+        only_event(responses),
+        WorkerEvent::Failure { error, .. }
+            if error.code().as_str() == "MODEL_BACKEND_PANIC"
+                && error.user_message_key().as_str() == "model.backend_failure"
+                && !error.retryable()
+                && error.sanitized_detail().is_none()
+    ));
+    assert!(!format!("{responses:?}").contains("sensitive-backend-panic-payload"));
+}
+
+fn assert_backend_poisoned_failure(responses: &[WorkerResponse]) {
+    assert!(matches!(
+        only_event(responses),
+        WorkerEvent::Failure { error, .. }
+            if error.code().as_str() == "MODEL_BACKEND_POISONED"
+                && error.user_message_key().as_str() == "model.backend_failure"
+                && !error.retryable()
+                && error.sanitized_detail().is_none()
+    ));
+}
+
+fn assert_model_ready(responses: &[WorkerResponse], expected: bool) {
+    assert!(matches!(
+        only_event(responses),
+        WorkerEvent::Health { model_ready, .. } if *model_ready == expected
+    ));
+}
+
+fn assert_preparation_failure(responses: &[WorkerResponse], expected_code: &str, retryable: bool) {
+    assert_eq!(responses.len(), 1);
+    let response = &responses[0];
+    assert!(response.meeting_id().is_none());
+    assert!(response.job_id().is_none());
+    assert!(response.segment_id().is_none());
+    let WorkerEvent::PreparationFailed { error } = response.event() else {
+        panic!("expected preparation failure, got {:?}", response.event());
+    };
+    assert_eq!(error.code().as_str(), expected_code);
+    assert_eq!(error.category(), ErrorCategory::Model);
+    assert_eq!(error.severity(), ErrorSeverity::Error);
+    assert_eq!(error.retryable(), retryable);
+    assert_eq!(error.user_message_key().as_str(), "model.backend_failure");
+    let expected_recovery = if retryable {
+        vec![
+            RecoveryAction::Retry,
+            RecoveryAction::RestartWorker,
+            RecoveryAction::ChooseAnotherEngine,
+        ]
+    } else {
+        vec![
+            RecoveryAction::RestartWorker,
+            RecoveryAction::ChooseAnotherEngine,
+        ]
+    };
+    assert_eq!(error.recovery_actions(), expected_recovery);
+    assert_eq!(error.correlation_id(), response.correlation_id());
+    assert_eq!(
+        error.correlation_sequence(),
+        response.correlation_sequence()
+    );
+    assert!(error.meeting_id().is_none());
+    assert!(error.segment_id().is_none());
+    assert!(error.sanitized_detail().is_none());
 }
 
 fn fill_two_delivery_slots<E: WorkerEndpoint>(harness: &mut Harness<E>, label: &str) {
@@ -577,6 +767,273 @@ fn assert_restart_waits_for_two_delivery_slots<E: WorkerEndpoint>(
     ));
     assert!(weak.upgrade().is_none());
     assert_eq!(call_count(&state), 0);
+}
+
+fn assert_prepare_success_once_and_replay_is_frozen<E: WorkerEndpoint>(
+    mut harness: Harness<E>,
+    state: Arc<Mutex<PreparationProbe>>,
+    deferred_until_drain: bool,
+    label: &str,
+) {
+    let prepare = harness.stamp(prepare_request(&format!("message-{label}-prepare")));
+    harness
+        .submit_exact(prepare.clone())
+        .expect("prepare admission");
+    assert_eq!(
+        preparation_call_count(&state),
+        usize::from(!deferred_until_drain)
+    );
+    let first = harness.drain().expect("prepare completion");
+    assert!(matches!(
+        only_event(&first),
+        WorkerEvent::Prepared { ready: true, .. }
+    ));
+    assert_eq!(preparation_call_count(&state), 1);
+
+    harness
+        .submit_exact(prepare)
+        .expect("frozen prepare replay admission");
+    assert_eq!(harness.drain().expect("frozen prepare replay"), first);
+    assert_eq!(preparation_call_count(&state), 1);
+}
+
+fn assert_prepare_failure_is_frozen_and_new_request_recovers<E: WorkerEndpoint>(
+    mut harness: Harness<E>,
+    state: Arc<Mutex<PreparationProbe>>,
+    deferred_until_drain: bool,
+    label: &str,
+) {
+    let prepare = harness.stamp(prepare_request(&format!("message-{label}-prepare-fail")));
+    harness
+        .submit_exact(prepare.clone())
+        .expect("failed prepare admission");
+    assert_eq!(
+        preparation_call_count(&state),
+        usize::from(!deferred_until_drain)
+    );
+    let first = harness.drain().expect("failed prepare completion");
+    assert_preparation_failure(&first, "SHERPA_INIT_FAILED", true);
+    assert_eq!(preparation_call_count(&state), 1);
+
+    harness
+        .submit_exact(prepare)
+        .expect("failed prepare replay admission");
+    assert_eq!(
+        harness.drain().expect("frozen failed prepare replay"),
+        first
+    );
+    assert_eq!(preparation_call_count(&state), 1);
+
+    let unhealthy = harness
+        .exchange(request(
+            &format!("message-{label}-health-before-retry"),
+            None,
+            WorkerCommand::Health,
+        ))
+        .expect("health before retry");
+    assert_model_ready(&unhealthy, false);
+
+    let recovered = harness
+        .exchange(prepare_request(&format!("message-{label}-prepare-retry")))
+        .expect("new prepare request retries backend");
+    assert!(matches!(
+        only_event(&recovered),
+        WorkerEvent::Prepared { ready: true, .. }
+    ));
+    assert_eq!(preparation_call_count(&state), 2);
+
+    let healthy = harness
+        .exchange(request(
+            &format!("message-{label}-health-after-retry"),
+            None,
+            WorkerCommand::Health,
+        ))
+        .expect("health after retry");
+    assert_model_ready(&healthy, true);
+}
+
+fn assert_prepare_panic_is_redacted_and_frozen<E: WorkerEndpoint>(
+    mut harness: Harness<E>,
+    state: Arc<Mutex<PreparationProbe>>,
+    deferred_until_drain: bool,
+    label: &str,
+) {
+    let prepare = harness.stamp(prepare_request(&format!("message-{label}-prepare-panic")));
+    harness
+        .submit_exact(prepare.clone())
+        .expect("panic prepare admission");
+    assert_eq!(
+        preparation_call_count(&state),
+        usize::from(!deferred_until_drain)
+    );
+    let first = harness.drain().expect("panic prepare completion");
+    assert_preparation_failure(&first, "MODEL_BACKEND_PANIC", false);
+    assert!(!format!("{first:?}").contains("sensitive-backend-prepare-panic-payload"));
+    assert_eq!(preparation_call_count(&state), 1);
+
+    harness
+        .submit_exact(prepare)
+        .expect("panic prepare replay admission");
+    assert_eq!(harness.drain().expect("frozen panic prepare replay"), first);
+    assert_eq!(preparation_call_count(&state), 1);
+
+    let poisoned = harness
+        .exchange(prepare_request(&format!(
+            "message-{label}-prepare-after-panic"
+        )))
+        .expect("poisoned prepare is an explicit failure");
+    assert_preparation_failure(&poisoned, "MODEL_BACKEND_POISONED", false);
+    assert_eq!(preparation_call_count(&state), 1);
+
+    let restarted = harness
+        .exchange(request(
+            &format!("message-{label}-restart"),
+            None,
+            WorkerCommand::Restart,
+        ))
+        .expect("restart after backend panic");
+    assert!(
+        restarted
+            .iter()
+            .any(|response| matches!(response.event(), WorkerEvent::Restarted { .. }))
+    );
+
+    let poisoned_after_restart = harness
+        .exchange(prepare_request(&format!(
+            "message-{label}-prepare-after-restart"
+        )))
+        .expect("restart does not clear backend poison");
+    assert_preparation_failure(&poisoned_after_restart, "MODEL_BACKEND_POISONED", false);
+    assert_eq!(preparation_call_count(&state), 1);
+}
+
+fn assert_execute_poison_blocks_actions_and_survives_restart<E: WorkerEndpoint>(
+    harness: &mut Harness<E>,
+    calls: &Arc<Mutex<usize>>,
+    label: &str,
+) {
+    let unhealthy_after_panic = harness
+        .exchange(request(
+            &format!("message-{label}-health-after-panic"),
+            None,
+            WorkerCommand::Health,
+        ))
+        .expect("poisoned backend is not ready");
+    assert_model_ready(&unhealthy_after_panic, false);
+
+    let poisoned_target = job(&format!("{label}-poisoned-action"));
+    harness
+        .exchange(request(
+            &format!("message-{label}-poisoned-audio"),
+            Some(&poisoned_target),
+            WorkerCommand::AcceptAudio(pcm_chunk(1, 0)),
+        ))
+        .expect("audio admission remains contract-owned after backend panic");
+    let poisoned = harness
+        .exchange(request(
+            &format!("message-{label}-poisoned-flush"),
+            Some(&poisoned_target),
+            WorkerCommand::FlushSegment,
+        ))
+        .expect("poisoned backend action is an explicit failure");
+    assert_backend_poisoned_failure(&poisoned);
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 1);
+
+    let restarted = harness
+        .exchange(request(
+            &format!("message-{label}-restart"),
+            None,
+            WorkerCommand::Restart,
+        ))
+        .expect("restart after execute panic");
+    assert!(
+        restarted
+            .iter()
+            .any(|response| matches!(response.event(), WorkerEvent::Restarted { .. }))
+    );
+    let unhealthy_after_restart = harness
+        .exchange(request(
+            &format!("message-{label}-health-after-restart"),
+            None,
+            WorkerCommand::Health,
+        ))
+        .expect("restart cannot restore a poisoned backend");
+    assert_model_ready(&unhealthy_after_restart, false);
+    let prepare_after_restart = harness
+        .exchange(prepare_request(&format!(
+            "message-{label}-prepare-after-restart"
+        )))
+        .expect("restart does not clear execute poison");
+    assert_preparation_failure(&prepare_after_restart, "MODEL_BACKEND_POISONED", false);
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 1);
+}
+
+#[test]
+fn direct_prepare_success_runs_once_and_replay_is_frozen() {
+    let (harness, state) = direct_preparation_harness([PlannedPreparation::Success]);
+    assert_prepare_success_once_and_replay_is_frozen(harness, state, false, "direct-success");
+}
+
+#[test]
+fn queued_prepare_success_defers_to_drain_runs_once_and_replay_is_frozen() {
+    let (harness, state) = queued_preparation_harness([PlannedPreparation::Success]);
+    assert_prepare_success_once_and_replay_is_frozen(harness, state, true, "queued-success");
+}
+
+#[test]
+fn direct_prepare_failure_is_frozen_and_new_request_recovers_readiness() {
+    let failure = BackendFailure::new(id("SHERPA_INIT_FAILED"), true, None);
+    let (harness, state) = direct_preparation_harness([
+        PlannedPreparation::Failure(failure),
+        PlannedPreparation::Success,
+    ]);
+    assert_prepare_failure_is_frozen_and_new_request_recovers(
+        harness,
+        state,
+        false,
+        "direct-failure",
+    );
+}
+
+#[test]
+fn queued_prepare_failure_is_frozen_and_new_request_recovers_readiness() {
+    let failure = BackendFailure::new(id("SHERPA_INIT_FAILED"), true, None);
+    let (harness, state) = queued_preparation_harness([
+        PlannedPreparation::Failure(failure),
+        PlannedPreparation::Success,
+    ]);
+    assert_prepare_failure_is_frozen_and_new_request_recovers(
+        harness,
+        state,
+        true,
+        "queued-failure",
+    );
+}
+
+#[test]
+fn direct_prepare_panic_is_redacted_and_frozen() {
+    let (harness, state) = direct_preparation_harness([PlannedPreparation::Panic]);
+    assert_prepare_panic_is_redacted_and_frozen(harness, state, false, "direct-panic");
+    let (recovery, recovery_state) = direct_preparation_harness([PlannedPreparation::Success]);
+    assert_prepare_success_once_and_replay_is_frozen(
+        recovery,
+        recovery_state,
+        false,
+        "direct-new-session-recovery",
+    );
+}
+
+#[test]
+fn queued_prepare_panic_is_redacted_and_frozen() {
+    let (harness, state) = queued_preparation_harness([PlannedPreparation::Panic]);
+    assert_prepare_panic_is_redacted_and_frozen(harness, state, true, "queued-panic");
+    let (recovery, recovery_state) = queued_preparation_harness([PlannedPreparation::Success]);
+    assert_prepare_success_once_and_replay_is_frozen(
+        recovery,
+        recovery_state,
+        true,
+        "queued-new-session-recovery",
+    );
 }
 
 #[test]
@@ -898,6 +1355,129 @@ fn backend_failure_and_replay_are_frozen_without_rerun() {
     harness.submit_exact(flush).expect("submit replay");
     assert_eq!(harness.drain().expect("replay failure"), first);
     assert_eq!(call_count(&state), 1);
+}
+
+#[test]
+fn direct_backend_panic_is_stable_frozen_and_new_session_recovers() {
+    let calls = Arc::new(Mutex::new(0));
+    let endpoint = DirectWorkerSession::new(
+        manifest(),
+        limits(),
+        PanicOnceBackend::new(Arc::clone(&calls)),
+    )
+    .expect("direct panic session constructor");
+    let mut failed_session = Harness::new(endpoint, limits());
+    let target = job("direct-panic");
+    prime_audio(&mut failed_session, &target);
+    let flush = failed_session.stamp(request(
+        "message-direct-panic-flush",
+        Some(&target),
+        WorkerCommand::FlushSegment,
+    ));
+
+    failed_session
+        .submit_exact(flush.clone())
+        .expect("caught direct backend panic");
+    let first = failed_session.drain().expect("direct panic failure");
+    assert_backend_panic_failure(&first);
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 1);
+
+    failed_session
+        .submit_exact(flush)
+        .expect("direct panic replay admission");
+    assert_eq!(
+        failed_session.drain().expect("direct frozen panic replay"),
+        first
+    );
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 1);
+
+    assert_execute_poison_blocks_actions_and_survives_restart(
+        &mut failed_session,
+        &calls,
+        "direct-execute-panic",
+    );
+
+    let endpoint = DirectWorkerSession::new(
+        manifest(),
+        limits(),
+        PanicOnceBackend::new(Arc::clone(&calls)),
+    )
+    .expect("direct recovery session constructor");
+    let mut recovery_session = Harness::new(endpoint, limits());
+    assert_ne!(failed_session.session_epoch, recovery_session.session_epoch);
+    let recovery_target = job("direct-panic-recovery");
+    prime_audio(&mut recovery_session, &recovery_target);
+    let recovered = recovery_session
+        .exchange(request(
+            "message-direct-panic-recovery-flush",
+            Some(&recovery_target),
+            WorkerCommand::FlushSegment,
+        ))
+        .expect("new direct session recovers");
+    assert!(matches!(only_event(&recovered), WorkerEvent::Final { .. }));
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 2);
+}
+
+#[test]
+fn queued_backend_panic_is_stable_frozen_and_new_session_recovers() {
+    let calls = Arc::new(Mutex::new(0));
+    let endpoint = QueuedWorkerSession::new(
+        manifest(),
+        limits(),
+        PanicOnceBackend::new(Arc::clone(&calls)),
+    )
+    .expect("queued panic session constructor");
+    let mut failed_session = Harness::new(endpoint, limits());
+    let target = job("queued-panic");
+    prime_audio(&mut failed_session, &target);
+    let flush = failed_session.stamp(request(
+        "message-queued-panic-flush",
+        Some(&target),
+        WorkerCommand::FlushSegment,
+    ));
+
+    failed_session
+        .submit_exact(flush.clone())
+        .expect("queued panic action admission");
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 0);
+    let first = failed_session.drain().expect("queued panic failure");
+    assert_backend_panic_failure(&first);
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 1);
+
+    failed_session
+        .submit_exact(flush)
+        .expect("queued panic replay admission");
+    assert_eq!(
+        failed_session.drain().expect("queued frozen panic replay"),
+        first
+    );
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 1);
+
+    assert_execute_poison_blocks_actions_and_survives_restart(
+        &mut failed_session,
+        &calls,
+        "queued-execute-panic",
+    );
+
+    let endpoint = QueuedWorkerSession::new(
+        manifest(),
+        limits(),
+        PanicOnceBackend::new(Arc::clone(&calls)),
+    )
+    .expect("queued recovery session constructor");
+    let mut recovery_session = Harness::new(endpoint, limits());
+    assert_ne!(failed_session.session_epoch, recovery_session.session_epoch);
+    let recovery_target = job("queued-panic-recovery");
+    prime_audio(&mut recovery_session, &recovery_target);
+    let recovered = recovery_session
+        .exchange(request(
+            "message-queued-panic-recovery-flush",
+            Some(&recovery_target),
+            WorkerCommand::FlushSegment,
+        ))
+        .expect("new queued session recovers");
+    assert!(matches!(only_event(&recovered), WorkerEvent::Final { .. }));
+    assert_eq!(*calls.lock().expect("panic backend call lock"), 2);
 }
 
 #[test]
@@ -1251,7 +1831,7 @@ fn pcm_arc_is_released_after_backend_completion_and_not_retained_by_replay() {
         .exchange(prepare_request("message-arc-release-prepare"))
         .expect("prepare");
     let target = job("arc-release");
-    let samples: Arc<[i16]> = Arc::from([31_i16; 320]);
+    let samples: Arc<[i16]> = Arc::from([-12_345_i16; 320]);
     let weak = Arc::downgrade(&samples);
     harness
         .exchange(request(
@@ -1279,7 +1859,7 @@ fn pcm_arc_is_released_after_backend_completion_and_not_retained_by_replay() {
             .expect("probe lock")
             .action_debug
             .iter()
-            .all(|debug| !debug.contains("31"))
+            .all(|debug| !debug.contains("-12345"))
     );
 }
 

@@ -1,0 +1,9 @@
+[env]
+SHERPA_ONNX_LIB_DIR = { value = "target/sherpa-native/extracted/sherpa-onnx-v1.13.4-win-x64-shared-MT-Release-lib/lib", relative = true }
+
+# sherpa-onnx-sys declares `links = "sherpa-onnx"`. This target override
+# prevents its upstream convenience build script (and implicit downloader)
+# from running. The MeetingRelay adapter build script performs the sealed
+# inventory verification, link directives, and DLL staging instead.
+[target.x86_64-pc-windows-msvc.sherpa-onnx]
+rustc-link-lib = []

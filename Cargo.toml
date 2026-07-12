@@ -3,6 +3,7 @@ members = [
   "apps/desktop/src-tauri",
   "crates/benchmark-contract",
   "crates/model-worker-contract",
+  "crates/model-worker-sherpa-native",
 ]
 resolver = "3"
 

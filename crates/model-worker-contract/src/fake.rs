@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::panic::{AssertUnwindSafe, PanicHookInfo, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Once, OnceLock};
 
 use crate::engine::{AudioPayload, BackendOutcomePayload, RequestValidation};
 use crate::{
@@ -18,9 +20,81 @@ use crate::{
 
 pub const DEFAULT_FAKE_CLOCK_DOMAIN_ID: &str = "core-fixture-clock";
 const DELIVERY_SESSION_EPOCH_PREFIX: &str = "fixture-delivery-session";
+const MODEL_BACKEND_PANIC_CODE: &str = "MODEL_BACKEND_PANIC";
+const MODEL_BACKEND_POISONED_CODE: &str = "MODEL_BACKEND_POISONED";
 static NEXT_DELIVERY_SESSION_EPOCH: AtomicU64 = AtomicU64::new(1);
+static INSTALL_BACKEND_PANIC_HOOK: Once = Once::new();
+type PanicHook = dyn for<'a> Fn(&PanicHookInfo<'a>) + Send + Sync + 'static;
+static ORIGINAL_PANIC_HOOK: OnceLock<Box<PanicHook>> = OnceLock::new();
 const DEFAULT_NOW_NS: u64 = 100;
 const DEFAULT_DEADLINE_NS: u64 = 10_000;
+
+thread_local! {
+    static BACKEND_PANIC_SCOPE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Installs MeetingRelay's process-wide panic dispatch hook.
+///
+/// The process must retain ownership of this hook for its lifetime. Replacing
+/// it later disables the thread-local backend payload redaction. This boundary
+/// catches Rust unwinds only; native aborts and access violations remain outside
+/// this contract slice.
+fn install_backend_panic_hook() {
+    INSTALL_BACKEND_PANIC_HOOK.call_once(|| {
+        let original = std::panic::take_hook();
+        if ORIGINAL_PANIC_HOOK.set(original).is_err() {
+            unreachable!("backend panic hook is installed exactly once");
+        }
+        std::panic::set_hook(Box::new(|info| {
+            let backend_scope_active = BACKEND_PANIC_SCOPE_DEPTH.with(|depth| depth.get() != 0);
+            // The stable response carries the redacted diagnostic. A panic
+            // hook must not perform fallible I/O here: a second panic inside
+            // the hook would abort the process before `catch_unwind` can map
+            // the backend failure.
+            if !backend_scope_active && let Some(original) = ORIGINAL_PANIC_HOOK.get() {
+                original(info);
+            }
+        }));
+    });
+}
+
+fn backend_recovery_actions(retryable: bool) -> Vec<RecoveryAction> {
+    if retryable {
+        vec![
+            RecoveryAction::Retry,
+            RecoveryAction::RestartWorker,
+            RecoveryAction::ChooseAnotherEngine,
+        ]
+    } else {
+        vec![
+            RecoveryAction::RestartWorker,
+            RecoveryAction::ChooseAnotherEngine,
+        ]
+    }
+}
+
+struct BackendPanicScope;
+
+impl BackendPanicScope {
+    fn enter() -> Self {
+        install_backend_panic_hook();
+        BACKEND_PANIC_SCOPE_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_add(1)
+                    .expect("backend panic scope depth cannot overflow"),
+            );
+        });
+        Self
+    }
+}
+
+impl Drop for BackendPanicScope {
+    fn drop(&mut self) {
+        BACKEND_PANIC_SCOPE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 #[derive(Debug)]
 struct DeterministicFakeBackend {
@@ -45,6 +119,10 @@ impl DeterministicFakeBackend {
 }
 
 impl ModelBackend for DeterministicFakeBackend {
+    fn prepare(&mut self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
     fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
         let Some(language) = self.descriptor.languages.first().cloned() else {
             return Self::contract_failure(action);
@@ -424,6 +502,7 @@ impl FakeWorker {
         &mut self,
         request: WorkerRequest,
         queue_depth: u32,
+        backend_ready: bool,
     ) -> Result<Vec<WorkerResponse>, ContractError> {
         self.preflight(&request)?;
         let cancellation = if matches!(&request.command, WorkerCommand::Cancel { .. }) {
@@ -436,7 +515,7 @@ impl FakeWorker {
             WorkerCommand::Describe => vec![WorkerEvent::Described {
                 descriptor: self.manifest.descriptor.clone(),
             }],
-            WorkerCommand::Prepare(prepare) => self.prepare(*prepare),
+            WorkerCommand::Prepare(_) => return Err(ContractError::QueueInvariant),
             WorkerCommand::AcceptAudio(chunk) => self.accept_audio(context, chunk)?,
             WorkerCommand::DeclareGap(gap) => self.declare_gap(context, *gap)?,
             WorkerCommand::PollEvents => self.poll_events(context)?,
@@ -455,7 +534,7 @@ impl FakeWorker {
                     .filter_map(|state| state.last_progress_sequence)
                     .max(),
                 queue_depth,
-                model_ready: self.prepared,
+                model_ready: self.prepared && backend_ready,
                 execution_provider: self.manifest.descriptor.execution_provider,
                 restart_count: self.restart_count,
             }],
@@ -464,14 +543,35 @@ impl FakeWorker {
         self.wrap_events(&request, events)
     }
 
-    fn prepare(&mut self, _prepare: PrepareRequest) -> Vec<WorkerEvent> {
-        self.prepared = true;
-        vec![WorkerEvent::Prepared {
-            ready: true,
-            execution_provider: self.manifest.descriptor.execution_provider,
-            fallback_nodes: Vec::new(),
-            resource_estimate: ResourceEstimate::unavailable_contract_fixture(),
-        }]
+    fn complete_backend_prepare(
+        &mut self,
+        request: &WorkerRequest,
+        outcome: Result<(), BackendFailure>,
+    ) -> Result<Vec<WorkerResponse>, ContractError> {
+        if !matches!(request.command, WorkerCommand::Prepare(_)) {
+            return Err(ContractError::QueueInvariant);
+        }
+        let event = match outcome {
+            Ok(()) => {
+                self.prepared = true;
+                WorkerEvent::Prepared {
+                    ready: true,
+                    execution_provider: self.manifest.descriptor.execution_provider,
+                    fallback_nodes: Vec::new(),
+                    resource_estimate: ResourceEstimate::unavailable_contract_fixture(),
+                }
+            }
+            Err(failure) => {
+                self.prepared = false;
+                let BackendFailure {
+                    code,
+                    retryable,
+                    sanitized_detail,
+                } = failure;
+                self.backend_preparation_failure_event(request, code, retryable, sanitized_detail)?
+            }
+        };
+        self.wrap_events(request, vec![event])
     }
 
     fn accept_audio(
@@ -766,18 +866,7 @@ impl FakeWorker {
         retryable: bool,
         sanitized_detail: Option<SanitizedText>,
     ) -> Result<WorkerEvent, ContractError> {
-        let recovery_actions = if retryable {
-            vec![
-                RecoveryAction::Retry,
-                RecoveryAction::RestartWorker,
-                RecoveryAction::ChooseAnotherEngine,
-            ]
-        } else {
-            vec![
-                RecoveryAction::RestartWorker,
-                RecoveryAction::ChooseAnotherEngine,
-            ]
-        };
+        let recovery_actions = backend_recovery_actions(retryable);
         let error = StableWorkerError::try_from_spec(StableWorkerErrorSpec {
             code,
             category: ErrorCategory::Model,
@@ -800,6 +889,37 @@ impl FakeWorker {
                 .ok_or(ContractError::MissingRequestIdentity)?,
             error,
         })
+    }
+
+    fn backend_preparation_failure_event(
+        &self,
+        request: &WorkerRequest,
+        code: Identifier,
+        retryable: bool,
+        sanitized_detail: Option<SanitizedText>,
+    ) -> Result<WorkerEvent, ContractError> {
+        if request.context.meeting_id.is_some()
+            || request.context.job_id.is_some()
+            || request.context.segment_id.is_some()
+            || request.context.cancel_scope_id.is_some()
+        {
+            return Err(ContractError::UnexpectedRequestIdentity);
+        }
+        let error = StableWorkerError::try_from_spec(StableWorkerErrorSpec {
+            code,
+            category: ErrorCategory::Model,
+            severity: ErrorSeverity::Error,
+            retryable,
+            user_message_key: Identifier::new("model.backend_failure")?,
+            recovery_actions: backend_recovery_actions(retryable),
+            correlation_id: request.context.message_id.clone(),
+            correlation_sequence: request.context.message_sequence,
+            meeting_id: None,
+            segment_id: None,
+            subsystem: Identifier::new("model-worker")?,
+            sanitized_detail,
+        })?;
+        Ok(WorkerEvent::PreparationFailed { error })
     }
 
     fn cancel(&mut self, cancellation: Cancellation) -> Result<Vec<WorkerEvent>, ContractError> {
@@ -1145,6 +1265,7 @@ struct EndpointCore {
     worker: FakeWorker,
     delivery: DeliveryLedger,
     backend: Box<dyn ModelBackend>,
+    backend_poisoned: bool,
     handshaken: bool,
 }
 
@@ -1154,6 +1275,7 @@ impl fmt::Debug for EndpointCore {
             .debug_struct("EndpointCore")
             .field("worker", &self.worker)
             .field("delivery", &self.delivery)
+            .field("backend_poisoned", &self.backend_poisoned)
             .field("handshaken", &self.handshaken)
             .finish_non_exhaustive()
     }
@@ -1165,6 +1287,7 @@ impl EndpointCore {
         limits: WorkerLimits,
         backend: B,
     ) -> Result<Self, ContractError> {
+        install_backend_panic_hook();
         let epoch_nonce = NEXT_DELIVERY_SESSION_EPOCH.fetch_add(1, Ordering::Relaxed);
         let session_epoch =
             Identifier::new(&format!("{DELIVERY_SESSION_EPOCH_PREFIX}-{epoch_nonce}"))?;
@@ -1172,6 +1295,7 @@ impl EndpointCore {
             worker: FakeWorker::new(manifest, limits, session_epoch.clone())?,
             delivery: DeliveryLedger::new(session_epoch, limits.max_replay_entries as usize),
             backend: Box::new(backend),
+            backend_poisoned: false,
             handshaken: false,
         })
     }
@@ -1215,6 +1339,54 @@ impl EndpointCore {
         }
     }
 
+    fn execute_backend(&mut self, action: &BackendAction) -> BackendOutcome {
+        if self.backend_poisoned {
+            return action.failed(Self::backend_poisoned_failure());
+        }
+        let _scope = BackendPanicScope::enter();
+        match catch_unwind(AssertUnwindSafe(|| self.backend.execute(action))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.backend_poisoned = true;
+                action.failed(Self::backend_panic_failure())
+            }
+        }
+    }
+
+    fn prepare_backend(&mut self) -> Result<(), BackendFailure> {
+        if self.backend_poisoned {
+            self.worker.prepared = false;
+            return Err(Self::backend_poisoned_failure());
+        }
+        let _scope = BackendPanicScope::enter();
+        match catch_unwind(AssertUnwindSafe(|| self.backend.prepare())) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.backend_poisoned = true;
+                self.worker.prepared = false;
+                Err(Self::backend_panic_failure())
+            }
+        }
+    }
+
+    fn backend_panic_failure() -> BackendFailure {
+        BackendFailure::new(
+            Identifier::new(MODEL_BACKEND_PANIC_CODE)
+                .expect("model backend panic code is constant-valid"),
+            false,
+            None,
+        )
+    }
+
+    fn backend_poisoned_failure() -> BackendFailure {
+        BackendFailure::new(
+            Identifier::new(MODEL_BACKEND_POISONED_CODE)
+                .expect("model backend poison code is constant-valid"),
+            false,
+            None,
+        )
+    }
+
     fn inspect(&self, request: &WorkerRequest) -> Result<Admission, ContractError> {
         self.delivery.inspect(request, self.worker.limits)
     }
@@ -1256,6 +1428,7 @@ struct PendingDelivery {
 #[derive(Debug)]
 enum PendingDeliveryState {
     Frozen(Result<Vec<WorkerResponse>, ContractError>),
+    BackendPrepare,
     Backend(BackendAction),
 }
 
@@ -1269,12 +1442,15 @@ impl PendingDelivery {
             PendingDeliveryState::Frozen(outcome) => {
                 outcome.as_ref().map(|_| ()).map_err(|error| *error)
             }
-            PendingDeliveryState::Backend(_) => Ok(()),
+            PendingDeliveryState::BackendPrepare | PendingDeliveryState::Backend(_) => Ok(()),
         }
     }
 
-    const fn has_backend_action(&self) -> bool {
-        matches!(self.state, PendingDeliveryState::Backend(_))
+    const fn has_backend_work(&self) -> bool {
+        matches!(
+            self.state,
+            PendingDeliveryState::BackendPrepare | PendingDeliveryState::Backend(_)
+        )
     }
 }
 
@@ -1391,15 +1567,22 @@ impl WorkerEndpoint for DirectWorkerSession {
                         return Err(error);
                     }
                 };
-                let outcome = if let Some(action) = backend_action {
-                    let backend_outcome = self.core.backend.execute(&action);
+                let outcome = if matches!(&request.command, WorkerCommand::Prepare(_)) {
+                    let backend_outcome = self.core.prepare_backend();
+                    self.core
+                        .worker
+                        .complete_backend_prepare(&request, backend_outcome)
+                } else if let Some(action) = backend_action {
+                    let backend_outcome = self.core.execute_backend(&action);
                     self.core
                         .worker
                         .complete_backend_action(&request, action, backend_outcome)
                 } else {
-                    self.core
-                        .worker
-                        .process(request.clone(), queue_depth_at_admission)
+                    self.core.worker.process(
+                        request.clone(),
+                        queue_depth_at_admission,
+                        !self.core.backend_poisoned,
+                    )
                 };
                 if let Err(error) = outcome
                     && !error.consumes_message_sequence()
@@ -1429,7 +1612,9 @@ impl WorkerEndpoint for DirectWorkerSession {
         for pending in self.pending.drain(..) {
             match pending.state {
                 PendingDeliveryState::Frozen(outcome) => responses.extend(outcome?),
-                PendingDeliveryState::Backend(_) => return Err(ContractError::QueueInvariant),
+                PendingDeliveryState::BackendPrepare | PendingDeliveryState::Backend(_) => {
+                    return Err(ContractError::QueueInvariant);
+                }
             }
         }
         self.new_command_count = 0;
@@ -1506,7 +1691,7 @@ impl WorkerEndpoint for QueuedWorkerSession {
             }
             return Err(ContractError::MessageIdConflict);
         }
-        if self.pending.iter().any(PendingDelivery::has_backend_action) {
+        if self.pending.iter().any(PendingDelivery::has_backend_work) {
             return Err(ContractError::BackendActionInFlight);
         }
         match self.core.inspect(&request)? {
@@ -1562,6 +1747,15 @@ impl WorkerEndpoint for QueuedWorkerSession {
                         return Err(error);
                     }
                 };
+                if matches!(&request.command, WorkerCommand::Prepare(_)) {
+                    self.pending.push_back(PendingDelivery {
+                        request: request.replay_snapshot(),
+                        state: PendingDeliveryState::BackendPrepare,
+                    });
+                    self.new_command_count += 1;
+                    self.pending_delivery_units += required_delivery_units;
+                    return Ok(());
+                }
                 if let Some(action) = backend_action {
                     self.pending.push_back(PendingDelivery {
                         request: request.replay_snapshot(),
@@ -1571,10 +1765,11 @@ impl WorkerEndpoint for QueuedWorkerSession {
                     self.pending_delivery_units += required_delivery_units;
                     return Ok(());
                 }
-                let outcome = self
-                    .core
-                    .worker
-                    .process(request.clone(), queue_depth_at_admission);
+                let outcome = self.core.worker.process(
+                    request.clone(),
+                    queue_depth_at_admission,
+                    !self.core.backend_poisoned,
+                );
                 if let Err(error) = outcome
                     && !error.consumes_message_sequence()
                 {
@@ -1603,8 +1798,18 @@ impl WorkerEndpoint for QueuedWorkerSession {
         for pending in self.pending.drain(..) {
             match pending.state {
                 PendingDeliveryState::Frozen(outcome) => responses.extend(outcome?),
+                PendingDeliveryState::BackendPrepare => {
+                    let backend_outcome = self.core.prepare_backend();
+                    let outcome = self
+                        .core
+                        .worker
+                        .complete_backend_prepare(&pending.request, backend_outcome);
+                    self.core
+                        .record(pending.request.replay_snapshot(), outcome.clone())?;
+                    responses.extend(outcome?);
+                }
                 PendingDeliveryState::Backend(action) => {
-                    let backend_outcome = self.core.backend.execute(&action);
+                    let backend_outcome = self.core.execute_backend(&action);
                     let outcome = self.core.worker.complete_backend_action(
                         &pending.request,
                         action,
@@ -2291,6 +2496,7 @@ const fn event_kind(event: &WorkerEvent) -> &'static str {
     match event {
         WorkerEvent::Described { .. } => "described",
         WorkerEvent::Prepared { .. } => "prepared",
+        WorkerEvent::PreparationFailed { .. } => "preparation-failed",
         WorkerEvent::AudioAccepted { .. } => "audio-accepted",
         WorkerEvent::GapAccepted { .. } => "gap-accepted",
         WorkerEvent::Progress { .. } => "progress",
@@ -2375,4 +2581,60 @@ fn audio_chunk(sequence: u64, media_start_sample: u64) -> Result<AudioChunk, Con
         payload_sha256: Some(crate::Sha256Digest::from_bytes([17; 32])),
         payload: Some(AudioPayload::PcmS16Le(Arc::from([0_i16; 320]))),
     })
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{BACKEND_PANIC_SCOPE_DEPTH, BackendPanicScope, install_backend_panic_hook};
+
+    #[test]
+    fn backend_panic_hook_redacts_only_the_scoped_thread_and_restores_nested_depth() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let hook_observed = Arc::clone(&observed);
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string-panic".to_owned());
+            hook_observed
+                .lock()
+                .expect("panic hook observation lock")
+                .push(payload);
+        }));
+        install_backend_panic_hook();
+
+        assert!(std::panic::catch_unwind(|| panic!("outside-before-scope-payload")).is_err());
+        let depth_after_inner;
+        {
+            let _outer = BackendPanicScope::enter();
+            assert!(std::panic::catch_unwind(|| panic!("scoped-backend-payload-one")).is_err());
+            {
+                let _inner = BackendPanicScope::enter();
+                assert!(std::panic::catch_unwind(|| panic!("scoped-backend-payload-two")).is_err());
+            }
+            depth_after_inner = BACKEND_PANIC_SCOPE_DEPTH.with(|depth| depth.get());
+            assert!(
+                std::thread::spawn(|| panic!("unrelated-thread-payload"))
+                    .join()
+                    .is_err()
+            );
+        }
+        let depth_after_outer = BACKEND_PANIC_SCOPE_DEPTH.with(|depth| depth.get());
+        assert!(std::panic::catch_unwind(|| panic!("outside-after-scope-payload")).is_err());
+
+        assert_eq!(depth_after_inner, 1);
+        assert_eq!(depth_after_outer, 0);
+        assert_eq!(
+            *observed.lock().expect("panic hook observation lock"),
+            [
+                "outside-before-scope-payload",
+                "unrelated-thread-payload",
+                "outside-after-scope-payload",
+            ]
+        );
+    }
 }

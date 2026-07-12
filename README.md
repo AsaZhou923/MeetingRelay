@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.2 candidate artifact contract work**. WP-0.3.1 through WP-0.3.7 completed the deterministic Phase 0 fixture, ledger, provider, clock, queue/resource, and integrated harness gates. WP-0.4.1 added one std-only Rust semantic contract for replaceable model workers. WP-0.4.2 adds a deterministic Node contract for candidate/evidence/fixture manifests, `HW-REF`, run plans, integrity seals, license references, and claim authority. The generated candidate and hardware records are explicitly contract fixtures: they are not real candidates, measurements, rankings, hardware recommendations, or formal `PERF-RT-*` evidence.
+MeetingRelay is currently in **WP-0.4.3b sherpa native functional integration**. WP-0.3.1 through WP-0.3.7 completed the deterministic Phase 0 harness gates; WP-0.4.1 added the transport-neutral model-worker semantic contract; WP-0.4.2 added candidate artifact integrity and claim authority; and WP-0.4.3a established the non-cloneable, exactly-once backend action/outcome seam. WP-0.4.3b pins the official sherpa-onnx 1.13.4 shared Windows runtime and SenseVoice 2024 INT8 assets, adds an offline-by-default materializer, independently verifies canonical PCM SHA-256 at the adapter boundary, and runs a real functional inference smoke. This narrow smoke does not establish accuracy, quality, latency, throughput, candidate eligibility, distribution approval, or production readiness.
 
 ## Prerequisites
 
@@ -23,6 +23,8 @@ pnpm phase0:fixtures:test
 pnpm phase0:fixtures:validate
 pnpm phase0:candidate-artifacts:test
 pnpm phase0:candidate-artifacts:validate
+pnpm phase0:sherpa-assets:test
+pnpm phase0:sherpa-assets:validate
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -32,6 +34,7 @@ pnpm phase0:clock:validate
 pnpm phase0:resources:test
 pnpm phase0:resources:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
+cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 pnpm tauri -- --version
 ```
 
@@ -47,6 +50,8 @@ pnpm phase0:fixtures:test
 pnpm phase0:fixtures:validate
 pnpm phase0:candidate-artifacts:test
 pnpm phase0:candidate-artifacts:validate
+pnpm phase0:sherpa-assets:test
+pnpm phase0:sherpa-assets:validate
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -56,6 +61,7 @@ pnpm phase0:clock:validate
 pnpm phase0:resources:test
 pnpm phase0:resources:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
+cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 pnpm --dir apps/desktop test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -67,6 +73,8 @@ pnpm desktop:build
 cargo build --package meetingrelay-desktop --release --locked
 pnpm --dir apps/desktop tauri build --no-bundle
 ```
+
+Native-feature checks and the ignored real SenseVoice smoke require the sealed assets and pinned DLLs to be materialized and staged first. Follow [the sherpa asset instructions](tools/sherpa-native/README.md) and [the adapter smoke instructions](crates/model-worker-sherpa-native/README.md). The upstream build script's implicit network-download path is not an accepted project workflow.
 
 IPC and ledger uint64/ns values use canonical unsigned decimal strings. The ledger validator runs two clean replays: `input-ledger.jsonl` and `decision-ledger.jsonl` must be byte-for-byte and SHA-256 identical; `observation-ledger.jsonl` intentionally preserves distinct run IDs and actual monotonic observations, so it is checked for canonical encoding, order, causation, source hashes, and join integrity instead of byte equality. Generated evidence stays under ignored `target/wp-0.3/ct-ledger-001/`.
 
@@ -86,4 +94,4 @@ Clock calibration performs two actual `process.hrtime.bigint()` runs under ignor
 
 The queue/resource harness writes two runs under ignored `target/wp-0.3/ct-resource-harness-001/`. Its fixed-capacity `Q-HARNESS-COALESCE` scenario uses a logical clock and must produce byte-identical queue artifacts. Mutually exclusive dequeue, drop, merge, cancel, and remaining-depth outcomes conserve every enqueued item; retry and full counters describe attempts only. Only an interim item identified as a `superseded_revision` may use the scripted drop/coalescing path. Actual resource snapshots use one `node.hrtime.<run_id>` domain per run and are validated for canonical encoding, capability/schema projection, observation-clock ordering, and checksums rather than cross-run byte equality. Per-core CPU arrays preserve each snapshot's order but do not claim stable core identity across samples. The harness does not use sleep, wall-clock time, or a network and does not establish production sampling cadence, resource limits, or product queue behavior.
 
-Commit-specific completion requires the `Phase 0 Contract CI` workflow to be green on the pinned `windows-2022` runner. Local success alone is not release evidence. These checks validate only the bootstrap, worker semantic contract, and artifact-contract boundaries. `CT-WORKER-CANDIDATE-001` remains pending: no sherpa-onnx, FunASR, whisper, model quality, candidate eligibility, default/fallback selection, approved hardware tier, session, audio, ASR, translation, persistence, UI paint, or other product capability is claimed.
+Commit-specific completion requires the `Phase 0 Contract CI` workflow to be green on the pinned `windows-2022` runner. Local success alone is not release evidence. These checks validate the bootstrap/harness boundaries, worker contract, asset lock, minimal sherpa adapter, and one functional inference path. `CT-WORKER-CANDIDATE-001` remains pending: no model accuracy/quality, candidate eligibility/ranking/default selection, approved distribution, formal performance/SLO, production session/audio capture/ASR pipeline, translation, persistence, UI paint, or other product capability is claimed.

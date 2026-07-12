@@ -460,6 +460,10 @@ pub enum ErrorSeverity {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RecoveryAction {
     Retry,
+    /// Discard the current worker instance/session and construct a fresh backend.
+    ///
+    /// This is intentionally stronger than [`WorkerCommand::Restart`], which
+    /// resynchronizes the existing session and cannot clear backend poison.
     RestartWorker,
     ReprocessAudio,
     ChooseAnotherEngine,
@@ -954,6 +958,8 @@ impl fmt::Debug for BackendOutcome {
 }
 
 pub trait ModelBackend: Send {
+    fn prepare(&mut self) -> Result<(), BackendFailure>;
+
     fn execute(&mut self, action: &BackendAction) -> BackendOutcome;
 }
 
@@ -1071,6 +1077,9 @@ pub enum WorkerEvent {
         execution_provider: ExecutionProvider,
         fallback_nodes: Vec<Identifier>,
         resource_estimate: ResourceEstimate,
+    },
+    PreparationFailed {
+        error: StableWorkerError,
     },
     AudioAccepted {
         sequence: u64,
@@ -1530,6 +1539,9 @@ impl WorkerResponse {
                     && !fallback_nodes.windows(2).any(|pair| pair[0] >= pair[1])
                     && resource_estimate.validate().is_ok()
             }
+            (WorkerCommand::Prepare(_), WorkerEvent::PreparationFailed { error }) => {
+                self.valid_preparation_failure(error)
+            }
             (WorkerCommand::AcceptAudio(chunk), WorkerEvent::AudioAccepted { sequence }) => {
                 self.has_job_target() && *sequence != 0 && *sequence == chunk.sequence
             }
@@ -1674,6 +1686,33 @@ impl WorkerResponse {
             && error.correlation_sequence() == self.correlation_sequence
             && error.meeting_id() == self.meeting_id.as_ref()
             && error.segment_id() == self.segment_id.as_ref()
+    }
+
+    fn valid_preparation_failure(&self, error: &StableWorkerError) -> bool {
+        let recovery_matches_retryability = if error.retryable() {
+            error.recovery_actions()
+                == [
+                    RecoveryAction::Retry,
+                    RecoveryAction::RestartWorker,
+                    RecoveryAction::ChooseAnotherEngine,
+                ]
+        } else {
+            error.recovery_actions()
+                == [
+                    RecoveryAction::RestartWorker,
+                    RecoveryAction::ChooseAnotherEngine,
+                ]
+        };
+        self.has_no_target()
+            && error.category() == ErrorCategory::Model
+            && error.severity() == ErrorSeverity::Error
+            && error.user_message_key().as_str() == "model.backend_failure"
+            && error.subsystem().as_str() == "model-worker"
+            && recovery_matches_retryability
+            && error.correlation_id() == &self.correlation_id
+            && error.correlation_sequence() == self.correlation_sequence
+            && error.meeting_id().is_none()
+            && error.segment_id().is_none()
     }
 
     fn has_valid_target_shape(&self) -> bool {

@@ -48,12 +48,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'tools/sherpa-native/assets.lock.json', 'tools/sherpa-native/assets.lock.sha256') }}
           restore-keys: |
             ${{ runner.os }}-rust-1.95.0-
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+        timeout-minutes: 10
+
+      - name: Fetch locked Rust dependencies before the offline build phase
+        shell: pwsh
+        run: |
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo fetch --locked failed" }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_NET_OFFLINE=true' -Encoding utf8
         timeout-minutes: 10
 
       - name: Test desktop bootstrap contract
@@ -70,6 +78,13 @@ jobs:
         run: |
           pnpm phase0:candidate-artifacts:test
           pnpm phase0:candidate-artifacts:validate
+        timeout-minutes: 5
+
+      - name: Test and validate sherpa offline asset lock
+        shell: pwsh
+        run: |
+          pnpm phase0:sherpa-assets:test
+          pnpm phase0:sherpa-assets:validate
         timeout-minutes: 5
 
       - name: Test and validate Phase 0 replay ledgers
@@ -96,25 +111,167 @@ jobs:
           pnpm phase0:resources:validate
         timeout-minutes: 5
 
+      - name: Materialize pinned sherpa runtime and model assets
+        shell: pwsh
+        run: |
+          $first = & ./tools/sherpa-native/materialize.ps1 `
+            -CacheRoot target/sherpa-native `
+            -AssetSet All `
+            -AllowDownload
+          $first | Write-Output
+          $second = & ./tools/sherpa-native/materialize.ps1 `
+            -CacheRoot target/sherpa-native `
+            -AssetSet All
+          $second | Write-Output
+          $keys = @(
+            'MEETINGRELAY_SHERPA_LOCK',
+            'MEETINGRELAY_SHERPA_LOCK_SHA256',
+            'MEETINGRELAY_SHERPA_PARAMETER_SHA256',
+            'MEETINGRELAY_SHERPA_MODEL',
+            'MEETINGRELAY_SHERPA_MODEL_SHA256',
+            'MEETINGRELAY_SHERPA_TOKENS',
+            'MEETINGRELAY_SHERPA_TOKENS_SHA256',
+            'MEETINGRELAY_SHERPA_WAV',
+            'SHERPA_ONNX_LIB_DIR'
+          )
+          foreach ($key in $keys) {
+            $matches = @($second | Where-Object { $_ -like "$key=*" })
+            if ($matches.Count -ne 1) { throw "materializer did not emit exactly one $key" }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $matches[0] -Encoding utf8
+          }
+        timeout-minutes: 15
+
+      - name: Test sherpa path hardening against materialized assets
+        shell: pwsh
+        run: |
+          $output = @(& ./tools/sherpa-native/path-hardening.test.ps1 2>&1)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "sherpa path-hardening tests failed" }
+          if (@($output | Where-Object { [string]$_ -match '=SKIP' }).Count -ne 0) {
+            throw "sherpa path-hardening tests must not skip on the Windows CI runner"
+          }
+          $required = @(
+            'MATERIALIZE_JUNCTION_REGRESSION=PASS',
+            'STAGE_JUNCTION_REGRESSION=PASS',
+            'STAGE_DESTINATION_JUNCTION_REGRESSION=PASS',
+            'STAGE_EQUAL_OVERLAP_REGRESSION=PASS',
+            'STAGE_DESCENDANT_OVERLAP_REGRESSION=PASS',
+            'STAGE_ANCESTOR_OVERLAP_REGRESSION=PASS',
+            'ARCHIVE_HARDLINK_REGRESSION=PASS'
+          )
+          foreach ($expected in $required) {
+            if (@($output | Where-Object { [string]$_ -eq $expected }).Count -ne 1) {
+              throw "Missing unique path-hardening result: $expected"
+            }
+          }
+        timeout-minutes: 5
+
+      - name: Stage pinned sherpa DLLs beside Windows test executables
+        shell: pwsh
+        run: |
+          ./tools/sherpa-native/stage-runtime.ps1 `
+            -LibDir $env:SHERPA_ONNX_LIB_DIR `
+            -Configuration All
+        timeout-minutes: 5
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
         timeout-minutes: 5
 
       - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings
         timeout-minutes: 15
 
+      - name: Lint and test sherpa adapter without the native feature
+        run: |
+          cargo clippy -p meetingrelay-model-worker-sherpa-native --all-targets --no-default-features --offline --locked -- -D warnings
+          cargo test -p meetingrelay-model-worker-sherpa-native --all-targets --no-default-features --offline --locked
+        timeout-minutes: 10
+
       - name: Check Rust workspace
-        run: cargo check --workspace --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --all-features --offline --locked
         timeout-minutes: 15
 
       - name: Test Rust workspace
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --all-features --offline --locked
         timeout-minutes: 15
 
-      - name: Test Rust workspace in release mode
-        run: cargo test --workspace --release --all-targets --all-features --locked
+      - name: Build exact Debug and Release sherpa smoke executables
+        shell: pwsh
+        run: |
+          function Build-SmokeExecutable {
+            param([switch]$Release)
+            $profileArguments = if ($Release) { @('--release') } else { @() }
+            $cargoArguments = @(
+              'test'
+            ) + $profileArguments + @(
+              '-p', 'meetingrelay-model-worker-sherpa-native',
+              '--features', 'native-sherpa',
+              '--test', 'native_sherpa_smoke',
+              '--no-run',
+              '--message-format=json',
+              '--offline',
+              '--locked'
+            )
+            $messages = @(& cargo @cargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
+            if ($LASTEXITCODE -ne 0) { throw "cargo failed to build the native smoke executable" }
+            $executables = @($messages |
+              Where-Object {
+                $_.reason -eq 'compiler-artifact' -and
+                $_.target.name -eq 'native_sherpa_smoke' -and
+                $_.profile.test -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.executable)
+              } |
+              ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
+              Sort-Object -Unique)
+            if ($executables.Count -ne 1) {
+              throw "Expected exactly one native smoke executable, got $($executables.Count)"
+            }
+            if (-not (Test-Path -LiteralPath $executables[0] -PathType Leaf)) {
+              throw "Cargo-reported native smoke executable does not exist: $($executables[0])"
+            }
+            return $executables[0]
+          }
+
+          $debugExecutable = Build-SmokeExecutable
+          $releaseExecutable = Build-SmokeExecutable -Release
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_DEBUG_SMOKE_EXE=$debugExecutable" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_SMOKE_EXE=$releaseExecutable" -Encoding utf8
         timeout-minutes: 20
+
+      - name: Audit pinned runtime inventory and PE dependencies
+        shell: pwsh
+        run: |
+          ./tools/sherpa-native/audit-pe-dependencies.ps1 -ParserSelfTest
+          ./tools/sherpa-native/audit-pe-dependencies.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -BinaryPath @(
+              $env:MEETINGRELAY_SHERPA_DEBUG_SMOKE_EXE,
+              $env:MEETINGRELAY_SHERPA_RELEASE_SMOKE_EXE
+            )
+        timeout-minutes: 5
+
+      - name: Probe loaded modules and run real Debug sherpa smoke
+        shell: pwsh
+        run: |
+          ./tools/sherpa-native/probe-loaded-runtime.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -TestExecutable $env:MEETINGRELAY_SHERPA_DEBUG_SMOKE_EXE `
+            -Configuration Debug
+        timeout-minutes: 10
+
+      - name: Test Rust workspace in release mode
+        run: cargo test --workspace --release --all-targets --all-features --offline --locked
+        timeout-minutes: 20
+
+      - name: Probe loaded modules and run real Release sherpa smoke
+        shell: pwsh
+        run: |
+          ./tools/sherpa-native/probe-loaded-runtime.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -TestExecutable $env:MEETINGRELAY_SHERPA_RELEASE_SMOKE_EXE `
+            -Configuration Release
+        timeout-minutes: 10
 
       - name: Typecheck desktop frontend
         run: pnpm desktop:typecheck
@@ -125,5 +282,5 @@ jobs:
         timeout-minutes: 10
 
       - name: Build release desktop shell
-        run: pnpm --dir apps/desktop tauri build --no-bundle
+        run: pnpm --dir apps/desktop tauri build --no-bundle -- -- --offline --locked
         timeout-minutes: 20

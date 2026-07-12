@@ -1,0 +1,223 @@
+{
+  "schema_version": "1.0",
+  "lock_id": "sherpa-onnx-1.13.4-sensevoice-int8-2024-07-17-win-x64-cpu",
+  "scope": {
+    "evaluation": "internal-phase0-only",
+    "network_policy": "offline-by-default-download-opt-in",
+    "quality_claim": "not-authorized",
+    "performance_claim": "not-authorized",
+    "license_review_status": "accepted-for-internal-evaluation",
+    "distribution_status": "pending"
+  },
+  "runtime": {
+    "upstream_repository": "https://github.com/k2-fsa/sherpa-onnx",
+    "upstream_tag": "v1.13.4",
+    "upstream_commit": "142807252687d81b40d6315f23470a1512a00de3",
+    "rust_crate": {
+      "name": "sherpa-onnx",
+      "version": "1.13.4",
+      "checksum": "0b142d3f255cb4e4b7808ea25869db6f5714e0a3550da355234483b4db552055",
+      "features": [
+        "shared"
+      ]
+    },
+    "rust_sys_crate": {
+      "name": "sherpa-onnx-sys",
+      "version": "1.13.4",
+      "checksum": "ffc951af03dc0653c0622158ca8a585a6f2bc43b7b06048cf0e5b5020005c227"
+    },
+    "hash_crate": {
+      "name": "sha2",
+      "version": "0.10.9",
+      "checksum": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
+      "license": "MIT OR Apache-2.0"
+    },
+    "archive": {
+      "name": "sherpa-onnx-v1.13.4-win-x64-shared-MT-Release-lib.tar.bz2",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-v1.13.4-win-x64-shared-MT-Release-lib.tar.bz2",
+      "size_bytes": 7849655,
+      "sha256": "f923e5eacb6bca83914d89cb31afa579e11eeaff9af39f8ead82ad19f44b2c9f",
+      "extracted_directory": "sherpa-onnx-v1.13.4-win-x64-shared-MT-Release-lib",
+      "inventory": [
+        {
+          "path": "lib/onnxruntime.dll",
+          "size_bytes": 17363968,
+          "sha256": "daa77083a45bf525da0dde9e87f85d8eb146f58f9c9aa7124ca84545e1c0f148"
+        },
+        {
+          "path": "lib/onnxruntime.lib",
+          "size_bytes": 2124,
+          "sha256": "b9fc3cd678257d88a111b0773ede4bfceaf0fe95daab4379f2b2b37348a68781"
+        },
+        {
+          "path": "lib/onnxruntime_providers_shared.dll",
+          "size_bytes": 104960,
+          "sha256": "190d10767c321f324d3785368a0b752d9c5a9e06cb5d4d97bb176f58bdb652f3"
+        },
+        {
+          "path": "lib/sherpa-onnx-c-api.dll",
+          "size_bytes": 4544512,
+          "sha256": "3db688ca9e6408c958f45986adc68ed9158522e28c7567b7ffee9312a553c777"
+        },
+        {
+          "path": "lib/sherpa-onnx-c-api.lib",
+          "size_bytes": 75298,
+          "sha256": "21513d9d053ea39956081f5d421d610cd512b076032bf550b9907d2c7b6a52fb"
+        },
+        {
+          "path": "lib/sherpa-onnx-cxx-api.dll",
+          "size_bytes": 258048,
+          "sha256": "3e8b308e9235a3e7398b2c89b43ebb7f813f216aade661b2f246d42656517777"
+        },
+        {
+          "path": "lib/sherpa-onnx-cxx-api.lib",
+          "size_bytes": 224022,
+          "sha256": "9b754db267f88e928f77b39afcc9875985e7d51063d0839162e01fb681dd9faf"
+        }
+      ],
+      "bundle_sha256": "0682618f660a2a9f2278d99decb77624253aadde60e8199a9b07813b8d843317"
+    },
+    "onnxruntime_file_version": "1.27.0",
+    "license": {
+      "license_id": "Apache-2.0",
+      "source_url": "https://github.com/k2-fsa/sherpa-onnx/blob/142807252687d81b40d6315f23470a1512a00de3/LICENSE",
+      "source_revision": "142807252687d81b40d6315f23470a1512a00de3",
+      "snapshot_path": "licenses/apache-2.0-sherpa-onnx.txt",
+      "size_bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "review_status": "accepted-for-internal-evaluation",
+      "distribution_status": "pending"
+    },
+    "onnxruntime_license": {
+      "license_id": "MIT",
+      "source_url": "https://github.com/microsoft/onnxruntime/blob/8f0278c77bf44b0cc83c098c6c722b92a36ac4b5/LICENSE",
+      "source_revision": "8f0278c77bf44b0cc83c098c6c722b92a36ac4b5",
+      "snapshot_path": "licenses/mit-onnxruntime-1.27.0.txt",
+      "size_bytes": 1073,
+      "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+      "review_status": "accepted-for-internal-evaluation",
+      "distribution_status": "pending"
+    }
+  },
+  "model": {
+    "model_id": "sensevoice-zh-en-ja-ko-yue-int8-2024-07-17",
+    "upstream_repository": "https://github.com/FunAudioLLM/SenseVoice",
+    "upstream_revision": "05ecb6ef037640b57851d8b32403a7ffb81b019c",
+    "archive": {
+      "name": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
+      "size_bytes": 163002883,
+      "sha256": "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
+      "extracted_directory": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+      "inventory": [
+        {
+          "path": "LICENSE",
+          "size_bytes": 71,
+          "sha256": "221c6df10b0931a5629adad671ea48fb7747e034c414b6d2bfa275bc3dd4ea17"
+        },
+        {
+          "path": "README.md",
+          "size_bytes": 104,
+          "sha256": "763991a00edaea534ab36bf1b7cf89e61e911666dcfabbba71f91f9f7c593a63"
+        },
+        {
+          "path": "export-onnx.py",
+          "size_bytes": 5905,
+          "sha256": "c97f6a33f9d7135efd4d55b3e24e288c47d925f3b4f04b8b3418c2821c0a89ce"
+        },
+        {
+          "path": "model.int8.onnx",
+          "size_bytes": 239233841,
+          "sha256": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"
+        },
+        {
+          "path": "test_wavs/en.wav",
+          "size_bytes": 228908,
+          "sha256": "eb1eb008904465b74c304aad8342e8c7d3c6e61ffe9f66adcaca9cf0f76a93f4"
+        },
+        {
+          "path": "test_wavs/ja.wav",
+          "size_bytes": 230444,
+          "sha256": "460bd8dccb0d2a5f4e29c628f837be4082d13defc64c3fc21dd1b6bb0e119095"
+        },
+        {
+          "path": "test_wavs/ko.wav",
+          "size_bytes": 147500,
+          "sha256": "0dc797a5c81ed30fc339d91f3da718ab02854e17ffa37cb93c4c039ac5c6bb9c"
+        },
+        {
+          "path": "test_wavs/yue.wav",
+          "size_bytes": 164780,
+          "sha256": "0960b2db54ae202071d250e6462fbf74a3c863f0e3e7f01273e4939c996875a0"
+        },
+        {
+          "path": "test_wavs/zh.wav",
+          "size_bytes": 178988,
+          "sha256": "b77f1794fe374a0ba1ee1dc458bfaf9349496cbbfc32780c50ba3c5a7ad8e373"
+        },
+        {
+          "path": "tokens.txt",
+          "size_bytes": 315894,
+          "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc"
+        }
+      ]
+    },
+    "embedded_license_pointer": {
+      "snapshot_path": "licenses/sensevoice-embedded-license-pointer.txt",
+      "size_bytes": 71,
+      "sha256": "221c6df10b0931a5629adad671ea48fb7747e034c414b6d2bfa275bc3dd4ea17"
+    },
+    "license_at_model_release": {
+      "license_id": "LicenseRef-FunASR-Model-1.0",
+      "source_url": "https://github.com/modelscope/FunASR/blob/75ddde7acd49cb6940de339cf7de24297f0826c2/MODEL_LICENSE",
+      "source_revision": "75ddde7acd49cb6940de339cf7de24297f0826c2",
+      "snapshot_path": "licenses/funasr-model-license-1.0.txt",
+      "size_bytes": 4085,
+      "sha256": "80f5bff3bc3f1b4ba7128e07a7bf94ac10ca260b64059dfdc66e83202bcae50e"
+    },
+    "current_license_snapshot": {
+      "license_id": "LicenseRef-FunASR-Model-1.1-Internal-Evaluation",
+      "source_url": "https://github.com/modelscope/FunASR/blob/b1a7283d97b61ddeef25d13f3b56b62a896ee3bb/MODEL_LICENSE",
+      "source_revision": "b1a7283d97b61ddeef25d13f3b56b62a896ee3bb",
+      "snapshot_path": "licenses/funasr-model-license-1.1.txt",
+      "size_bytes": 5306,
+      "sha256": "7dba975a2069691db4992b0592d70828b330d2f8a30a71450f4e152a554e84f8",
+      "review_status": "accepted-for-internal-evaluation",
+      "distribution_status": "pending"
+    }
+  },
+  "parameters": {
+    "blank_penalty": 0,
+    "bpe_vocab": null,
+    "channels": 1,
+    "debug": false,
+    "decoding_method": "greedy_search",
+    "feature_dim": 80,
+    "homophone_lexicon": null,
+    "homophone_rule_fsts": null,
+    "hotwords_file": null,
+    "hotwords_score": 0,
+    "language": "zh",
+    "lm_model": null,
+    "lm_scale": 1,
+    "max_active_paths": 4,
+    "max_input_bytes": 67108864,
+    "model_family": "sense_voice",
+    "model_type": null,
+    "modeling_unit": null,
+    "num_threads": 1,
+    "provider": "cpu",
+    "rule_fars": null,
+    "rule_fsts": null,
+    "sample_rate_hz": 16000,
+    "telespeech_ctc": null,
+    "use_itn": true,
+    "canonical_json_sha256": "0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e"
+  },
+  "entrypoints": {
+    "runtime_lib_relative_path": "lib",
+    "model_relative_path": "model.int8.onnx",
+    "tokens_relative_path": "tokens.txt",
+    "smoke_wav_relative_path": "test_wavs/zh.wav"
+  }
+}

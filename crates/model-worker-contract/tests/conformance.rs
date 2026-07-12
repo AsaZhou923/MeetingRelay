@@ -1261,6 +1261,49 @@ fn worker_response_command_event_matrix_and_numeric_domains_fail_closed() {
             resource_estimate: ResourceEstimate::unavailable_contract_fixture(),
         },
     );
+    let preparation_error = |retryable, recovery_actions, meeting_id| {
+        StableWorkerError::try_from_spec(StableWorkerErrorSpec {
+            code: id("MODEL_PREPARATION_FAILED"),
+            category: ErrorCategory::Model,
+            severity: ErrorSeverity::Error,
+            retryable,
+            user_message_key: id("model.backend_failure"),
+            recovery_actions,
+            correlation_id: prepare_request.context.message_id.clone(),
+            correlation_sequence: prepare_request.context.message_sequence,
+            meeting_id,
+            segment_id: None,
+            subsystem: id("model-worker"),
+            sanitized_detail: None,
+        })
+        .expect("well-shaped preparation error fixture")
+    };
+    assert_invalid(
+        &prepare_request,
+        WorkerEvent::PreparationFailed {
+            error: preparation_error(
+                true,
+                vec![
+                    RecoveryAction::RestartWorker,
+                    RecoveryAction::ChooseAnotherEngine,
+                ],
+                None,
+            ),
+        },
+    );
+    assert_invalid(
+        &prepare_request,
+        WorkerEvent::PreparationFailed {
+            error: preparation_error(
+                false,
+                vec![
+                    RecoveryAction::RestartWorker,
+                    RecoveryAction::ChooseAnotherEngine,
+                ],
+                Some(id("unexpected-preparation-meeting")),
+            ),
+        },
+    );
 
     let target = job("matrix-values");
     let audio_request = sequenced(request(
