@@ -1130,7 +1130,8 @@ function validateCandidateManifest(candidate, contractEntries) {
   const isContractFixture = candidate.artifact_scope === "contract-fixture-only";
   const isCandidateInput = candidate.artifact_scope === "candidate-input";
   if (
-    candidate.schema_version !== "1.0" ||
+    (isContractFixture && candidate.schema_version !== "1.0") ||
+    (isCandidateInput && candidate.schema_version !== "1.1") ||
     (!isContractFixture && !isCandidateInput) ||
     (isContractFixture && candidate.candidate_id !== CANDIDATE_ID) ||
     candidate.worker_contract_version !== "meetingrelay.model-worker/1.0"
@@ -1261,17 +1262,31 @@ function validateCandidateManifest(candidate, contractEntries) {
     }
     assertExactKeys(
       license,
-      [
-        "distribution_status",
-        "license_id",
-        "review_status",
-        "source_revision",
-        "source_url",
-        "spdx_or_license_ref",
-        "text_path",
-        "text_sha256",
-        "text_size_bytes",
-      ],
+      isContractFixture
+        ? [
+            "distribution_status",
+            "license_id",
+            "review_status",
+            "source_revision",
+            "source_url",
+            "spdx_or_license_ref",
+            "text_path",
+            "text_sha256",
+            "text_size_bytes",
+          ]
+        : [
+            "distribution_status",
+            "license_id",
+            "review_scope",
+            "review_source_status",
+            "review_status",
+            "source_revision",
+            "source_url",
+            "spdx_or_license_ref",
+            "text_path",
+            "text_sha256",
+            "text_size_bytes",
+          ],
       "candidate.licenses[" + index + "]",
     );
     assertIdentifier(license.license_id, "candidate.licenses[" + index + "].license_id");
@@ -1318,6 +1333,26 @@ function validateCandidateManifest(candidate, contractEntries) {
         !["pending", "accepted", "rejected"].includes(
           license.distribution_status,
         ) ||
+        !["internal-evaluation-only", "distribution"].includes(
+          license.review_scope,
+        ) ||
+        (license.review_scope === "internal-evaluation-only" &&
+          !(
+            (license.review_source_status ===
+              "accepted-for-internal-evaluation" &&
+              license.review_status === "accepted") ||
+            (license.review_source_status === "unlicensed" &&
+              license.review_status === "rejected")
+          )) ||
+        (license.review_scope === "internal-evaluation-only" &&
+          license.distribution_status === "accepted") ||
+        (license.review_scope === "distribution" &&
+          (!["pending", "accepted", "rejected"].includes(
+            license.review_source_status,
+          ) ||
+            license.review_source_status !== license.review_status)) ||
+        (license.distribution_status === "accepted" &&
+          license.review_status !== "accepted") ||
         typeof license.source_url !== "string" ||
         !/^https:\/\/\S+$/.test(license.source_url))
     ) {
@@ -1349,13 +1384,10 @@ function validateCandidateManifest(candidate, contractEntries) {
   }
   const projection = candidate.worker_manifest_projection;
   const descriptor = projection.descriptor;
-  if (
-    byRole.get("model")?.license_id !== descriptor.model_license_id ||
-    byRole.get("model-manifest")?.license_id !== descriptor.model_license_id
-  ) {
+  if (byRole.get("model")?.license_id !== descriptor.model_license_id) {
     fail(
       "ART_LICENSE_REFERENCE",
-      "model and model-manifest licenses must match descriptor.model_license_id",
+      "model license must match descriptor.model_license_id",
     );
   }
   const expectedProjection = [

@@ -117,7 +117,11 @@ async function assertRealPathChain(filePath) {
 async function digestRegularFile(filePath, sizeLimit = null) {
   const resolved = await assertRealPathChain(filePath);
   const metadata = await lstat(resolved);
-  if (!metadata.isFile() || metadata.size === 0) {
+  if (
+    !metadata.isFile() ||
+    !Number.isSafeInteger(metadata.size) ||
+    metadata.size <= 0
+  ) {
     fail("PROV_FILE_NOT_REGULAR");
   }
   if (sizeLimit !== null && metadata.size > sizeLimit) {
@@ -249,6 +253,7 @@ export async function validateWorkerProvenanceProjection({
   }
   return {
     executableSha256: executable.sha256,
+    executableSizeBytes: String(executable.sizeBytes),
     schemaRegistrySha256: schemaRegistry.sha256,
     workerId: projection.worker_id,
   };
@@ -324,6 +329,7 @@ async function main(arguments_) {
   process.stdout.write(
     `candidate-host-provenance=verified worker_id=${result.workerId} ` +
       `executable_sha256=${result.executableSha256} ` +
+      `executable_size_bytes=${result.executableSizeBytes} ` +
       `schema_registry_sha256=${result.schemaRegistrySha256}\n`,
   );
 }

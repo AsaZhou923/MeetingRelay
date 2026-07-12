@@ -192,6 +192,7 @@ async function convertToCandidateRunBundle(root, role) {
     candidate.candidate_id = candidateId;
     candidate.build.toolchain = "rust-1.95.0";
     candidate.publishability_status = "accepted";
+    candidate.schema_version = "1.1";
     candidate.source.source_revision = "source-rev-1";
     candidate.source.source_url = "https://example.invalid/source";
     candidate.worker_manifest_projection.role = role;
@@ -208,12 +209,16 @@ async function convertToCandidateRunBundle(root, role) {
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
     );
     candidate.licenses[0].distribution_status = "accepted";
+    candidate.licenses[0].review_scope = "distribution";
+    candidate.licenses[0].review_source_status = "accepted";
     candidate.licenses[0].review_status = "accepted";
     candidate.licenses[0].source_revision = "project-license-rev-1";
     candidate.licenses[0].source_url = "https://example.invalid/project-license";
     candidate.licenses.push({
       distribution_status: "accepted",
       license_id: "license-notice",
+      review_scope: "distribution",
+      review_source_status: "accepted",
       review_status: "accepted",
       source_revision: "notice-license-rev-1",
       source_url: "https://example.invalid/notice-license",
@@ -552,6 +557,220 @@ test("generic contract accepts native, sidecar, and fallback candidate-run profi
       assert.match(result.candidateId, /^candidate-/);
     });
   }
+});
+
+test("candidate schema 1.1 carries license review provenance without upgrading the 1.0 fixture", async () => {
+  await withBundle(async (root) => {
+    const candidate = await readJson(root, "manifests/candidate-manifest.json");
+    assert.equal(candidate.artifact_scope, "contract-fixture-only");
+    assert.equal(candidate.schema_version, "1.0");
+    assert.equal("review_scope" in candidate.licenses[0], false);
+    assert.equal("review_source_status" in candidate.licenses[0], false);
+  });
+  await withBundle(async (root) => {
+    const trust = await convertToRawCandidateInputBundle(root);
+    const candidate = await readJson(root, "manifests/candidate-manifest.json");
+    assert.equal(candidate.artifact_scope, "candidate-input");
+    assert.equal(candidate.schema_version, "1.1");
+    assert.ok(candidate.licenses.length > 1);
+    for (const license of candidate.licenses) {
+      assert.equal(license.review_scope, "distribution");
+      assert.equal(license.review_source_status, "accepted");
+    }
+    assert.equal(
+      (await validateCandidateArtifactInputBundle(root, trust)).status,
+      "input-valid",
+    );
+  });
+  await withBundle(async (root) => {
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      candidate.schema_version = "1.1";
+    });
+    await expectCode(validateCandidateArtifactBundle(root), "ART_SCHEMA_VALUE");
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      candidate.schema_version = "1.0";
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_SCHEMA_VALUE",
+    );
+  });
+});
+
+test("candidate license review scopes and source statuses fail closed on loss or contradiction", async () => {
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      for (const license of candidate.licenses) {
+        license.distribution_status = "pending";
+        license.review_scope = "internal-evaluation-only";
+        license.review_source_status = "accepted-for-internal-evaluation";
+        license.review_status = "accepted";
+      }
+    });
+    assert.equal(
+      (
+        await validateCandidateArtifactInputBundle(
+          root,
+          await currentInputTrust(root),
+        )
+      ).status,
+      "input-valid",
+    );
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      const license = candidate.licenses[0];
+      license.distribution_status = "pending";
+      license.review_scope = "internal-evaluation-only";
+      license.review_source_status = "unlicensed";
+      license.review_status = "rejected";
+    });
+    assert.equal(
+      (
+        await validateCandidateArtifactInputBundle(
+          root,
+          await currentInputTrust(root),
+        )
+      ).status,
+      "input-valid",
+    );
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      delete candidate.licenses[0].review_scope;
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_SCHEMA_KEYS",
+    );
+  });
+  for (const mutateLicense of [
+    (license) => {
+      license.review_source_status = "unknown";
+    },
+    (license) => {
+      license.review_source_status = "pending";
+    },
+    (license) => {
+      license.review_status = "accepted-for-internal-evaluation";
+    },
+    (license) => {
+      license.review_status = "pending";
+    },
+  ]) {
+    await withBundle(async (root) => {
+      await convertToRawCandidateInputBundle(root);
+      await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+        const license = candidate.licenses[0];
+        license.distribution_status = "pending";
+        license.review_scope = "internal-evaluation-only";
+        license.review_source_status = "accepted-for-internal-evaluation";
+        license.review_status = "accepted";
+        mutateLicense(license);
+      });
+      await expectCode(
+        validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+        "ART_LICENSE_REFERENCE",
+      );
+    });
+  }
+});
+
+test("candidate license review rejects cross-scope status contradictions", async (context) => {
+  const cases = [
+    {
+      name: "internal evaluation cannot accept distribution",
+      mutate(license) {
+        license.distribution_status = "accepted";
+        license.review_scope = "internal-evaluation-only";
+        license.review_source_status = "accepted-for-internal-evaluation";
+        license.review_status = "accepted";
+      },
+    },
+    {
+      name: "unlicensed source cannot normalize to accepted",
+      mutate(license) {
+        license.distribution_status = "pending";
+        license.review_scope = "internal-evaluation-only";
+        license.review_source_status = "unlicensed";
+        license.review_status = "accepted";
+      },
+    },
+    {
+      name: "unlicensed source cannot normalize to pending",
+      mutate(license) {
+        license.distribution_status = "pending";
+        license.review_scope = "internal-evaluation-only";
+        license.review_source_status = "unlicensed";
+        license.review_status = "pending";
+      },
+    },
+    {
+      name: "distribution source and normalized review must agree",
+      mutate(license) {
+        license.distribution_status = "pending";
+        license.review_scope = "distribution";
+        license.review_source_status = "pending";
+        license.review_status = "accepted";
+      },
+    },
+  ];
+  for (const case_ of cases) {
+    await context.test(case_.name, async () => {
+      await withBundle(async (root) => {
+        await convertToRawCandidateInputBundle(root);
+        await mutateContractJson(
+          root,
+          "manifests/candidate-manifest.json",
+          (candidate) => case_.mutate(candidate.licenses[0]),
+        );
+        await expectCode(
+          validateCandidateArtifactInputBundle(
+            root,
+            await currentInputTrust(root),
+          ),
+          "ART_LICENSE_REFERENCE",
+        );
+      });
+    });
+  }
+});
+
+test("descriptor model license binds only the model while model-manifest keeps a resolved license", async () => {
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      candidate.artifacts.find(
+        (artifact) => artifact.role === "model-manifest",
+      ).license_id = "license-notice";
+    });
+    assert.equal(
+      (
+        await validateCandidateArtifactInputBundle(
+          root,
+          await currentInputTrust(root),
+        )
+      ).status,
+      "input-valid",
+    );
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      candidate.artifacts.find((artifact) => artifact.role === "model").license_id =
+        "license-notice";
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_LICENSE_REFERENCE",
+    );
+  });
 });
 
 test("candidate input validates without evidence while combined validation still requires it", async () => {

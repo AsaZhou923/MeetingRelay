@@ -428,7 +428,10 @@ jobs:
             $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_HOST_EXE `
             $schemaRegistry)
           if ($LASTEXITCODE -ne 0) { throw "actual Release candidate-host provenance validation failed" }
-          if (@($output | Where-Object { [string]$_ -like 'candidate-host-provenance=verified *' }).Count -ne 1) {
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^candidate-host-provenance=verified worker_id=meetingrelay-sherpa-native-candidate-host-v1 executable_sha256=[0-9a-f]{64} executable_size_bytes=[1-9][0-9]* schema_registry_sha256=[0-9a-f]{64}$'
+          })
+          if ($marker.Count -ne 1) {
             throw "actual Release candidate-host provenance marker is missing or duplicated"
           }
         timeout-minutes: 10

@@ -151,10 +151,13 @@ test("synthetic Release candidate-host projection validates exact executable and
     const result = await validateWorkerProvenanceProjection(fixture);
     assert.deepEqual(Object.keys(result).sort(), [
       "executableSha256",
+      "executableSizeBytes",
       "schemaRegistrySha256",
       "workerId",
     ]);
     assert.equal(result.executableSha256, sha256(fixture.executableBytes));
+    assert.equal(result.executableSizeBytes, String(fixture.executableBytes.length));
+    assert.match(result.executableSizeBytes, /^[1-9][0-9]*$/u);
     assert.equal(result.schemaRegistrySha256, sha256(fixture.schemaBytes));
     assert.equal(result.workerId, fixture.manifest.worker_id);
   });
