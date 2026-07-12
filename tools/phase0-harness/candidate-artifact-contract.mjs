@@ -1811,40 +1811,40 @@ function validateJsonContractAssets(
   warmupPlan,
   candidate,
 ) {
-  const expectedScope =
-    candidate.artifact_scope === "contract-fixture-only"
-      ? "contract-fixture-only"
-      : "candidate-input";
-  assertExactKeys(
-    modelManifest,
-    ["artifact_scope", "formal_claims", "model_id", "schema_version"],
-    "model-manifest",
-  );
-  if (
-    modelManifest.schema_version !== "1.0" ||
-    modelManifest.artifact_scope !== expectedScope ||
-    modelManifest.formal_claims !== "none" ||
-    modelManifest.model_id !== candidate.worker_manifest_projection.descriptor.model_id
-  ) {
-    fail("ART_CLAIM_UNSUPPORTED", "model manifest identity or claim scope differs");
-  }
+  const isContractFixture = candidate.artifact_scope === "contract-fixture-only";
+  const expectedScope = isContractFixture ? "contract-fixture-only" : "candidate-input";
+  if (isContractFixture) {
+    assertExactKeys(
+      modelManifest,
+      ["artifact_scope", "formal_claims", "model_id", "schema_version"],
+      "model-manifest",
+    );
+    if (
+      modelManifest.schema_version !== "1.0" ||
+      modelManifest.artifact_scope !== expectedScope ||
+      modelManifest.formal_claims !== "none" ||
+      modelManifest.model_id !== candidate.worker_manifest_projection.descriptor.model_id
+    ) {
+      fail("ART_CLAIM_UNSUPPORTED", "model manifest identity or claim scope differs");
+    }
 
-  assertExactKeys(
-    packageLock,
-    ["artifact_scope", "dependencies", "formal_claims", "schema_version"],
-    "package-lock",
-  );
-  if (
-    packageLock.schema_version !== "1.0" ||
-    packageLock.artifact_scope !== expectedScope ||
-    packageLock.formal_claims !== "none" ||
-    !Array.isArray(packageLock.dependencies) ||
-    packageLock.dependencies.some((value) => typeof value !== "string")
-  ) {
-    fail("ART_CLAIM_UNSUPPORTED", "package lock identity or claim scope differs");
-  }
+    assertExactKeys(
+      packageLock,
+      ["artifact_scope", "dependencies", "formal_claims", "schema_version"],
+      "package-lock",
+    );
+    if (
+      packageLock.schema_version !== "1.0" ||
+      packageLock.artifact_scope !== expectedScope ||
+      packageLock.formal_claims !== "none" ||
+      !Array.isArray(packageLock.dependencies) ||
+      packageLock.dependencies.some((value) => typeof value !== "string")
+    ) {
+      fail("ART_CLAIM_UNSUPPORTED", "package lock identity or claim scope differs");
+    }
 
-  validateParameterAsset(parameters, expectedScope);
+    validateParameterAsset(parameters, expectedScope);
+  }
 
   assertExactKeys(
     schemaRegistry,
@@ -2122,8 +2122,9 @@ function validateRunPlan(
   }
   const descriptor = candidate.worker_manifest_projection.descriptor;
   if (
-    conditions.batch_size !== parameters.batch_size ||
-    conditions.thread_count !== parameters.thread_count ||
+    (candidate.artifact_scope === "contract-fixture-only" &&
+      (conditions.batch_size !== parameters.batch_size ||
+        conditions.thread_count !== parameters.thread_count)) ||
     !fixtureSet.fixtures.some(
       (fixture) =>
         conditions.audio_playback_path === "test-fixtures/" + fixture.audio_path,
@@ -2340,9 +2341,86 @@ function validateEvidenceManifest(evidence, contractDigest, runPlan, candidate, 
   }
 }
 
-export async function validateCandidateArtifactBundle(
+function sealedInputPathsFor(candidate, hardware, runPlan, contractEntries) {
+  const usedInputPaths = new Set([
+    CANDIDATE_MANIFEST_PATH,
+    FIXTURE_SET_MANIFEST_PATH,
+    HW_REF_PATH,
+    RUN_PLAN_PATH,
+    ...candidate.artifacts.map((artifact) => artifact.path),
+    ...candidate.licenses.map((license) => license.text_path),
+    hardware.collector.path,
+    runPlan.harness.core.path,
+    runPlan.harness.lockfile.path,
+    runPlan.harness.ui.path,
+    runPlan.same_condition_contract.endpoint_parameters.path,
+    runPlan.same_condition_contract.vad_parameters.path,
+    runPlan.same_condition_contract.warmup_plan.path,
+  ]);
+  if (
+    ![...usedInputPaths].some(
+      (relativePath) =>
+        contractEntries.get(relativePath)?.sha256 === candidate.source.source_sha256,
+    )
+  ) {
+    const sourceMatches = [...contractEntries.values()].filter(
+      (entry) => entry.sha256 === candidate.source.source_sha256,
+    );
+    if (sourceMatches.length !== 1) {
+      fail("ART_JOIN_MISMATCH", "candidate source digest is ambiguous or unreferenced");
+    }
+    usedInputPaths.add(sourceMatches[0].path);
+  }
+  const sealedInputPaths = [...contractEntries.keys()].sort();
+  const requiredInputPaths = [...usedInputPaths].sort();
+  if (
+    sealedInputPaths.length !== requiredInputPaths.length ||
+    sealedInputPaths.some(
+      (relativePath, index) => relativePath !== requiredInputPaths[index],
+    )
+  ) {
+    fail("ART_INVENTORY_MISMATCH", "contract manifest contains an unused or missing input");
+  }
+  return sealedInputPaths;
+}
+
+async function assertExactBundleInventory(resolvedRoot, expectedFiles) {
+  const finalFiles = await listFiles(resolvedRoot);
+  const sortedExpectedFiles = [...expectedFiles].sort();
+  if (
+    finalFiles.length !== sortedExpectedFiles.length ||
+    finalFiles.some(
+      (relativePath, index) => relativePath !== sortedExpectedFiles[index],
+    )
+  ) {
+    fail(
+      "ART_INVENTORY_MISMATCH",
+      "bundle inventory differs: " + finalFiles.join(","),
+      resolvedRoot,
+    );
+  }
+}
+
+async function postflightContractInputs(resolvedRoot, contract) {
+  for (const entry of contract.entries) {
+    const postflight = await digestRegularFile(resolvedRoot, entry.path);
+    if (
+      postflight.sha256 !== entry.sha256 ||
+      postflight.sizeBytes !== entry.size_bytes
+    ) {
+      fail(
+        "ART_DIGEST_MISMATCH",
+        entry.path + " changed during contract validation",
+        entry.path,
+      );
+    }
+  }
+}
+
+async function validateCandidateArtifactInputCore(
   root = DEFAULT_BUNDLE_ROOT,
   options = {},
+  inputOnly = false,
 ) {
   const resolvedRoot = path.resolve(root);
   const files = await listFiles(resolvedRoot);
@@ -2353,8 +2431,6 @@ export async function validateCandidateArtifactBundle(
     FIXTURE_SET_MANIFEST_PATH,
     HW_REF_PATH,
     RUN_PLAN_PATH,
-    EVIDENCE_MANIFEST_PATH,
-    EVIDENCE_SEAL_PATH,
   ]) {
     if (!files.includes(requiredPath)) {
       fail("ART_INVENTORY_MISMATCH", requiredPath + " is missing", requiredPath);
@@ -2420,26 +2496,36 @@ export async function validateCandidateArtifactBundle(
   }
   const canonicalInputCache = new Map();
   for (const entry of contract.entries) {
-    let actual;
-    if (entry.path.endsWith(".json") || entry.path.endsWith(".lock")) {
-      const parsed = await readCanonicalJson(resolvedRoot, entry.path);
-      canonicalInputCache.set(entry.path, parsed);
-      actual = {
-        sha256: sha256(parsed.bytes),
-        sizeBytes: String(parsed.bytes.length),
-      };
-    } else {
-      actual = await digestRegularFile(resolvedRoot, entry.path);
-    }
+    const actual = await digestRegularFile(resolvedRoot, entry.path);
     if (actual.sha256 !== entry.sha256 || actual.sizeBytes !== entry.size_bytes) {
       fail("ART_DIGEST_MISMATCH", entry.path + " differs from its sealed digest", entry.path);
     }
   }
-  for (const [relativePath, parsed] of canonicalInputCache) {
-    validateEmbeddedClaimBoundary(parsed.value, relativePath);
+  const cacheCanonicalInput = async (relativePath) => {
+    const existing = canonicalInputCache.get(relativePath);
+    if (existing) {
+      return existing;
+    }
+    const parsed = await readCanonicalJson(resolvedRoot, relativePath);
+    const entry = contractEntries.get(relativePath);
+    if (
+      !entry ||
+      sha256(parsed.bytes) !== entry.sha256 ||
+      String(parsed.bytes.length) !== entry.size_bytes
+    ) {
+      fail("ART_DIGEST_MISMATCH", relativePath + " differs from its sealed digest", relativePath);
+    }
+    canonicalInputCache.set(relativePath, parsed);
+    return parsed;
+  };
+  for (const relativePath of [
+    CANDIDATE_MANIFEST_PATH,
+    FIXTURE_SET_MANIFEST_PATH,
+    HW_REF_PATH,
+    RUN_PLAN_PATH,
+  ]) {
+    await cacheCanonicalInput(relativePath);
   }
-
-  const fixtureRegistry = await readFixtureRegistryProjection();
   const cachedValue = (relativePath) => {
     const parsed = canonicalInputCache.get(relativePath);
     if (!parsed) {
@@ -2451,7 +2537,43 @@ export async function validateCandidateArtifactBundle(
   const fixtureSet = cachedValue(FIXTURE_SET_MANIFEST_PATH);
   const hardware = cachedValue(HW_REF_PATH);
   const runPlan = cachedValue(RUN_PLAN_PATH);
-  validateCandidateManifest(candidate, contractEntries);
+  const isContractFixtureCandidate =
+    candidate.artifact_scope === "contract-fixture-only";
+  if (!isContractFixtureCandidate) {
+    validateCandidateManifest(candidate, contractEntries);
+  }
+  if (isContractFixtureCandidate) {
+    for (const entry of contract.entries) {
+      if (entry.path.endsWith(".json") || entry.path.endsWith(".lock")) {
+        await cacheCanonicalInput(entry.path);
+      }
+    }
+  } else {
+    // Candidate domain artifacts stay opaque here: their dedicated lock validators
+    // own those schemas. This generic gate parses only its contract-wrapper inputs.
+    const schemaRegistry = candidate.artifacts.find(
+      (artifact) => artifact.role === "schema-registry",
+    );
+    for (const relativePath of new Set([
+      schemaRegistry.path,
+      runPlan.same_condition_contract.endpoint_parameters.path,
+      runPlan.same_condition_contract.vad_parameters.path,
+      runPlan.same_condition_contract.warmup_plan.path,
+    ])) {
+      await cacheCanonicalInput(relativePath);
+    }
+  }
+  for (const [relativePath, parsed] of canonicalInputCache) {
+    validateEmbeddedClaimBoundary(parsed.value, relativePath);
+  }
+  if (isContractFixtureCandidate) {
+    validateCandidateManifest(candidate, contractEntries);
+  }
+
+  const fixtureRegistry = await readFixtureRegistryProjection();
+  if (inputOnly && candidate.artifact_scope !== "candidate-input") {
+    fail("ART_SCHEMA_VALUE", "input-only validation requires candidate-input scope");
+  }
   await validateLicenseTexts(resolvedRoot, candidate);
   if (
     candidate.artifact_scope === "contract-fixture-only" &&
@@ -2504,17 +2626,18 @@ export async function validateCandidateArtifactBundle(
   const artifactByRole = new Map(
     candidate.artifacts.map((artifact) => [artifact.role, artifact]),
   );
-  const readRoleJson = async (role) => {
+  const readRoleJson = (role) => {
     const artifact = artifactByRole.get(role);
     if (!artifact) {
       fail("ART_JOIN_MISMATCH", "candidate is missing required role " + role);
     }
     return cachedValue(artifact.path);
   };
-  const parameters = await readRoleJson("parameters");
-  const modelManifest = await readRoleJson("model-manifest");
-  const packageLock = await readRoleJson("package-lock");
-  const schemaRegistry = await readRoleJson("schema-registry");
+  const isContractFixture = candidate.artifact_scope === "contract-fixture-only";
+  const parameters = isContractFixture ? readRoleJson("parameters") : null;
+  const modelManifest = isContractFixture ? readRoleJson("model-manifest") : null;
+  const packageLock = isContractFixture ? readRoleJson("package-lock") : null;
+  const schemaRegistry = readRoleJson("schema-registry");
   const vadEndpointPlan = cachedValue(
     runPlan.same_condition_contract.endpoint_parameters.path,
   );
@@ -2538,6 +2661,75 @@ export async function validateCandidateArtifactBundle(
     parameters,
     contractEntries,
   );
+
+  const sealedInputPaths = sealedInputPathsFor(
+    candidate,
+    hardware,
+    runPlan,
+    contractEntries,
+  );
+  if (inputOnly) {
+    await assertExactBundleInventory(resolvedRoot, [
+      CONTRACT_MANIFEST_PATH,
+      CONTRACT_SEAL_PATH,
+      ...sealedInputPaths,
+    ]);
+    await postflightContractInputs(resolvedRoot, contract);
+  }
+  return {
+    candidate,
+    contract,
+    contractEntries,
+    contractSeal,
+    fixtureRegistry,
+    fixtureSet,
+    hardware,
+    resolvedRoot,
+    runPlan,
+    sealedInputPaths,
+  };
+}
+
+export async function validateCandidateArtifactInputBundle(
+  root = DEFAULT_BUNDLE_ROOT,
+  options = {},
+) {
+  const validated = await validateCandidateArtifactInputCore(root, options, true);
+  return {
+    bundleRoot: validated.resolvedRoot,
+    candidateId: validated.candidate.candidate_id,
+    contractManifestSha256: validated.contractSeal.digest,
+    contractTestId: validated.contract.contract_id,
+    fixtureManifestSha256: validated.fixtureRegistry.manifestSha256,
+    formalClaims: "none",
+    productionEvidence: false,
+    status: "input-valid",
+    validationPhase: "input-only",
+  };
+}
+
+export async function validateCandidateArtifactBundle(
+  root = DEFAULT_BUNDLE_ROOT,
+  options = {},
+) {
+  const validated = await validateCandidateArtifactInputCore(root, options, false);
+  const {
+    candidate,
+    contract,
+    contractSeal,
+    fixtureRegistry,
+    fixtureSet,
+    hardware,
+    resolvedRoot,
+    runPlan,
+    sealedInputPaths,
+  } = validated;
+  const files = await listFiles(resolvedRoot);
+  for (const requiredPath of [EVIDENCE_MANIFEST_PATH, EVIDENCE_SEAL_PATH]) {
+    if (!files.includes(requiredPath)) {
+      fail("ART_INVENTORY_MISMATCH", requiredPath + " is missing", requiredPath);
+    }
+  }
 
   const evidenceSeal = await validateSeal(
     resolvedRoot,
@@ -2572,79 +2764,15 @@ export async function validateCandidateArtifactBundle(
     }
   }
 
-  const usedInputPaths = new Set([
-    CANDIDATE_MANIFEST_PATH,
-    FIXTURE_SET_MANIFEST_PATH,
-    HW_REF_PATH,
-    RUN_PLAN_PATH,
-    ...candidate.artifacts.map((artifact) => artifact.path),
-    ...candidate.licenses.map((license) => license.text_path),
-    hardware.collector.path,
-    runPlan.harness.core.path,
-    runPlan.harness.lockfile.path,
-    runPlan.harness.ui.path,
-    runPlan.same_condition_contract.endpoint_parameters.path,
-    runPlan.same_condition_contract.vad_parameters.path,
-    runPlan.same_condition_contract.warmup_plan.path,
-  ]);
-  if (
-    ![...usedInputPaths].some(
-      (relativePath) =>
-        contractEntries.get(relativePath)?.sha256 === candidate.source.source_sha256,
-    )
-  ) {
-    const sourceMatches = [...contractEntries.values()].filter(
-      (entry) => entry.sha256 === candidate.source.source_sha256,
-    );
-    if (sourceMatches.length !== 1) {
-      fail("ART_JOIN_MISMATCH", "candidate source digest is ambiguous or unreferenced");
-    }
-    usedInputPaths.add(sourceMatches[0].path);
-  }
-  const sealedInputPaths = [...contractEntries.keys()].sort();
-  const requiredInputPaths = [...usedInputPaths].sort();
-  if (
-    sealedInputPaths.length !== requiredInputPaths.length ||
-    sealedInputPaths.some(
-      (relativePath, index) => relativePath !== requiredInputPaths[index],
-    )
-  ) {
-    fail("ART_INVENTORY_MISMATCH", "contract manifest contains an unused or missing input");
-  }
-  const expectedFiles = [
+  await assertExactBundleInventory(resolvedRoot, [
     CONTRACT_MANIFEST_PATH,
     CONTRACT_SEAL_PATH,
     EVIDENCE_MANIFEST_PATH,
     EVIDENCE_SEAL_PATH,
     ...sealedInputPaths,
     ...evidence.output_artifacts.map((artifact) => artifact.path),
-  ].sort();
-  const finalFiles = await listFiles(resolvedRoot);
-  if (
-    finalFiles.length !== expectedFiles.length ||
-    finalFiles.some(
-      (relativePath, index) => relativePath !== expectedFiles[index],
-    )
-  ) {
-    fail(
-      "ART_INVENTORY_MISMATCH",
-      "bundle inventory differs: " + finalFiles.join(","),
-      resolvedRoot,
-    );
-  }
-  for (const entry of contract.entries) {
-    const postflight = await digestRegularFile(resolvedRoot, entry.path);
-    if (
-      postflight.sha256 !== entry.sha256 ||
-      postflight.sizeBytes !== entry.size_bytes
-    ) {
-      fail(
-        "ART_DIGEST_MISMATCH",
-        entry.path + " changed during contract validation",
-        entry.path,
-      );
-    }
-  }
+  ]);
+  await postflightContractInputs(resolvedRoot, contract);
   for (const artifact of evidence.output_artifacts) {
     const postflight = await digestRegularFile(resolvedRoot, artifact.path);
     if (

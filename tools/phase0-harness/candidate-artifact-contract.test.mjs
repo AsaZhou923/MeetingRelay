@@ -20,8 +20,22 @@ import {
   generateCandidateArtifactBundle,
   validateArtifactPath,
   validateCandidateArtifactBundle,
+  validateCandidateArtifactInputBundle,
 } from "./candidate-artifact-contract.mjs";
 import { sha256 } from "./fixture-contract.mjs";
+
+const FULL_SHERPA_PARAMETERS_BYTES = Buffer.from(
+  "{\"blank_penalty\":0,\"bpe_vocab\":null,\"channels\":1,\"debug\":false," +
+    "\"decoding_method\":\"greedy_search\",\"feature_dim\":80," +
+    "\"homophone_lexicon\":null,\"homophone_rule_fsts\":null," +
+    "\"hotwords_file\":null,\"hotwords_score\":0,\"language\":\"zh\"," +
+    "\"lm_model\":null,\"lm_scale\":1,\"max_active_paths\":4," +
+    "\"max_input_bytes\":67108864,\"model_family\":\"sense_voice\"," +
+    "\"model_type\":null,\"modeling_unit\":null,\"num_threads\":1," +
+    "\"provider\":\"cpu\",\"rule_fars\":null,\"rule_fsts\":null," +
+    "\"sample_rate_hz\":16000,\"telespeech_ctc\":null,\"use_itn\":true}",
+  "utf8",
+);
 
 async function withBundle(run) {
   const temp = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-wp04-artifact-"));
@@ -83,6 +97,26 @@ async function addContractFile(root, relativePath, bytes) {
     sha256: sha256(bytes),
     size_bytes: String(bytes.length),
   });
+  contract.entries.sort((left, right) =>
+    left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+  );
+  await resealContractManifest(root, contract);
+}
+
+async function replaceContractFile(root, previousPath, relativePath, bytes) {
+  const previousTarget = path.join(root, ...previousPath.split("/"));
+  const target = path.join(root, ...relativePath.split("/"));
+  if (previousPath !== relativePath) {
+    await rm(previousTarget);
+  }
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, bytes);
+  const contract = await readJson(root, "contract-manifest.json");
+  const entry = contract.entries.find((value) => value.path === previousPath);
+  assert.ok(entry, previousPath);
+  entry.path = relativePath;
+  entry.sha256 = sha256(bytes);
+  entry.size_bytes = String(bytes.length);
   contract.entries.sort((left, right) =>
     left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
   );
@@ -348,6 +382,97 @@ async function convertToCandidateRunBundle(root, role) {
   };
 }
 
+async function removeEvidencePhase(root) {
+  await rm(path.join(root, "evidence"), { recursive: true, force: true });
+}
+
+async function currentInputTrust(root) {
+  const candidate = await readJson(root, "manifests/candidate-manifest.json");
+  const contractBytes = await readFile(path.join(root, "contract-manifest.json"));
+  return {
+    approvedLicenseSha256s: candidate.licenses.map((license) => license.text_sha256),
+    expectedContractSha256: sha256(contractBytes),
+  };
+}
+
+async function convertToRawCandidateInputBundle(root) {
+  await convertToCandidateRunBundle(root, "native-candidate");
+  const assetLockBytes = await readFile(
+    path.join(candidateArtifactPaths.repositoryRoot, "tools", "sherpa-native", "assets.lock.json"),
+  );
+  const cargoLockBytes = await readFile(
+    path.join(candidateArtifactPaths.repositoryRoot, "Cargo.lock"),
+  );
+  const materials = new Map([
+    [
+      "model-manifest",
+      {
+        bytes: assetLockBytes,
+        path: "assets/assets.lock.json",
+        previousPath: "assets/model-manifest.json",
+      },
+    ],
+    [
+      "package-lock",
+      {
+        bytes: cargoLockBytes,
+        path: "assets/Cargo.lock",
+        previousPath: "assets/package.lock",
+      },
+    ],
+    [
+      "parameters",
+      {
+        bytes: FULL_SHERPA_PARAMETERS_BYTES,
+        path: "assets/parameters.json",
+        previousPath: "assets/parameters.json",
+      },
+    ],
+  ]);
+
+  for (const material of materials.values()) {
+    await replaceContractFile(
+      root,
+      material.previousPath,
+      material.path,
+      material.bytes,
+    );
+  }
+
+  await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+    candidate.publishability_status = "pending";
+    for (const license of candidate.licenses) {
+      license.distribution_status = "pending";
+    }
+    const byRole = new Map(candidate.artifacts.map((artifact) => [artifact.role, artifact]));
+    for (const [role, material] of materials) {
+      const artifact = byRole.get(role);
+      assert.ok(artifact, role);
+      artifact.path = material.path;
+      artifact.sha256 = sha256(material.bytes);
+      artifact.size_bytes = String(material.bytes.length);
+    }
+    candidate.artifacts.sort((left, right) =>
+      left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+    );
+    const descriptor = candidate.worker_manifest_projection.descriptor;
+    descriptor.model_manifest_sha256 = byRole.get("model-manifest").sha256;
+    descriptor.package_lock_sha256 = byRole.get("package-lock").sha256;
+    descriptor.parameter_sha256 = byRole.get("parameters").sha256;
+  });
+
+  await mutateContractJson(root, "manifests/run-plan.json", (runPlan) => {
+    const cargoLock = materials.get("package-lock");
+    runPlan.harness.lockfile.path = cargoLock.path;
+    runPlan.harness.lockfile.sha256 = sha256(cargoLock.bytes);
+    runPlan.same_condition_contract.parameter_sha256 = sha256(
+      materials.get("parameters").bytes,
+    );
+  });
+  await removeEvidencePhase(root);
+  return currentInputTrust(root);
+}
+
 test("CT-WORKER-ARTIFACT-001 validates the generated sealed contract fixture", async () => {
   await withBundle(async (root) => {
     const result = await validateCandidateArtifactBundle(root);
@@ -427,6 +552,215 @@ test("generic contract accepts native, sidecar, and fallback candidate-run profi
       assert.match(result.candidateId, /^candidate-/);
     });
   }
+});
+
+test("candidate input validates without evidence while combined validation still requires it", async () => {
+  await withBundle(async (root) => {
+    const trust = await convertToRawCandidateInputBundle(root);
+
+    const result = await validateCandidateArtifactInputBundle(root, {
+      expectedContractSha256: trust.expectedContractSha256,
+    });
+    assert.deepEqual(Object.keys(result).sort(), [
+      "bundleRoot",
+      "candidateId",
+      "contractManifestSha256",
+      "contractTestId",
+      "fixtureManifestSha256",
+      "formalClaims",
+      "productionEvidence",
+      "status",
+      "validationPhase",
+    ]);
+    assert.equal(result.status, "input-valid");
+    assert.equal(result.validationPhase, "input-only");
+    assert.equal(result.formalClaims, "none");
+    assert.equal(result.productionEvidence, false);
+    assert.equal("evidenceManifestSha256" in result, false);
+    await expectCode(
+      validateCandidateArtifactBundle(root, trust),
+      "ART_INVENTORY_MISMATCH",
+    );
+  });
+});
+
+test("candidate input treats assets lock, Cargo lock, and full compact parameters as descriptor-bound bytes", async () => {
+  await withBundle(async (root) => {
+    const trust = await convertToRawCandidateInputBundle(root);
+    const assetsLock = await readFile(path.join(root, "assets", "assets.lock.json"), "utf8");
+    const cargoLock = await readFile(path.join(root, "assets", "Cargo.lock"), "utf8");
+    const parameters = await readFile(path.join(root, "assets", "parameters.json"), "utf8");
+
+    assert.match(assetsLock, /\n  \"schema_version\"/);
+    assert.match(cargoLock, /^# This file is automatically @generated by Cargo\./);
+    assert.equal(parameters, FULL_SHERPA_PARAMETERS_BYTES.toString("utf8"));
+    assert.equal(JSON.parse(parameters).num_threads, 1);
+    assert.equal("batch_size" in JSON.parse(parameters), false);
+    const result = await validateCandidateArtifactInputBundle(root, trust);
+    assert.equal(result.status, "input-valid");
+  });
+});
+
+test("candidate input streams a model artifact without parsing it from a JSON-looking path", async () => {
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    const modelBytes = await readFile(path.join(root, "assets", "contract-model.bin"));
+    await replaceContractFile(
+      root,
+      "assets/contract-model.bin",
+      "assets/model.json",
+      modelBytes,
+    );
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      const model = candidate.artifacts.find((artifact) => artifact.role === "model");
+      model.path = "assets/model.json";
+      candidate.artifacts.sort((left, right) =>
+        left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+      );
+    });
+    const candidate = await readJson(root, "manifests/candidate-manifest.json");
+    const contract = await readJson(root, "contract-manifest.json");
+    const model = candidate.artifacts.find((artifact) => artifact.role === "model");
+    const contractEntry = contract.entries.find((entry) => entry.path === model.path);
+    assert.equal(model.sha256, sha256(modelBytes));
+    assert.equal(model.size_bytes, String(modelBytes.length));
+    assert.equal(contractEntry.sha256, model.sha256);
+    assert.equal(contractEntry.size_bytes, model.size_bytes);
+    assert.equal(
+      candidate.worker_manifest_projection.descriptor.model_sha256,
+      model.sha256,
+    );
+
+    const result = await validateCandidateArtifactInputBundle(
+      root,
+      await currentInputTrust(root),
+    );
+    assert.equal(result.status, "input-valid");
+  });
+});
+
+test("candidate input rejects raw Cargo lock, assets lock whitespace, and compact parameter byte drift", async () => {
+  for (const [relativePath, suffix] of [
+    ["assets/Cargo.lock", Buffer.from("# drift\n", "utf8")],
+    ["assets/assets.lock.json", Buffer.from(" \n", "utf8")],
+    ["assets/parameters.json", Buffer.from("\n", "utf8")],
+  ]) {
+    await withBundle(async (root) => {
+      const trust = await convertToRawCandidateInputBundle(root);
+      const target = path.join(root, ...relativePath.split("/"));
+      await writeFile(target, Buffer.concat([await readFile(target), suffix]));
+      await expectCode(
+        validateCandidateArtifactInputBundle(root, trust),
+        "ART_DIGEST_MISMATCH",
+      );
+    });
+  }
+});
+
+test("candidate input rejects descriptor role size and path joins that diverge from sealed raw assets", async () => {
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      const cargoLock = candidate.artifacts.find((artifact) => artifact.role === "package-lock");
+      cargoLock.size_bytes = String(Number(cargoLock.size_bytes) + 1);
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_JOIN_MISMATCH",
+    );
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      const assetsLock = candidate.artifacts.find(
+        (artifact) => artifact.role === "model-manifest",
+      );
+      assetsLock.path = "assets/Cargo.lock";
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_JOIN_MISMATCH",
+    );
+  });
+});
+
+test("candidate input keeps external trust, accepted-license approval, claim, and exact-inventory gates", async () => {
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await expectCode(
+      validateCandidateArtifactInputBundle(root),
+      "ART_TRUST_ANCHOR_REQUIRED",
+    );
+  });
+  await withBundle(async (root) => {
+    const trust = await convertToRawCandidateInputBundle(root);
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, {
+        expectedContractSha256: "1".repeat(64),
+      }),
+      "ART_JOIN_CONTRACT_MISMATCH",
+    );
+    assert.notEqual(trust.expectedContractSha256, "1".repeat(64));
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      candidate.publishability_status = "accepted";
+      for (const license of candidate.licenses) {
+        license.distribution_status = "accepted";
+      }
+    });
+    const trust = await currentInputTrust(root);
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, {
+        expectedContractSha256: trust.expectedContractSha256,
+      }),
+      "ART_LICENSE_APPROVAL_REQUIRED",
+    );
+    assert.ok(trust.approvedLicenseSha256s.length > 1);
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, {
+        approvedLicenseSha256s: [trust.approvedLicenseSha256s[0]],
+        expectedContractSha256: trust.expectedContractSha256,
+      }),
+      "ART_LICENSE_APPROVAL_REQUIRED",
+    );
+    assert.equal(
+      (await validateCandidateArtifactInputBundle(root, trust)).status,
+      "input-valid",
+    );
+  });
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/candidate-manifest.json", (candidate) => {
+      candidate.claims.formal_metric_ids = ["PERF-RT-001"];
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_CLAIM_UNSUPPORTED",
+    );
+  });
+  await withBundle(async (root) => {
+    const trust = await convertToRawCandidateInputBundle(root);
+    await writeFile(path.join(root, "extra.txt"), "extra\n");
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, trust),
+      "ART_INVENTORY_MISMATCH",
+    );
+  });
+  await withBundle(async (root) => {
+    const trust = await convertToRawCandidateInputBundle(root);
+    await mkdir(path.join(root, "evidence"), { recursive: true });
+    await writeFile(
+      path.join(root, "evidence", "evidence-manifest.sha256"),
+      "1".repeat(64) + "  evidence-manifest.json\n",
+      "ascii",
+    );
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, trust),
+      "ART_INVENTORY_MISMATCH",
+    );
+  });
 });
 
 test("candidate-run bundles require an external trust anchor and seal raw outputs", async () => {
