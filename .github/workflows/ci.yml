@@ -114,14 +114,31 @@ jobs:
       - name: Materialize pinned sherpa runtime and model assets
         shell: pwsh
         run: |
+          $gitRoots = @(
+            Get-Command git.exe -CommandType Application -All -ErrorAction Stop |
+              ForEach-Object {
+                [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $_.Source)))
+              } |
+              Sort-Object -Unique
+          )
+          if ($gitRoots.Count -ne 1) { throw "expected exactly one Git for Windows installation root" }
+          $gitRoot = $gitRoots[0]
+          $archiveTar = Join-Path $gitRoot 'usr\bin\tar.exe'
+          $archiveBzip2 = Join-Path $gitRoot 'usr\bin\bzip2.exe'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_ARCHIVE_TAR=$archiveTar" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_ARCHIVE_BZIP2=$archiveBzip2" -Encoding utf8
           & ./tools/sherpa-native/materialize.ps1 `
             -CacheRoot target/sherpa-native `
             -AssetSet All `
+            -ArchiveTarPath $archiveTar `
+            -ArchiveBzip2Path $archiveBzip2 `
             -AllowDownload
           if ($LASTEXITCODE -ne 0) { throw "online sherpa materialization failed" }
           $second = & ./tools/sherpa-native/materialize.ps1 `
             -CacheRoot target/sherpa-native `
-            -AssetSet All
+            -AssetSet All `
+            -ArchiveTarPath $archiveTar `
+            -ArchiveBzip2Path $archiveBzip2
           $second | Write-Output
           $keys = @(
             'MEETINGRELAY_SHERPA_LOCK',
@@ -144,7 +161,10 @@ jobs:
       - name: Test sherpa path hardening against materialized assets
         shell: pwsh
         run: |
-          $output = @(& ./tools/sherpa-native/path-hardening.test.ps1 2>&1)
+          $output = @(& ./tools/sherpa-native/path-hardening.test.ps1 `
+            -ArchiveTarPath $env:MEETINGRELAY_ARCHIVE_TAR `
+            -ArchiveBzip2Path $env:MEETINGRELAY_ARCHIVE_BZIP2 `
+            2>&1)
           $output | Write-Output
           if ($LASTEXITCODE -ne 0) { throw "sherpa path-hardening tests failed" }
           if (@($output | Where-Object { [string]$_ -match '=SKIP' }).Count -ne 0) {

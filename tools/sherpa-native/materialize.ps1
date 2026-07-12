@@ -2,6 +2,8 @@
 param(
     [string]$CacheRoot = "target/sherpa-native",
     [string]$ArchiveSourceRoot,
+    [string]$ArchiveTarPath,
+    [string]$ArchiveBzip2Path,
     [ValidateSet("All", "Runtime", "Model")]
     [string]$AssetSet = "All",
     [switch]$AllowDownload
@@ -217,6 +219,108 @@ function Resolve-WindowsSystemToolPath {
     return $toolPath
 }
 
+function Invoke-SanitizedArchiveCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+
+    $environmentNames = @("TAR_OPTIONS", "BZIP2", "BZIP")
+    $savedEnvironment = @{}
+    foreach ($name in $environmentNames) {
+        $environmentPath = "Env:$name"
+        if (Test-Path -LiteralPath $environmentPath) {
+            $savedEnvironment[$name] = (Get-Item -LiteralPath $environmentPath).Value
+        }
+    }
+
+    $locationPushed = $false
+    $previousErrorActionPreference = $ErrorActionPreference
+    $output = @()
+    $exitCode = $null
+    try {
+        foreach ($name in $environmentNames) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        }
+        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            Push-Location -LiteralPath $WorkingDirectory
+            $locationPushed = $true
+        }
+        $ErrorActionPreference = "Continue"
+        $output = @(& $Executable @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($locationPushed) {
+            Pop-Location
+        }
+        foreach ($name in $environmentNames) {
+            if ($savedEnvironment.ContainsKey($name)) {
+                Set-Item -LiteralPath "Env:$name" -Value $savedEnvironment[$name]
+            }
+            else {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Output = $output
+        ExitCode = $exitCode
+    }
+}
+
+function Resolve-ArchiveTool {
+    param(
+        [string]$TarExecutable,
+        [string]$Bzip2Executable
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TarExecutable) -and
+        [string]::IsNullOrWhiteSpace($Bzip2Executable)) {
+        return [PSCustomObject]@{
+            Kind = "windows-system-tar"
+            TarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
+            Bzip2Path = $null
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($TarExecutable) -or
+        [string]::IsNullOrWhiteSpace($Bzip2Executable)) {
+        throw "ArchiveTarPath and ArchiveBzip2Path must be supplied together"
+    }
+
+    $tarPath = [IO.Path]::GetFullPath($TarExecutable)
+    $bzip2Path = [IO.Path]::GetFullPath($Bzip2Executable)
+    Assert-RegularFile -Path $tarPath -Label "explicit archive tar"
+    Assert-RegularFile -Path $bzip2Path -Label "explicit archive bzip2"
+    $expectedBzip2Path = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $tarPath) "bzip2.exe"))
+    if (-not $bzip2Path.Equals($expectedBzip2Path, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Explicit GNU tar and bzip2 must be sibling Git-for-Windows tools"
+    }
+    $versionResult = Invoke-SanitizedArchiveCommand -Executable $tarPath -Arguments @("--version")
+    $version = @($versionResult.Output)
+    if ($versionResult.ExitCode -ne 0 -or $version.Count -eq 0 -or
+        -not ([string]$version[0]).StartsWith("tar (GNU tar) ", [StringComparison]::Ordinal)) {
+        throw "Explicit archive tar must identify as GNU tar"
+    }
+    $bzip2Result = Invoke-SanitizedArchiveCommand -Executable $bzip2Path -Arguments @("-h")
+    $bzip2Identity = @($bzip2Result.Output)
+    if ($bzip2Result.ExitCode -ne 0 -or $bzip2Identity.Count -eq 0 -or
+        -not ([string]$bzip2Identity[0]).StartsWith(
+            "bzip2, a block-sorting file compressor.  Version ",
+            [StringComparison]::Ordinal
+        )) {
+        throw "Explicit archive bzip2 must identify as bzip2"
+    }
+    return [PSCustomObject]@{
+        Kind = "git-for-windows-gnu-tar"
+        TarPath = $tarPath
+        Bzip2Path = $bzip2Path
+    }
+}
+
 function Invoke-LockedHttpsDownload {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -272,18 +376,41 @@ function Assert-SafeArchiveListing {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
         [Parameter(Mandatory = $true)][string]$ExpectedRoot,
-        [Parameter(Mandatory = $true)]$Inventory
+        [Parameter(Mandatory = $true)]$Inventory,
+        [string]$TarExecutable,
+        [string]$Bzip2Executable
     )
 
     Assert-RegularFile -Path $ArchivePath -Label "archive"
-    $tarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
-    Write-Host "SHERPA_ARCHIVE_LISTING_START path=$ArchivePath"
-    $entries = @(& $tarPath -tjf $ArchivePath)
-    if ($LASTEXITCODE -ne 0 -or $entries.Count -eq 0) {
+    $archiveTool = Resolve-ArchiveTool -TarExecutable $TarExecutable -Bzip2Executable $Bzip2Executable
+    Write-Host "SHERPA_ARCHIVE_LISTING_START path=$ArchivePath tool=$($archiveTool.Kind)"
+    if ($archiveTool.Kind -eq "git-for-windows-gnu-tar") {
+        $listingResult = Invoke-SanitizedArchiveCommand `
+            -Executable $archiveTool.TarPath `
+            -Arguments @("--force-local", "--use-compress-program=/usr/bin/bzip2", "-tf", $ArchivePath)
+    }
+    else {
+        $listingResult = Invoke-SanitizedArchiveCommand `
+            -Executable $archiveTool.TarPath `
+            -Arguments @("-tjf", $ArchivePath)
+    }
+    $entries = @($listingResult.Output)
+    if ($listingResult.ExitCode -ne 0 -or $entries.Count -eq 0) {
         throw "Unable to inspect archive path listing: $ArchivePath"
     }
-    $verboseEntries = @(& $tarPath -tvjf $ArchivePath)
-    if ($LASTEXITCODE -ne 0 -or $verboseEntries.Count -ne $entries.Count) {
+    Write-Host "SHERPA_ARCHIVE_PATH_LISTING_COMPLETE path=$ArchivePath entries=$($entries.Count)"
+    if ($archiveTool.Kind -eq "git-for-windows-gnu-tar") {
+        $verboseResult = Invoke-SanitizedArchiveCommand `
+            -Executable $archiveTool.TarPath `
+            -Arguments @("--force-local", "--use-compress-program=/usr/bin/bzip2", "-tvf", $ArchivePath)
+    }
+    else {
+        $verboseResult = Invoke-SanitizedArchiveCommand `
+            -Executable $archiveTool.TarPath `
+            -Arguments @("-tvjf", $ArchivePath)
+    }
+    $verboseEntries = @($verboseResult.Output)
+    if ($verboseResult.ExitCode -ne 0 -or $verboseEntries.Count -ne $entries.Count) {
         throw "Unable to inspect archive entry types: $ArchivePath"
     }
 
@@ -429,15 +556,40 @@ function Get-VerifiedExtraction {
         return $destination
     }
 
-    Assert-SafeArchiveListing -ArchivePath $ArchivePath -ExpectedRoot $Archive.extracted_directory -Inventory $Archive.inventory
+    Assert-FileIdentity `
+        -Path $ArchivePath `
+        -SizeBytes ([Int64]$Archive.size_bytes) `
+        -Sha256 $Archive.sha256 `
+        -Label "$Label archive before listing"
+    Assert-SafeArchiveListing `
+        -ArchivePath $ArchivePath `
+        -ExpectedRoot $Archive.extracted_directory `
+        -Inventory $Archive.inventory `
+        -TarExecutable $ArchiveTarPath `
+        -Bzip2Executable $ArchiveBzip2Path
     $temporary = Join-Path $resolvedCacheRoot ("extracting-" + [Guid]::NewGuid().ToString("N"))
     New-SafeCacheDirectory -Path $temporary
     try {
         Assert-WithinCache -Value $temporary -Label "pre-extraction directory"
-        $tarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
-        Write-Host "SHERPA_ARCHIVE_EXTRACTION_START name=$($Archive.name)"
-        & $tarPath -xjf $ArchivePath -C $temporary
-        if ($LASTEXITCODE -ne 0) {
+        Assert-FileIdentity `
+            -Path $ArchivePath `
+            -SizeBytes ([Int64]$Archive.size_bytes) `
+            -Sha256 $Archive.sha256 `
+            -Label "$Label archive before extraction"
+        $archiveTool = Resolve-ArchiveTool -TarExecutable $ArchiveTarPath -Bzip2Executable $ArchiveBzip2Path
+        Write-Host "SHERPA_ARCHIVE_EXTRACTION_START name=$($Archive.name) tool=$($archiveTool.Kind)"
+        if ($archiveTool.Kind -eq "git-for-windows-gnu-tar") {
+            $extractionResult = Invoke-SanitizedArchiveCommand `
+                -Executable $archiveTool.TarPath `
+                -Arguments @("--force-local", "--use-compress-program=/usr/bin/bzip2", "-xf", $ArchivePath) `
+                -WorkingDirectory $temporary
+        }
+        else {
+            $extractionResult = Invoke-SanitizedArchiveCommand `
+                -Executable $archiveTool.TarPath `
+                -Arguments @("-xjf", $ArchivePath, "-C", $temporary)
+        }
+        if ($extractionResult.ExitCode -ne 0) {
             throw "Failed to extract locked archive: $ArchivePath"
         }
         Write-Host "SHERPA_ARCHIVE_EXTRACTION_COMPLETE name=$($Archive.name)"
@@ -460,7 +612,7 @@ if ($MyInvocation.InvocationName -eq ".") {
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw "Node.js is required to validate the committed asset lock"
 }
-$null = Resolve-WindowsSystemToolPath -Name "tar.exe"
+$null = Resolve-ArchiveTool -TarExecutable $ArchiveTarPath -Bzip2Executable $ArchiveBzip2Path
 
 & node (Join-Path $scriptRoot "validate-lock.mjs") $lockPath
 if ($LASTEXITCODE -ne 0) {

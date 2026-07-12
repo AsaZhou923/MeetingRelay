@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ArchiveTarPath,
+    [string]$ArchiveBzip2Path
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -15,6 +18,8 @@ $archiveRoot = Join-Path $archiveInput "locked-root"
 $archivePath = Join-Path $testRoot "hardlink.tar.bz2"
 $overlapRoot = Join-Path $testRoot "overlap-source"
 $overlapLibDir = Join-Path $overlapRoot "lib"
+$testArchiveTarPath = $ArchiveTarPath
+$testArchiveBzip2Path = $ArchiveBzip2Path
 . (Join-Path $scriptRoot "materialize.ps1")
 $systemTarPath = Resolve-WindowsSystemToolPath -Name "tar.exe"
 
@@ -136,17 +141,51 @@ try {
         [PSCustomObject]@{ path = "first.bin" },
         [PSCustomObject]@{ path = "second.bin" }
     )
-    try {
-        Assert-SafeArchiveListing -ArchivePath $archivePath -ExpectedRoot "locked-root" -Inventory $inventory
-    }
-    catch {
-        if ($_.Exception.Message -notmatch "links and special entries are forbidden") {
-            throw "Archive hard-link regression failed for the wrong reason: $($_.Exception.Message)"
+    $archiveEnvironmentNames = @("TAR_OPTIONS", "BZIP2", "BZIP")
+    $savedArchiveEnvironment = @{}
+    foreach ($name in $archiveEnvironmentNames) {
+        if (Test-Path -LiteralPath "Env:$name") {
+            $savedArchiveEnvironment[$name] = (Get-Item -LiteralPath "Env:$name").Value
         }
-        Write-Output "ARCHIVE_HARDLINK_REGRESSION=PASS"
-        return
     }
-    throw "Archive hard-link regression did not reject a hard-link entry"
+    $injectedTarOptions = "--checkpoint=1 --checkpoint-action=echo=MEETINGRELAY_TAR_OPTIONS_INJECTED"
+    $hardlinkRejected = $false
+    try {
+        $env:TAR_OPTIONS = $injectedTarOptions
+        $env:BZIP2 = "-v"
+        $env:BZIP = "-v"
+        try {
+            Assert-SafeArchiveListing `
+                -ArchivePath $archivePath `
+                -ExpectedRoot "locked-root" `
+                -Inventory $inventory `
+                -TarExecutable $testArchiveTarPath `
+                -Bzip2Executable $testArchiveBzip2Path
+        }
+        catch {
+            if ($_.Exception.Message -notmatch "links and special entries are forbidden") {
+                throw "Archive hard-link regression failed for the wrong reason: $($_.Exception.Message)"
+            }
+            $hardlinkRejected = $true
+        }
+        if ($env:TAR_OPTIONS -ne $injectedTarOptions -or $env:BZIP2 -ne "-v" -or $env:BZIP -ne "-v") {
+            throw "Archive command did not restore ambient archive environment variables"
+        }
+    }
+    finally {
+        foreach ($name in $archiveEnvironmentNames) {
+            if ($savedArchiveEnvironment.ContainsKey($name)) {
+                Set-Item -LiteralPath "Env:$name" -Value $savedArchiveEnvironment[$name]
+            }
+            else {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    if (-not $hardlinkRejected) {
+        throw "Archive hard-link regression did not reject a hard-link entry"
+    }
+    Write-Output "ARCHIVE_HARDLINK_REGRESSION=PASS"
 }
 finally {
     $junctionAttributes = try { [IO.File]::GetAttributes($junction) } catch { $null }

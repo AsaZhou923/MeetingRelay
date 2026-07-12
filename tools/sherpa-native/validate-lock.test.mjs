@@ -71,7 +71,9 @@ test("explicit archive acquisition uses the HTTPS-only curl path", async () => {
   const materializer = await readFile(MATERIALIZER_PATH, "utf8");
   assert.doesNotMatch(materializer, /\bInvoke-WebRequest\b/);
   assert.doesNotMatch(materializer, /Get-Command\s+curl\.exe/);
+  assert.doesNotMatch(materializer, /Get-Command\s+(?:tar|bzip2)(?:\.exe)?/);
   assert.doesNotMatch(materializer, /&\s+tar(?:\.exe)?\b/);
+  assert.doesNotMatch(materializer, /&\s+\$archiveTool\.TarPath/);
   assert.match(
     materializer,
     /& \$curlPath `\r?\n\s+--disable `\r?\n\s+--proto '=https'/,
@@ -81,6 +83,12 @@ test("explicit archive acquisition uses the HTTPS-only curl path", async () => {
     'ValidateSet("curl.exe", "tar.exe")',
     'Resolve-WindowsSystemToolPath -Name "curl.exe"',
     'Resolve-WindowsSystemToolPath -Name "tar.exe"',
+    "ArchiveTarPath and ArchiveBzip2Path must be supplied together",
+    "Explicit GNU tar and bzip2 must be sibling Git-for-Windows tools",
+    "Explicit archive bzip2 must identify as bzip2",
+    "Invoke-SanitizedArchiveCommand",
+    "--force-local",
+    "--use-compress-program=/usr/bin/bzip2",
     'Assert-RegularFile -Path $toolPath -Label "Windows system $Name"',
     "--disable",
     "--proto '=https'",
@@ -93,6 +101,12 @@ test("explicit archive acquisition uses the HTTPS-only curl path", async () => {
     "--output $Destination",
   ]) {
     assert.ok(materializer.includes(required), `materializer is missing ${required}`);
+  }
+  for (const environmentName of ["TAR_OPTIONS", "BZIP2", "BZIP"]) {
+    assert.ok(
+      materializer.includes(`\"${environmentName}\"`),
+      `materializer does not sanitize ${environmentName}`,
+    );
   }
 });
 
