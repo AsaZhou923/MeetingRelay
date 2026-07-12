@@ -14,6 +14,7 @@ import {
 } from "./validate-lock.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const MATERIALIZER_PATH = path.join(HERE, "materialize.ps1");
 
 async function originalLock() {
   return JSON.parse(await readFile(DEFAULT_LOCK_PATH, "utf8"));
@@ -64,6 +65,30 @@ test("Cargo cannot fall through to the upstream implicit downloader", () => {
     () => validateCargoOfflineGate("[env]\n"),
     (error) => error instanceof LockValidationError && error.code === "LOCK_CARGO_OFFLINE_GATE",
   );
+});
+
+test("explicit archive acquisition uses the HTTPS-only curl path", async () => {
+  const materializer = await readFile(MATERIALIZER_PATH, "utf8");
+  assert.doesNotMatch(materializer, /\bInvoke-WebRequest\b/);
+  assert.match(
+    materializer,
+    /& \$curl\.Source `\r?\n\s+--disable `\r?\n\s+--proto '=https'/,
+    "--disable must be the first curl argument so curlrc files cannot weaken the transfer policy",
+  );
+  for (const required of [
+    "Get-Command curl.exe",
+    "--disable",
+    "--proto '=https'",
+    "--proto-redir '=https'",
+    "--tlsv1.2",
+    "--retry 10",
+    "--retry-connrefused",
+    "--location",
+    "--fail",
+    "--output $Destination",
+  ]) {
+    assert.ok(materializer.includes(required), `materializer is missing ${required}`);
+  }
 });
 
 test("runtime and model archive digest tampering fail closed", async () => {

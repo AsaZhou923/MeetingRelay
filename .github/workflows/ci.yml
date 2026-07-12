@@ -114,11 +114,11 @@ jobs:
       - name: Materialize pinned sherpa runtime and model assets
         shell: pwsh
         run: |
-          $first = & ./tools/sherpa-native/materialize.ps1 `
+          & ./tools/sherpa-native/materialize.ps1 `
             -CacheRoot target/sherpa-native `
             -AssetSet All `
             -AllowDownload
-          $first | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "online sherpa materialization failed" }
           $second = & ./tools/sherpa-native/materialize.ps1 `
             -CacheRoot target/sherpa-native `
             -AssetSet All
@@ -139,7 +139,7 @@ jobs:
             if ($matches.Count -ne 1) { throw "materializer did not emit exactly one $key" }
             Add-Content -LiteralPath $env:GITHUB_ENV -Value $matches[0] -Encoding utf8
           }
-        timeout-minutes: 15
+        timeout-minutes: 25
 
       - name: Test sherpa path hardening against materialized assets
         shell: pwsh

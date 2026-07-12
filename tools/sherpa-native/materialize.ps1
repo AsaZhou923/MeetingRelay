@@ -206,6 +206,41 @@ function Get-LowerSha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Invoke-LockedHttpsDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][Int64]$ExpectedSizeBytes
+    )
+
+    if (-not $Url.StartsWith("https://github.com/", [StringComparison]::Ordinal)) {
+        throw "Locked download URL is not an allowed GitHub HTTPS URL: $Url"
+    }
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $curl) {
+        throw "curl.exe is required for explicit archive acquisition"
+    }
+    Write-Host "SHERPA_ARCHIVE_DOWNLOAD_START name=$Name expected_bytes=$ExpectedSizeBytes"
+    & $curl.Source `
+        --disable `
+        --proto '=https' `
+        --proto-redir '=https' `
+        --tlsv1.2 `
+        --retry 10 `
+        --retry-connrefused `
+        --location `
+        --silent `
+        --show-error `
+        --fail `
+        --output $Destination `
+        $Url
+    if ($LASTEXITCODE -ne 0) {
+        throw "curl.exe failed to acquire locked archive $Name (exit $LASTEXITCODE)"
+    }
+    Write-Host "SHERPA_ARCHIVE_DOWNLOAD_COMPLETE name=$Name"
+}
+
 function Assert-FileIdentity {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -354,10 +389,11 @@ function Get-VerifiedArchive {
         Copy-Item -LiteralPath $source -Destination $partial
     }
     else {
-        if (-not $Archive.url.StartsWith("https://github.com/", [StringComparison]::Ordinal)) {
-            throw "Locked download URL is not an allowed GitHub HTTPS URL: $($Archive.url)"
-        }
-        Invoke-WebRequest -UseBasicParsing -Uri $Archive.url -OutFile $partial
+        Invoke-LockedHttpsDownload `
+            -Url $Archive.url `
+            -Destination $partial `
+            -Name $Archive.name `
+            -ExpectedSizeBytes ([Int64]$Archive.size_bytes)
     }
     Assert-WithinCache -Value $partial -Label "written archive partial"
     Assert-FileIdentity -Path $partial -SizeBytes ([Int64]$Archive.size_bytes) -Sha256 $Archive.sha256 -Label "partial/$($Archive.name)"
@@ -387,10 +423,12 @@ function Get-VerifiedExtraction {
     New-SafeCacheDirectory -Path $temporary
     try {
         Assert-WithinCache -Value $temporary -Label "pre-extraction directory"
+        Write-Host "SHERPA_ARCHIVE_EXTRACTION_START name=$($Archive.name)"
         & tar -xjf $ArchivePath -C $temporary
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to extract locked archive: $ArchivePath"
         }
+        Write-Host "SHERPA_ARCHIVE_EXTRACTION_COMPLETE name=$($Archive.name)"
         Assert-WithinCache -Value $temporary -Label "post-extraction directory"
         $candidate = Join-Path $temporary $Archive.extracted_directory
         Assert-ExtractedInventory -Root $candidate -Inventory $Archive.inventory -Label $Label
