@@ -12,6 +12,7 @@
     "phase0:fixtures:validate": "node tools/phase0-harness/validate-fixtures.mjs",
     "phase0:candidate-artifacts:test": "node --test tools/phase0-harness/candidate-artifact-contract.test.mjs",
     "phase0:candidate-artifacts:validate": "node tools/phase0-harness/validate-candidate-artifact-contract.mjs",
+    "phase0:hw-ref:test": "node --test tools/phase0-harness/hw-ref-collector.test.mjs",
     "phase0:sherpa-assets:test": "node --test tools/sherpa-native/validate-lock.test.mjs",
     "phase0:sherpa-assets:validate": "node tools/sherpa-native/validate-lock.mjs",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",

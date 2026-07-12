@@ -280,7 +280,7 @@ async function convertToCandidateRunBundle(root, role) {
     hardware.environment.cpu.model = "Fixture CPU";
     hardware.environment.cpu.vendor = "FixtureVendor";
     hardware.environment.gpus[0].driver_version = "1.0.0";
-    hardware.environment.gpus[0].execution_providers = ["cpu"];
+    hardware.environment.gpus[0].execution_providers = [];
     hardware.environment.gpus[0].model = "Fixture GPU";
     hardware.environment.gpus[0].vendor = "FixtureVendor";
     hardware.environment.gpus[0].vram_bytes = "8589934592";
@@ -288,12 +288,12 @@ async function convertToCandidateRunBundle(root, role) {
     hardware.environment.operating_system.build = "26100";
     hardware.environment.operating_system.ubr = "1";
     hardware.environment.operating_system.version = "11";
-    hardware.environment.power.plan = "balanced";
+    hardware.environment.power.plan = `balanced@${"a".repeat(64)}`;
     hardware.environment.power.source = "ac";
     hardware.environment.storage[0].capacity_bytes = "1000000000000";
     hardware.environment.storage[0].driver_version = "1.0.0";
     hardware.environment.storage[0].filesystem = "NTFS";
-    hardware.environment.storage[0].medium = "SSD";
+    hardware.environment.storage[0].medium = "ssd";
     hardware.environment.storage[0].model = "Fixture Storage";
     hardware.environment.storage[0].vendor = "FixtureVendor";
   });
@@ -315,7 +315,7 @@ async function convertToCandidateRunBundle(root, role) {
       descriptorAfterRefresh.model_sha256;
     runPlan.same_condition_contract.parameter_sha256 =
       descriptorAfterRefresh.parameter_sha256;
-    runPlan.same_condition_contract.power_plan = "balanced";
+    runPlan.same_condition_contract.power_plan = `balanced@${"a".repeat(64)}`;
     runPlan.same_condition_contract.vad_parameters.sha256 =
       vadEndpointDigest;
     runPlan.same_condition_contract.warmup_plan.sha256 = warmupPlanDigest;
@@ -1160,6 +1160,10 @@ test("HW-REF rejects stable identifiers, email-like values, and local absolute p
       hardware.environment.bios.serial_number = "SERIAL-123";
     },
     (hardware) => {
+      hardware.environment.storage[0].pnp_device_id =
+        "forbidden-even-before-value-validation";
+    },
+    (hardware) => {
       hardware.environment.storage[0].model = "owner@example.test";
     },
     (hardware) => {
@@ -1167,6 +1171,20 @@ test("HW-REF rejects stable identifiers, email-like values, and local absolute p
     },
     (hardware) => {
       hardware.environment.bios.version = "550e8400-e29b-41d4-a716-446655440000";
+    },
+    (hardware) => {
+      hardware.environment.audio_devices[0].model =
+        "HDAUDIO\\FUNC_01&VEN_10EC&DEV_0295";
+    },
+    (hardware) => {
+      hardware.environment.gpus[0].model = "PCI\\VEN_10DE&DEV_2D58";
+    },
+    (hardware) => {
+      hardware.environment.storage[0].model = "USBSTOR\\DISK&VEN_FIXTURE";
+    },
+    (hardware) => {
+      hardware.environment.audio_devices[0].model =
+        "BTHENUM\\DEV_001122334455";
     },
   ];
   for (const mutate of mutations) {
@@ -1178,6 +1196,21 @@ test("HW-REF rejects stable identifiers, email-like values, and local absolute p
       );
     });
   }
+});
+
+test("sealed candidate validation still requires the HW collector artifact join", async () => {
+  await withBundle(async (root) => {
+    const contract = await readJson(root, "contract-manifest.json");
+    const alternate = contract.entries.find(
+      (entry) => entry.path === "assets/package.lock",
+    );
+    assert.ok(alternate);
+    await mutateContractJson(root, "manifests/hw-ref.json", (hardware) => {
+      hardware.collector.sha256 = alternate.sha256;
+    });
+    await resealContractEntry(root, "manifests/hw-ref.json");
+    await expectCode(validateCandidateArtifactBundle(root), "ART_JOIN_MISMATCH");
+  });
 });
 
 test("run-plan sequence, seed, cold/warm bounds, and duplicate IDs fail closed", async () => {

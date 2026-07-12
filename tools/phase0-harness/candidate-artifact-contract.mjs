@@ -17,6 +17,10 @@ import {
   sha256,
   validateFixtureTree,
 } from "./fixture-contract.mjs";
+import {
+  HW_REF_COLLECTOR_VERSION,
+  WINDOWS_COLLECTOR_ASSET_PATH,
+} from "./hw-ref-collector.mjs";
 
 export const CONTRACT_TEST_ID = "CT-WORKER-ARTIFACT-001";
 export const CANDIDATE_ID = "candidate-contract-fixture-001";
@@ -1475,7 +1479,7 @@ function assertPrivacySafe(value, label = "hw-ref") {
   if (value !== null && typeof value === "object") {
     for (const [key, entry] of Object.entries(value)) {
       if (
-        /^(?:host_?name|user_?name|machine_?guid|serial(?:_number)?|mac(?:_address)?|device_?instance(?:_id)?|endpoint_?id|email|local_?path)$/i.test(
+        /^(?:host_?name|computer_?name|user_?name|machine_?guid|serial(?:_?number)?|uuid|mac(?:_?address)?|device_?instance(?:_?id)?|pnp_?device_?id|hardware_?id|endpoint_?id|email|local_?path|sid)$/i.test(
           key,
         )
       ) {
@@ -1490,17 +1494,18 @@ function assertPrivacySafe(value, label = "hw-ref") {
     (/[A-Za-z]:[\\/]/.test(value) ||
       /^(?:\\\\|\/\/)/.test(value) ||
       /[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(value) ||
-      /(?:\b[0-9a-f]{2}:){5}[0-9a-f]{2}\b/i.test(value) ||
-      /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i.test(
+      /\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b/i.test(value) ||
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i.test(
         value,
       ) ||
+      /\b(?:PCI|HDAUDIO|USB(?:STOR|PRINT)?|BTHENUM|BTH|HID|DISPLAY|SCSI|STORAGE|SWD|ROOT|ACPI)\\[A-Z0-9_&.\\-]+/i.test(value) ||
       /\bS-\d(?:-\d+){2,}\b/i.test(value))
   ) {
     fail("ART_PRIVACY_UNSAFE_IDENTIFIER", label + " contains a stable or local identifier", label);
   }
 }
 
-function validateHardwareReference(hardware, contractEntries) {
+function validateHardwareReferenceSemantics(hardware) {
   assertPrivacySafe(hardware);
   assertExactKeys(
     hardware,
@@ -1553,12 +1558,6 @@ function validateHardwareReference(hardware, contractEntries) {
   validateArtifactPath(hardware.collector.path, "hw-ref.collector.path");
   assertDigest(hardware.collector.sha256, "hw-ref.collector.sha256");
   assertIdentifier(hardware.collector.version, "hw-ref.collector.version");
-  if (
-    contractEntries.get(hardware.collector.path)?.sha256 !==
-    hardware.collector.sha256
-  ) {
-    fail("ART_JOIN_MISMATCH", "HW-REF collector does not join a sealed input");
-  }
   assertExactKeys(
     hardware.environment,
     [
@@ -1637,7 +1636,8 @@ function validateHardwareReference(hardware, contractEntries) {
       gpu.execution_providers.some(
         (value) =>
           !["cpu", "cuda", "directml", "openvino"].includes(value),
-      )
+      ) ||
+      (isMeasured && gpu.execution_providers.includes("cpu"))
     ) {
       fail("ART_SCHEMA_VALUE", "HW-REF GPU execution provider list differs");
     }
@@ -1770,13 +1770,75 @@ function validateHardwareReference(hardware, contractEntries) {
       }
     }
     if (
+      !["x64", "arm64", "x86"].includes(
+        hardware.environment.operating_system.architecture,
+      ) ||
+      !["ac", "battery"].includes(hardware.environment.power.source) ||
+      !/^(?:balanced|high-performance|ultimate-performance|power-saver)@[0-9a-f]{64}$/.test(
+        hardware.environment.power.plan,
+      ) ||
+      hardware.environment.audio_devices.some(
+        (device) => !["signed", "unsigned"].includes(device.signature_status),
+      ) ||
+      hardware.environment.storage.some(
+        (storage) => !["ssd", "hdd", "emmc", "other"].includes(storage.medium),
+      )
+    ) {
+      fail("ART_SCHEMA_VALUE", "measured HW-REF canonical environment value differs");
+    }
+    if (
       !/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(
         hardware.environment.cooling.ambient_celsius,
-      )
+      ) ||
+      /^-0(?:\.0+)?$/.test(hardware.environment.cooling.ambient_celsius)
     ) {
       fail("ART_SCHEMA_VALUE", "captured ambient_celsius must be a canonical decimal string");
     }
   }
+}
+
+function validateHardwareReference(hardware, contractEntries) {
+  validateHardwareReferenceSemantics(hardware);
+  if (
+    contractEntries.get(hardware.collector.path)?.sha256 !==
+    hardware.collector.sha256
+  ) {
+    fail("ART_JOIN_MISMATCH", "HW-REF collector does not join a sealed input");
+  }
+}
+
+export function validateCollectorOnlyMeasuredHardwareReference(hardware) {
+  validateHardwareReferenceSemantics(hardware);
+  if (
+    hardware.capture_scope !== "measured" ||
+    hardware.measurement_status !== "captured"
+  ) {
+    fail(
+      "ART_SCHEMA_VALUE",
+      "collector-only HW-REF validation requires measured/captured facts",
+      "hw-ref.measurement_status",
+    );
+  }
+  const environment = hardware.environment;
+  if (
+    hardware.collector.path !== WINDOWS_COLLECTOR_ASSET_PATH ||
+    hardware.collector.version !== HW_REF_COLLECTOR_VERSION ||
+    environment.audio_devices.length !== 1 ||
+    environment.gpus.length !== 1 ||
+    environment.storage.length !== 1 ||
+    environment.gpus[0].execution_providers.length !== 0
+  ) {
+    fail(
+      "ART_SCHEMA_VALUE",
+      "collector-only HW-REF provenance, device cardinality, or execution providers differ",
+      "hw-ref.collector",
+    );
+  }
+  return {
+    hwRefId: hardware.hw_ref_id,
+    sealed: false,
+    validationPhase: "collector-only",
+  };
 }
 
 function validateParameterAsset(parameters, expectedScope) {

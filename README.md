@@ -1,11 +1,12 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3b sherpa native functional integration**. WP-0.3.1 through WP-0.3.7 completed the deterministic Phase 0 harness gates; WP-0.4.1 added the transport-neutral model-worker semantic contract; WP-0.4.2 added candidate artifact integrity and claim authority; and WP-0.4.3a established the non-cloneable, exactly-once backend action/outcome seam. WP-0.4.3b pins the official sherpa-onnx 1.13.4 shared Windows runtime and SenseVoice 2024 INT8 assets, adds an offline-by-default materializer, independently verifies canonical PCM SHA-256 at the adapter boundary, and runs a real functional inference smoke. This narrow smoke does not establish accuracy, quality, latency, throughput, candidate eligibility, distribution approval, or production readiness.
+MeetingRelay is currently in **WP-0.4.3f1 privacy-safe measured HW-REF collector foundation**. WP-0.4.3a through WP-0.4.3e are Done/Passed; f1 remains In Progress until its commit, remote CI, and independent closeout complete. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open. The completed narrow slices establish adapter, functional-smoke, deterministic input, input-only validation, and Release host-provenance foundations; they do not establish accuracy, quality, controlled performance, candidate eligibility, distribution approval, hardware recommendation, or production readiness.
 
 ## Prerequisites
 
 - Windows x64
 - Rust 1.95 with the Windows MSVC target
+- Node.js 24
 - pnpm 9.15.9
 - Microsoft C++ Build Tools with a compatible Windows SDK
 - Microsoft Edge WebView2 Runtime
@@ -23,6 +24,7 @@ pnpm phase0:fixtures:test
 pnpm phase0:fixtures:validate
 pnpm phase0:candidate-artifacts:test
 pnpm phase0:candidate-artifacts:validate
+pnpm phase0:hw-ref:test
 pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:ledgers:test
@@ -50,6 +52,7 @@ pnpm phase0:fixtures:test
 pnpm phase0:fixtures:validate
 pnpm phase0:candidate-artifacts:test
 pnpm phase0:candidate-artifacts:validate
+pnpm phase0:hw-ref:test
 pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:ledgers:test
@@ -87,6 +90,32 @@ node tools/phase0-harness/validate-candidate-artifact-contract.mjs --existing <b
 ```
 
 The contract digest and every accepted license-text digest must come from an out-of-band approved run plan, legal record, or evidence ledger, not from the bundle being checked. Completed raw evidence still cannot declare a candidate eligible, selected, ranked, default, production-ready, or compliant with a formal `PERF-*`/SLO.
+
+### Collector-only measured HW-REF
+
+WP-0.4.3f1 adds a Windows-native, privacy-whitelisted collector foundation. Before running it, independently measure or verify every operator fact; do not substitute guesses or values copied from a plumbing smoke. The output parent must already exist below this repository's ignored `target/` tree:
+
+```powershell
+New-Item -ItemType Directory -Force target/wp-0.4/hw-ref | Out-Null
+node tools/phase0-harness/hw-ref-collector.mjs `
+  --ambient-celsius "<operator-measured canonical decimal>" `
+  --audio-device-model "<exact unique benchmark MEDIA device model>" `
+  --audio-logical-role "<operator-verified benchmark role>" `
+  --cooling-mode "<operator-observed cooling mode>" `
+  --gpu-device-model "<exact unique reference GPU model>" `
+  --gpu-vram-bytes "<operator-verified canonical uint64 bytes>" `
+  --hw-ref-id "hw-ref-<run-id>" `
+  --output "target/wp-0.4/hw-ref/hw-ref.json" `
+  --power-source "ac" `
+  --storage-medium "ssd" `
+  --storage-volume "E"
+```
+
+`--storage-volume` is one drive letter without a colon, `--storage-medium` is an operator-verified `ssd|hdd|emmc|other` class, and `--power-source` is exactly `ac` or `battery`. Ambient temperature, cooling mode, audio device/role, reference GPU VRAM, power source, and storage medium are operator-attested capture inputs; do not run the persisted collector until each value has been independently observed or verified. GPU execution-provider capability is deliberately emitted as an empty list and is bound later by the run plan, not inferred by this hardware collector. The selected GPU's VRAM is explicit because `Win32_VideoController.AdapterRAM` is only 32 bits and cannot represent modern dedicated VRAM exactly. Audio and GPU model selections must each match exactly one enumerated device, and the selected storage volume must associate with exactly one physical disk whose linked driver record reports `IsSigned=true`; internal device identifiers are never emitted. The collector assumes a trusted local operator, genuine Windows installation, and genuine `SystemRoot`; it is not an execution proof against a malicious parent process or local administrator.
+
+Only the canonical built-in base aliases `balanced`, `high-performance`, `ultimate-performance`, and `power-saver` are accepted; custom base schemes fail closed. `power.plan` is stored as `<base-alias>@<sha256>`. The digest uses length-framed canonical LF/NFC text from both an explicit base-scheme `powercfg /Q <guid>` query and the effective no-argument `powercfg /Q` query, so overlays and modified built-in settings change the identity without exposing a GUID or friendly name. Active GUID plus both query surfaces are read before/after and any drift aborts capture. The f1 document itself remains unsealed/unjoined; a later slice must bind this exact value into the same-condition run contract.
+
+The runnable collector is one self-contained source file: its streaming SHA-256 covers argument policy, canonical encoding, privacy/semantic validation, embedded PowerShell collection, and the CLI itself. The CLI emits canonical NFC JSON, refuses output outside `target/`, reserves the output with an exclusive `wx` handle before collection, rejects reparse-point ancestors, and never overwrites an existing file. Its stdout summary is `validationPhase=collector-only` and `sealed=false`; those fields are deliberately not inserted into the exact HW-REF schema. The HW-REF document is measured/captured with claims fixed to none, but it remains unsealed and unjoined. This command does not build a candidate-input bundle, execute a candidate or model, create run evidence, or support quality, performance, eligibility, ranking, default, publishability, hardware-recommendation, PERF, SLO, or product claims. A plumbing smoke that uses synthetic operator annotations must not persist a HW-REF document and is not measured evidence.
 
 The provider harness performs two clean, byte-identical virtual-clock runs under ignored `target/wp-0.3/provider-harness/`. Version 1.0 intentionally accepts only the committed empty fault plan; any non-empty or unknown fault step fails before the first emission. Logical offsets are ordering inputs, not latency observations or performance evidence.
 

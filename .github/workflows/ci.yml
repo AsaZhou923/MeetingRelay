@@ -80,6 +80,10 @@ jobs:
           pnpm phase0:candidate-artifacts:validate
         timeout-minutes: 5
 
+      - name: Test WP-0.4 measured HW-REF collector foundation
+        run: pnpm phase0:hw-ref:test
+        timeout-minutes: 5
+
       - name: Test and validate sherpa offline asset lock
         shell: pwsh
         run: |
