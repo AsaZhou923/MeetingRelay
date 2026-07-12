@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f1 are Done/Passed; f1 source/local/remote `0fd1179b170293e67919d9a7ef7c25df4375baa2`, CI run `29185489301`, and its independent verifier all passed. WP-0.4.3f2a is now aligning the candidate license/source and Release provenance contracts. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open. The completed narrow slices establish adapter, functional-smoke, deterministic input, input-only validation, Release host-provenance, and privacy-safe measured HW-REF collector foundations; they do not establish accuracy, quality, controlled performance, candidate eligibility, distribution approval, hardware recommendation, or production readiness.
+MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f1 are Done/Passed; f1 source/local/remote `0fd1179b170293e67919d9a7ef7c25df4375baa2`, CI run `29185489301`, and its independent verifier all passed. WP-0.4.3f2b is In Progress as a pure in-memory candidate-input planner: it computes source/artifact/license mappings and canonical document bytes only, with no filesystem write, bundle or seal, hardware/fixture/run-plan input, model execution/evidence, quality/performance result, ranking, or selection authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open. The completed narrow slices establish adapter, functional-smoke, deterministic input, input-only validation, Release host-provenance, and privacy-safe measured HW-REF collector foundations; they do not establish accuracy, quality, controlled performance, candidate eligibility, distribution approval, hardware recommendation, or production readiness.
 
 ## Prerequisites
 
@@ -27,6 +27,7 @@ pnpm phase0:candidate-artifacts:validate
 pnpm phase0:hw-ref:test
 pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
+pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -55,6 +56,7 @@ pnpm phase0:candidate-artifacts:validate
 pnpm phase0:hw-ref:test
 pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
+pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test

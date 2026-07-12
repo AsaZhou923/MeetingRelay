@@ -92,6 +92,10 @@ jobs:
           pnpm phase0:sherpa-provenance:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 sherpa candidate-input pure planner
+        run: pnpm phase0:sherpa-candidate-plan:test
+        timeout-minutes: 5
+
       - name: Test and validate Phase 0 replay ledgers
         run: |
           pnpm phase0:ledgers:test

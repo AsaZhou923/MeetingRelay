@@ -1409,6 +1409,48 @@ function validateCandidateManifest(candidate, contractEntries) {
   }
 }
 
+/**
+ * Validates an in-memory candidate-input manifest against planned material
+ * metadata without reading a bundle or creating a trust anchor. This is the
+ * narrow bridge used by pure planners; sealing and input-only bundle
+ * validation remain separate operations.
+ */
+export function validatePlannedCandidateManifest(candidate, plannedEntries) {
+  if (!(plannedEntries instanceof Map)) {
+    fail(
+      "ART_SCHEMA_TYPE",
+      "plannedEntries must be a Map of target paths to digest and size metadata",
+      "plannedEntries",
+    );
+  }
+  const contractEntries = new Map();
+  for (const [relativePath, entry] of plannedEntries) {
+    validateArtifactPath(relativePath, "plannedEntries path");
+    assertExactKeys(entry, ["sha256", "size_bytes"], `plannedEntries[${relativePath}]`);
+    assertDigest(entry.sha256, `plannedEntries[${relativePath}].sha256`);
+    assertCanonicalU64(
+      entry.size_bytes,
+      `plannedEntries[${relativePath}].size_bytes`,
+      1n,
+    );
+    contractEntries.set(relativePath, {
+      path: relativePath,
+      sha256: entry.sha256,
+      size_bytes: entry.size_bytes,
+    });
+  }
+  validateCandidateManifest(candidate, contractEntries);
+  return {
+    artifact_count: candidate.artifacts.length,
+    candidate_id: candidate.candidate_id,
+    formal_claims: candidate.claims.formal_claims,
+    publishability_status: candidate.publishability_status,
+    sealed: false,
+    selection_status: candidate.selection_status,
+    validation_phase: "candidate-input-plan",
+  };
+}
+
 async function validateLicenseTexts(root, candidate) {
   for (const license of candidate.licenses) {
     const target = await assertRealPathComponents(root, license.text_path);

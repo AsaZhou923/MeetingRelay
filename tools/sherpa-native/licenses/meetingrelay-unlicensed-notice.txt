@@ -1,0 +1,10 @@
+MeetingRelay Project Status Notice
+
+This file is a status notice only. It is not a license.
+
+MeetingRelay-authored portions of this repository are UNLICENSED.
+This status notice does not replace, amend, limit, or extend any third-party license terms.
+No rights or permission are granted to copy, modify, redistribute, or publish MeetingRelay-authored portions.
+Internal Phase 0 evaluation records the review scope only; it is not authorization.
+When attached to a compiled worker, this project notice is only a conservative non-publishable blocker. It is not a complete dependency license list or SBOM.
+Release SBOM, distribution approval, Legal review, and Product review remain pending.
