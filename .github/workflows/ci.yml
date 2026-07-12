@@ -316,5 +316,5 @@ jobs:
         timeout-minutes: 10
 
       - name: Build release desktop shell
-        run: pnpm --dir apps/desktop tauri build --no-bundle -- -- --offline --locked
+        run: pnpm --dir apps/desktop run tauri:build:ci
         timeout-minutes: 20
