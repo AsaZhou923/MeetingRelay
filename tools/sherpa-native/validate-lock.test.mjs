@@ -70,13 +70,15 @@ test("Cargo cannot fall through to the upstream implicit downloader", () => {
 test("explicit archive acquisition uses the HTTPS-only curl path", async () => {
   const materializer = await readFile(MATERIALIZER_PATH, "utf8");
   assert.doesNotMatch(materializer, /\bInvoke-WebRequest\b/);
+  assert.doesNotMatch(materializer, /Get-Command\s+curl\.exe/);
   assert.match(
     materializer,
-    /& \$curl\.Source `\r?\n\s+--disable `\r?\n\s+--proto '=https'/,
+    /& \$curlPath `\r?\n\s+--disable `\r?\n\s+--proto '=https'/,
     "--disable must be the first curl argument so curlrc files cannot weaken the transfer policy",
   );
   for (const required of [
-    "Get-Command curl.exe",
+    'Join-Path $env:SystemRoot "System32\\curl.exe"',
+    'Assert-RegularFile -Path $curlPath -Label "Windows system curl.exe"',
     "--disable",
     "--proto '=https'",
     "--proto-redir '=https'",

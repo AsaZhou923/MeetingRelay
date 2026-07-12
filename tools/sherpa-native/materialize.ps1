@@ -217,12 +217,13 @@ function Invoke-LockedHttpsDownload {
     if (-not $Url.StartsWith("https://github.com/", [StringComparison]::Ordinal)) {
         throw "Locked download URL is not an allowed GitHub HTTPS URL: $Url"
     }
-    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
-    if (-not $curl) {
-        throw "curl.exe is required for explicit archive acquisition"
+    if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        throw "SystemRoot is required to locate the trusted Windows curl.exe"
     }
+    $curlPath = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot "System32\curl.exe"))
+    Assert-RegularFile -Path $curlPath -Label "Windows system curl.exe"
     Write-Host "SHERPA_ARCHIVE_DOWNLOAD_START name=$Name expected_bytes=$ExpectedSizeBytes"
-    & $curl.Source `
+    & $curlPath `
         --disable `
         --proto '=https' `
         --proto-redir '=https' `
