@@ -114,15 +114,29 @@ jobs:
       - name: Materialize pinned sherpa runtime and model assets
         shell: pwsh
         run: |
-          $gitRoots = @(
-            Get-Command git.exe -CommandType Application -All -ErrorAction Stop |
-              ForEach-Object {
-                [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $_.Source)))
-              } |
-              Sort-Object -Unique
-          )
+          $gitCommands = @(Get-Command git.exe -CommandType Application -All -ErrorAction Stop)
+          $resolvedGitRoots = foreach ($gitCommand in $gitCommands) {
+            $directory = [IO.DirectoryInfo](Split-Path -Parent ([IO.Path]::GetFullPath($gitCommand.Source)))
+            $resolvedGitRoot = $null
+            while ($null -ne $directory) {
+              $tarCandidate = Join-Path $directory.FullName 'usr\bin\tar.exe'
+              $bzip2Candidate = Join-Path $directory.FullName 'usr\bin\bzip2.exe'
+              if ((Test-Path -LiteralPath $tarCandidate -PathType Leaf) -and
+                  (Test-Path -LiteralPath $bzip2Candidate -PathType Leaf)) {
+                $resolvedGitRoot = [IO.Path]::GetFullPath($directory.FullName)
+                break
+              }
+              $directory = $directory.Parent
+            }
+            if ($null -eq $resolvedGitRoot) {
+              throw "PATH-visible git.exe is not inside a complete Git for Windows installation: $($gitCommand.Source)"
+            }
+            $resolvedGitRoot
+          }
+          $gitRoots = @($resolvedGitRoots | Sort-Object -Unique)
           if ($gitRoots.Count -ne 1) { throw "expected exactly one Git for Windows installation root" }
           $gitRoot = $gitRoots[0]
+          Write-Host "MEETINGRELAY_GIT_ROOT=$gitRoot visible_git_executables=$($gitCommands.Count)"
           $archiveTar = Join-Path $gitRoot 'usr\bin\tar.exe'
           $archiveBzip2 = Join-Path $gitRoot 'usr\bin\bzip2.exe'
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_ARCHIVE_TAR=$archiveTar" -Encoding utf8

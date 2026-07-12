@@ -2,7 +2,7 @@
 
 This directory is the executable asset boundary for `WP-0.4.3b`. It pins the official sherpa-onnx Rust/native runtime and the SenseVoice INT8 evaluation model without committing binaries or model weights.
 
-The default materializer path is offline. Network access is possible only with the explicit `-AllowDownload` switch. That explicit path requires and verifies Windows' `System32\curl.exe` instead of resolving a PATH candidate, disables curlrc loading before every other option, restricts redirects and transfers to HTTPS, retries transient connection failures, and still checks every archive for its exact byte length and SHA-256 before extraction. Archive operations default to verified `System32\tar.exe`; callers may instead provide `-ArchiveTarPath` and `-ArchiveBzip2Path` together. An override is accepted only when both are regular non-reparse sibling Git-for-Windows tools and identify as GNU tar and bzip2, so the materializer never resolves an archive tool from PATH. CI canonicalizes all PATH-visible `git.exe` entries to one Git installation root, then derives this explicit pair because the hosted System32 tar can hang on bzip2 listing. Every archive subprocess temporarily removes `TAR_OPTIONS`, `BZIP2`, and `BZIP` and restores their exact process values afterward, preventing ambient option injection. Each archive is rechecked for exact size and SHA-256 before listing and again immediately before extraction. Separate path and verbose-type listings must agree; every entry must be a regular file or directory, while links, special entries, unsafe paths, duplicates, and files outside the sealed inventory fail closed. Existing symlinks, junctions, or other reparse points anywhere in a cache, source, temporary, extraction, or destination path chain are rejected before mutation and checked again afterward. The extracted file and directory set is then checked against the complete inventory; extra, missing, or modified entries fail closed.
+The default materializer path is offline. Network access is possible only with the explicit `-AllowDownload` switch. That explicit path requires and verifies Windows' `System32\curl.exe` instead of resolving a PATH candidate, disables curlrc loading before every other option, restricts redirects and transfers to HTTPS, retries transient connection failures, and still checks every archive for its exact byte length and SHA-256 before extraction. Archive operations default to verified `System32\tar.exe`; callers may instead provide `-ArchiveTarPath` and `-ArchiveBzip2Path` together. An override is accepted only when both are regular non-reparse sibling Git-for-Windows tools and identify as GNU tar and bzip2, so the materializer never resolves an archive tool from PATH. CI walks upward from every PATH-visible `git.exe` until it finds the complete `usr\bin\tar.exe`/`bzip2.exe` installation, requires all candidates to resolve to one canonical Git root, and then derives the explicit pair because the hosted System32 tar can hang on bzip2 listing. Every archive subprocess temporarily removes `TAR_OPTIONS`, `BZIP2`, and `BZIP` and restores their exact process values afterward, preventing ambient option injection. Each archive is rechecked for exact size and SHA-256 before listing and again immediately before extraction. Separate path and verbose-type listings must agree; every entry must be a regular file or directory, while links, special entries, unsafe paths, duplicates, and files outside the sealed inventory fail closed. Existing symlinks, junctions, or other reparse points anywhere in a cache, source, temporary, extraction, or destination path chain are rejected before mutation and checked again afterward. The extracted file and directory set is then checked against the complete inventory; extra, missing, or modified entries fail closed.
 
 ```powershell
 pnpm phase0:sherpa-assets:test
@@ -14,11 +14,22 @@ pnpm phase0:sherpa-assets:validate
   -ArchiveSourceRoot target/wp-0.4.3b/upstream
 
 # Explicit acquisition path used by a clean CI runner.
-$gitRoots = @(
-  Get-Command git.exe -CommandType Application -All -ErrorAction Stop |
-    ForEach-Object { [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $_.Source))) } |
-    Sort-Object -Unique
-)
+$gitCommands = @(Get-Command git.exe -CommandType Application -All -ErrorAction Stop)
+$resolvedGitRoots = foreach ($gitCommand in $gitCommands) {
+  $directory = [IO.DirectoryInfo](Split-Path -Parent ([IO.Path]::GetFullPath($gitCommand.Source)))
+  $resolvedGitRoot = $null
+  while ($null -ne $directory) {
+    if ((Test-Path -LiteralPath (Join-Path $directory.FullName 'usr\bin\tar.exe') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $directory.FullName 'usr\bin\bzip2.exe') -PathType Leaf)) {
+      $resolvedGitRoot = [IO.Path]::GetFullPath($directory.FullName)
+      break
+    }
+    $directory = $directory.Parent
+  }
+  if ($null -eq $resolvedGitRoot) { throw "git.exe is not inside a complete Git for Windows installation" }
+  $resolvedGitRoot
+}
+$gitRoots = @($resolvedGitRoots | Sort-Object -Unique)
 if ($gitRoots.Count -ne 1) { throw "expected exactly one Git for Windows installation root" }
 $gitRoot = $gitRoots[0]
 ./tools/sherpa-native/materialize.ps1 `
