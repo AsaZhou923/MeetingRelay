@@ -19,5 +19,12 @@ sherpa-onnx = { version = "=1.13.4", default-features = false, features = ["shar
 [build-dependencies]
 sha2 = "=0.10.9"
 
+[[bin]]
+name = "meetingrelay-sherpa-candidate-host"
+path = "src/bin/meetingrelay_sherpa_candidate_host.rs"
+required-features = ["native-sherpa"]
+test = false
+bench = false
+
 [lints]
 workspace = true

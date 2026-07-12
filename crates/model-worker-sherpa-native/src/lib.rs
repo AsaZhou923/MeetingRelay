@@ -24,11 +24,17 @@ use meetingrelay_model_worker_contract::{
 use sha2::{Digest, Sha256};
 
 mod candidate_builder_input;
+mod worker_provenance;
 
 pub use candidate_builder_input::{
     LOCKED_CANDIDATE_BUILDER_INPUT_SHA256_HEX, LOCKED_CANDIDATE_ID,
     LOCKED_MODEL_LICENSE_TEXT_SHA256_HEX, locked_candidate_builder_input_json_bytes,
     locked_engine_descriptor,
+};
+pub use worker_provenance::{
+    LOCKED_SCHEMA_REGISTRY_BYTES, LOCKED_WORKER_ID, MAX_SCHEMA_REGISTRY_BYTES,
+    WorkerProvenanceError, locked_schema_registry_sha256, locked_worker_manifest,
+    locked_worker_manifest_projection_json_bytes,
 };
 
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 16_000;

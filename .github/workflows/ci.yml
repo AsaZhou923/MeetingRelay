@@ -85,6 +85,7 @@ jobs:
         run: |
           pnpm phase0:sherpa-assets:test
           pnpm phase0:sherpa-assets:validate
+          pnpm phase0:sherpa-provenance:test
         timeout-minutes: 5
 
       - name: Test and validate Phase 0 replay ledgers
@@ -305,6 +306,127 @@ jobs:
             -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
             -TestExecutable $env:MEETINGRELAY_SHERPA_RELEASE_SMOKE_EXE `
             -Configuration Release
+        timeout-minutes: 10
+
+      - name: Build exact Release candidate-host executable
+        shell: pwsh
+        run: |
+          $metadata = & cargo metadata --format-version 1 --no-deps --offline --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed for candidate-host selection" }
+          $packageIds = @($metadata.packages |
+            Where-Object { $_.name -eq 'meetingrelay-model-worker-sherpa-native' } |
+            ForEach-Object { [string]$_.id } |
+            Sort-Object -Unique)
+          if ($packageIds.Count -ne 1) {
+            throw "Expected exactly one sherpa-native package ID, got $($packageIds.Count)"
+          }
+          $packageId = $packageIds[0]
+          $targetRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target'))
+          $rustcVersion = @(& rustc -vV)
+          if ($LASTEXITCODE -ne 0) { throw "rustc -vV failed for candidate-host target validation" }
+          $hostLines = @($rustcVersion | Where-Object { [string]$_ -like 'host: *' })
+          if ($hostLines.Count -ne 1 -or [string]$hostLines[0] -cne 'host: x86_64-pc-windows-msvc') {
+            throw "candidate host requires the x86_64-pc-windows-msvc Rust host triple"
+          }
+
+          function Assert-CargoCandidateHostPath {
+            param(
+              [Parameter(Mandatory = $true)][string]$Executable
+            )
+            $resolved = [IO.Path]::GetFullPath($Executable)
+            $prefix = $targetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if (-not $resolved.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Cargo-reported candidate host is outside the repository target directory"
+            }
+            if ((Split-Path -Leaf $resolved) -cne 'meetingrelay-sherpa-candidate-host.exe' -or
+                (Split-Path -Leaf (Split-Path -Parent $resolved)) -cne 'release' -or
+                [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $resolved))) -ne $targetRoot) {
+              throw "Cargo-reported candidate host has an unexpected target or profile path"
+            }
+            $current = $resolved
+            while ($null -ne $current) {
+              $attributes = [IO.File]::GetAttributes($current)
+              if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Cargo-reported candidate host path contains a reparse point"
+              }
+              $parent = [IO.Directory]::GetParent($current)
+              $current = if ($null -eq $parent) { $null } else { $parent.FullName }
+            }
+            if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+              throw "Cargo-reported candidate host does not exist"
+            }
+            return $resolved
+          }
+
+          function Build-CandidateHostExecutable {
+            $cargoArguments = @(
+              'build', '--release',
+              '-p', 'meetingrelay-model-worker-sherpa-native',
+              '--features', 'native-sherpa',
+              '--bin', 'meetingrelay-sherpa-candidate-host',
+              '--message-format=json',
+              '--offline',
+              '--locked'
+            )
+            $messages = @(& cargo @cargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
+            if ($LASTEXITCODE -ne 0) { throw "cargo failed to build the candidate host" }
+            $executables = @($messages |
+              Where-Object {
+                $_.reason -eq 'compiler-artifact' -and
+                [string]$_.package_id -eq $packageId -and
+                $_.target.name -eq 'meetingrelay-sherpa-candidate-host' -and
+                @($_.target.kind).Count -eq 1 -and
+                [string]$_.target.kind[0] -eq 'bin' -and
+                -not [bool]$_.target.test -and
+                -not [bool]$_.profile.test -and
+                -not [bool]$_.profile.debug_assertions -and
+                [string]$_.profile.opt_level -ne '0' -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.executable)
+              } |
+              ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
+              Sort-Object -Unique)
+            if ($executables.Count -ne 1) {
+              throw "Expected exactly one Cargo-reported candidate host, got $($executables.Count)"
+            }
+            return Assert-CargoCandidateHostPath -Executable $executables[0]
+          }
+
+          $releaseExecutable = Build-CandidateHostExecutable
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_HOST_EXE=$releaseExecutable" -Encoding utf8
+        timeout-minutes: 20
+
+      - name: Audit provenance-only candidate-host PE dependencies
+        shell: pwsh
+        run: |
+          ./tools/sherpa-native/audit-pe-dependencies.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -ProvenanceBinaryPath $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_HOST_EXE
+        timeout-minutes: 5
+
+      - name: Validate actual Release candidate-host provenance
+        shell: pwsh
+        run: |
+          foreach ($name in @(
+            'MEETINGRELAY_SHERPA_LOCK',
+            'MEETINGRELAY_SHERPA_LOCK_SHA256',
+            'MEETINGRELAY_SHERPA_PARAMETER_SHA256',
+            'MEETINGRELAY_SHERPA_MODEL',
+            'MEETINGRELAY_SHERPA_MODEL_SHA256',
+            'MEETINGRELAY_SHERPA_TOKENS',
+            'MEETINGRELAY_SHERPA_TOKENS_SHA256',
+            'MEETINGRELAY_SHERPA_WAV',
+            'SHERPA_ONNX_LIB_DIR'
+          )) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+          }
+          $schemaRegistry = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-schema-registry.json'))
+          $output = @(& node ./tools/sherpa-native/validate-worker-provenance.mjs `
+            $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_HOST_EXE `
+            $schemaRegistry)
+          if ($LASTEXITCODE -ne 0) { throw "actual Release candidate-host provenance validation failed" }
+          if (@($output | Where-Object { [string]$_ -like 'candidate-host-provenance=verified *' }).Count -ne 1) {
+            throw "actual Release candidate-host provenance marker is missing or duplicated"
+          }
         timeout-minutes: 10
 
       - name: Typecheck desktop frontend

@@ -2,6 +2,7 @@
 param(
     [string]$RuntimeDir,
     [string[]]$BinaryPath,
+    [string[]]$ProvenanceBinaryPath,
     [switch]$ParserSelfTest
 )
 
@@ -233,8 +234,10 @@ if ($ParserSelfTest) {
     Write-Output "PE_DEPENDENCY_PARSER_SELF_TEST=PASS"
 }
 else {
-    if ([string]::IsNullOrWhiteSpace($RuntimeDir) -or $null -eq $BinaryPath -or $BinaryPath.Count -eq 0) {
-        throw "RuntimeDir and at least one BinaryPath are required outside ParserSelfTest mode"
+    $hasSmokeBinary = $null -ne $BinaryPath -and $BinaryPath.Count -gt 0
+    $hasProvenanceBinary = $null -ne $ProvenanceBinaryPath -and $ProvenanceBinaryPath.Count -gt 0
+    if ([string]::IsNullOrWhiteSpace($RuntimeDir) -or (-not $hasSmokeBinary -and -not $hasProvenanceBinary)) {
+        throw "RuntimeDir and at least one BinaryPath or ProvenanceBinaryPath are required outside ParserSelfTest mode"
     }
 
     & node (Join-Path $scriptRoot "validate-lock.mjs") $lockPath
@@ -325,6 +328,28 @@ foreach ($requestedBinary in $BinaryPath) {
         }
     }
     Write-Output "PE_DEPENDENCY_AUDIT=PASS binary=$binary imports=$($dependencies -join ',')"
+}
+
+foreach ($requestedBinary in $ProvenanceBinaryPath) {
+    $binary = Resolve-UnderTarget -Value $requestedBinary -Label "ProvenanceBinaryPath"
+    $attributes = Get-ExistingPathAttributes -Path $binary
+    if ($null -eq $attributes -or ($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+        throw "ProvenanceBinaryPath is not an existing regular file: $binary"
+    }
+    if ((Split-Path -Leaf $binary) -cne "meetingrelay-sherpa-candidate-host.exe" -or
+        (Split-Path -Leaf (Split-Path -Parent $binary)) -cne "release") {
+        throw "Provenance binary is not the exact Release candidate-host target: $binary"
+    }
+    $dependencies = @(Get-PeDependencies -Path $binary)
+    foreach ($dependency in $dependencies) {
+        if ($lockedDllNames.ContainsKey($dependency)) {
+            throw "Provenance-only candidate host imports a sherpa runtime DLL: $dependency ($binary)"
+        }
+        if (-not $systemAllowed.ContainsKey($dependency)) {
+            throw "Provenance-only candidate host imports a non-allowlisted DLL: $dependency ($binary)"
+        }
+    }
+    Write-Output "PE_PROVENANCE_DEPENDENCY_AUDIT=PASS binary=$binary imports=$($dependencies -join ',')"
 }
 
     Write-Output "PE_RUNTIME_AUDIT=PASS dumpbin=$dumpbin"

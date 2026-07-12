@@ -158,7 +158,7 @@ pub fn locked_candidate_builder_input_json_bytes() -> Vec<u8> {
     output.into_bytes()
 }
 
-fn push_descriptor_json(output: &mut String, descriptor: &EngineDescriptor) {
+pub(super) fn push_descriptor_json(output: &mut String, descriptor: &EngineDescriptor) {
     output.push_str("{\"engine_id\":\"");
     output.push_str(descriptor.engine_id.as_str());
     output.push_str("\",\"engine_version\":\"");
