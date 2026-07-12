@@ -23,6 +23,14 @@ use meetingrelay_model_worker_contract::{
 };
 use sha2::{Digest, Sha256};
 
+mod candidate_builder_input;
+
+pub use candidate_builder_input::{
+    LOCKED_CANDIDATE_BUILDER_INPUT_SHA256_HEX, LOCKED_CANDIDATE_ID,
+    LOCKED_MODEL_LICENSE_TEXT_SHA256_HEX, locked_candidate_builder_input_json_bytes,
+    locked_engine_descriptor,
+};
+
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 16_000;
 const REQUIRED_CHANNELS: u16 = 1;
 const MAX_BACKEND_INPUT_BYTES: u64 = 268_435_456;
@@ -34,17 +42,13 @@ const MODEL_ID: &str = "sensevoice-zh-en-ja-ko-yue-int8-2024-07-17";
 const MODEL_LICENSE_ID: &str = "LicenseRef-FunASR-Model-1.1-Internal-Evaluation";
 const QUANTIZATION: &str = "int8";
 
-#[cfg(any(feature = "native-sherpa", test))]
 pub const LOCKED_MODEL_SHA256_HEX: &str =
     "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51";
-#[cfg(any(feature = "native-sherpa", test))]
 pub const LOCKED_TOKENS_SHA256_HEX: &str =
     "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc";
 // Kept in one place because every intentional assets.lock.json edit changes it.
-#[cfg(any(feature = "native-sherpa", test))]
 pub const LOCKED_ASSET_LOCK_SHA256_HEX: &str =
     "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181";
-#[cfg(any(feature = "native-sherpa", test))]
 pub const LOCKED_PACKAGE_LOCK_SHA256_HEX: &str =
     "02efd2bae11eb162ed59526ac3ddadd73b8537ac4c98423b38cf3eed1208989d";
 pub const LOCKED_RUNTIME_BUNDLE_SHA256_HEX: &str =
@@ -279,14 +283,14 @@ impl SherpaNativeConfig {
     #[cfg(any(feature = "native-sherpa", test))]
     fn validate_locked_candidate(&self) -> Result<(), SherpaConfigError> {
         self.validate()?;
-        if self.expected_model_sha256 != locked_digest(LOCKED_MODEL_SHA256_HEX)
+        let locked_descriptor = locked_engine_descriptor();
+        if self.descriptor != locked_descriptor
+            || self.expected_model_sha256 != locked_descriptor.model_sha256
             || self.expected_tokens_sha256 != locked_digest(LOCKED_TOKENS_SHA256_HEX)
-            || self.expected_runtime_sha256 != locked_digest(LOCKED_RUNTIME_BUNDLE_SHA256_HEX)
-            || self.expected_asset_lock_sha256 != locked_digest(LOCKED_ASSET_LOCK_SHA256_HEX)
-            || self.expected_package_lock_sha256 != locked_digest(LOCKED_PACKAGE_LOCK_SHA256_HEX)
-            || self.descriptor.parameter_sha256 != locked_digest(LOCKED_PARAMETER_SHA256_HEX)
+            || self.expected_runtime_sha256 != locked_descriptor.runtime_sha256
+            || self.expected_asset_lock_sha256 != locked_descriptor.model_manifest_sha256
+            || self.expected_package_lock_sha256 != locked_descriptor.package_lock_sha256
             || self.parameter_canonical_json() != LOCKED_PARAMETER_CANONICAL_JSON
-            || self.descriptor.languages.as_slice() != [self.normalized_language.clone()]
             || !self.model_path.is_absolute()
             || !self.tokens_path.is_absolute()
         {
@@ -721,7 +725,6 @@ fn verify_locked_runtime(runtime_lib_dir: &Path) -> Result<(), AdapterFailure> {
     Ok(())
 }
 
-#[cfg(any(feature = "native-sherpa", test))]
 fn locked_digest(value: &str) -> Sha256Digest {
     Sha256Digest::from_lower_hex(value).expect("committed locked SHA-256 is constant-valid")
 }

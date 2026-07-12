@@ -16,7 +16,8 @@ use meetingrelay_model_worker_contract::{
 };
 use meetingrelay_model_worker_sherpa_native::{
     LOCKED_ASSET_LOCK_SHA256_HEX, LOCKED_MODEL_SHA256_HEX, LOCKED_RUNTIME_BUNDLE_SHA256_HEX,
-    LOCKED_TOKENS_SHA256_HEX, SherpaNativeBackend, SherpaNativeConfig, sha256_file,
+    LOCKED_TOKENS_SHA256_HEX, SherpaNativeBackend, SherpaNativeConfig, locked_engine_descriptor,
+    sha256_file,
 };
 use sha2::{Digest, Sha256};
 
@@ -261,27 +262,12 @@ fn descriptor(
     package_lock_sha256: Sha256Digest,
     runtime_sha256: Sha256Digest,
 ) -> EngineDescriptor {
-    EngineDescriptor {
-        engine_id: id("sherpa-onnx"),
-        engine_version: id("1.13.4"),
-        runtime_id: id("sherpa-onnx-shared-cpu"),
-        runtime_version: id("1.27.0"),
-        runtime_sha256,
-        package_lock_sha256,
-        model_id: id("sensevoice-zh-en-ja-ko-yue-int8-2024-07-17"),
-        model_sha256,
-        model_manifest_sha256,
-        model_license_id: id("LicenseRef-FunASR-Model-1.1-Internal-Evaluation"),
-        parameter_sha256: Sha256Digest::from_lower_hex(
-            "0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e",
-        )
-        .expect("canonical smoke parameters digest"),
-        execution_provider: ExecutionProvider::Cpu,
-        quantization: id("int8"),
-        languages: vec![language("zh")],
-        streaming: true,
-        offline: true,
-    }
+    let descriptor = locked_engine_descriptor();
+    assert_eq!(descriptor.model_sha256, model_sha256);
+    assert_eq!(descriptor.model_manifest_sha256, model_manifest_sha256);
+    assert_eq!(descriptor.package_lock_sha256, package_lock_sha256);
+    assert_eq!(descriptor.runtime_sha256, runtime_sha256);
+    descriptor
 }
 
 fn manifest(descriptor: EngineDescriptor) -> WorkerManifest {

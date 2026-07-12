@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { encodeCanonicalJsonLine } from "../phase0-harness/canonical-json.mjs";
 
 import {
   DEFAULT_LOCK_PATH,
@@ -14,7 +18,14 @@ import {
 } from "./validate-lock.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, "../..");
 const MATERIALIZER_PATH = path.join(HERE, "materialize.ps1");
+const EXPECTED_BUILDER_INPUT_SHA256 =
+  "7d9601948653e75c316461e5e2629ded8e5f4f669c909751ff3c1db91c1ca4f2";
+
+function sha256Bytes(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
 
 async function originalLock() {
   return JSON.parse(await readFile(DEFAULT_LOCK_PATH, "utf8"));
@@ -50,6 +61,156 @@ async function stagedLock() {
 test("the committed sherpa native lock and license snapshots validate", async () => {
   const result = await validateLockFile();
   assert.equal(result.lockSha256, "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181");
+});
+
+test("Rust sherpa builder input is canonical and joined to locked source material", async () => {
+  const command = process.platform === "win32" ? "cargo.exe" : "cargo";
+  const emitted = spawnSync(
+    command,
+    [
+      "run",
+      "--quiet",
+      "--locked",
+      "--offline",
+      "-p",
+      "meetingrelay-model-worker-sherpa-native",
+      "--bin",
+      "emit_sherpa_candidate_builder_input",
+      "--no-default-features",
+    ],
+    {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: { ...process.env, CARGO_TERM_COLOR: "never" },
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  assert.ifError(emitted.error);
+  assert.equal(emitted.status, 0, emitted.stderr);
+  assert.equal(emitted.stderr, "");
+
+  const parsed = JSON.parse(emitted.stdout);
+  assert.equal(emitted.stdout, encodeCanonicalJsonLine(parsed));
+  assert.equal(sha256Bytes(Buffer.from(emitted.stdout, "utf8")), EXPECTED_BUILDER_INPUT_SHA256);
+  assert.deepEqual(Object.keys(parsed), [
+    "candidate_id",
+    "claims",
+    "deferred_builder_fields",
+    "license_input",
+    "locked_assets",
+    "non_claim_guardrails",
+    "projection_kind",
+    "projection_schema_version",
+    "publishability_status",
+    "selection_status",
+    "trust_anchor_policy",
+    "worker_contract_version",
+    "worker_manifest_descriptor_fragment",
+    "worker_role",
+  ]);
+  assert.deepEqual(Object.keys(parsed.worker_manifest_descriptor_fragment), [
+    "engine_id",
+    "engine_version",
+    "execution_provider",
+    "languages",
+    "model_id",
+    "model_license_id",
+    "model_manifest_sha256",
+    "model_sha256",
+    "offline",
+    "package_lock_sha256",
+    "parameter_sha256",
+    "quantization",
+    "runtime_id",
+    "runtime_sha256",
+    "runtime_version",
+    "streaming",
+  ]);
+  assert.equal(parsed.candidate_id, "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu");
+  assert.deepEqual(parsed.claims, {
+    formal_claims: "none",
+    formal_metric_ids: [],
+    production_claims: [],
+    production_evidence: false,
+    slo_claims: [],
+  });
+  assert.deepEqual(parsed.deferred_builder_fields, [
+    "artifact-inventory-paths-roles-sizes-and-license-mapping",
+    "build-and-source-metadata",
+    "candidate-input-envelope-and-seals",
+    "contract-wrapper-assets-and-role-digest-joins",
+    "executable-worker-build-and-schema-registry-digests",
+    "external-expectedContractSha256-value",
+    "fixture-hw-run-plan-and-evidence",
+    "validator-schema-bridge-for-assets-lock-cargo-lock-and-full-parameters",
+    "worker-id",
+  ]);
+  assert.deepEqual(parsed.non_claim_guardrails, {
+    eligibility_status: "not-assessed",
+    execution_status: "not-run",
+    measurement_status: "not-measured",
+    quality_evidence: false,
+    ranking_status: "not-ranked",
+  });
+  assert.equal(parsed.publishability_status, "pending");
+  assert.equal(parsed.projection_kind, "sherpa-candidate-builder-input-v1");
+  assert.equal(parsed.projection_schema_version, "1.0");
+  assert.equal(parsed.selection_status, "not-selected");
+  assert.equal(parsed.trust_anchor_policy, "external-expectedContractSha256-required");
+  assert.equal(parsed.worker_contract_version, "meetingrelay.model-worker/1.0");
+  assert.equal(parsed.worker_role, "native-candidate");
+  assert.equal(parsed.artifact_scope, undefined);
+  assert.equal(parsed.expectedContractSha256, undefined);
+
+  const assetLockBytes = await readFile(DEFAULT_LOCK_PATH);
+  const lock = JSON.parse(assetLockBytes.toString("utf8"));
+  const cargoLockBytes = await readFile(path.join(REPO_ROOT, "Cargo.lock"));
+  const license = lock.model.current_license_snapshot;
+  const licenseBytes = await readFile(path.join(HERE, license.snapshot_path));
+  assert.equal(licenseBytes.length, license.size_bytes);
+  assert.equal(sha256Bytes(licenseBytes), license.sha256);
+  assert.deepEqual(parsed.license_input, {
+    distribution_status: license.distribution_status,
+    license_id: license.license_id,
+    review_scope: "internal-evaluation-only",
+    review_source_status: license.review_status,
+    review_status: "accepted",
+    source_revision: license.source_revision,
+    source_url: license.source_url,
+    spdx_or_license_ref: license.license_id,
+    text_path: license.snapshot_path,
+    text_sha256: license.sha256,
+    text_size_bytes: String(license.size_bytes),
+  });
+
+  const modelInventory = new Map(lock.model.archive.inventory.map((entry) => [entry.path, entry]));
+  assert.deepEqual(parsed.locked_assets, {
+    asset_lock_sha256: sha256Bytes(assetLockBytes),
+    model_license_text_sha256: license.sha256,
+    model_sha256: modelInventory.get("model.int8.onnx").sha256,
+    package_lock_sha256: sha256Bytes(cargoLockBytes),
+    parameter_sha256: lock.parameters.canonical_json_sha256,
+    runtime_bundle_sha256: lock.runtime.archive.bundle_sha256,
+    tokens_sha256: modelInventory.get("tokens.txt").sha256,
+  });
+  assert.deepEqual(parsed.worker_manifest_descriptor_fragment, {
+    engine_id: "sherpa-onnx",
+    engine_version: lock.runtime.rust_crate.version,
+    execution_provider: lock.parameters.provider,
+    languages: [lock.parameters.language],
+    model_id: lock.model.model_id,
+    model_license_id: license.license_id,
+    model_manifest_sha256: sha256Bytes(assetLockBytes),
+    model_sha256: modelInventory.get("model.int8.onnx").sha256,
+    offline: true,
+    package_lock_sha256: sha256Bytes(cargoLockBytes),
+    parameter_sha256: lock.parameters.canonical_json_sha256,
+    quantization: "int8",
+    runtime_id: "sherpa-onnx-shared-cpu",
+    runtime_sha256: lock.runtime.archive.bundle_sha256,
+    runtime_version: lock.runtime.onnxruntime_file_version,
+    streaming: true,
+  });
 });
 
 test("unknown fields fail closed", async () => {
