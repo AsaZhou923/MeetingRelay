@@ -2100,6 +2100,12 @@ function validateRunPlan(
   ) {
     fail("ART_SCHEMA_VALUE", "run-plan identity or non-execution scope differs");
   }
+  if (
+    isCandidateRun &&
+    runPlan.source_commit !== candidate.source.source_revision
+  ) {
+    fail("ART_JOIN_MISMATCH", "run-plan source commit differs from candidate source revision");
+  }
   assertIdentifier(runPlan.run_plan_id, "run-plan.run_plan_id");
   assertIdentifier(runPlan.evidence_manifest_id, "run-plan.evidence_manifest_id");
   validateClaims(runPlan.claims, "run-plan.claims");

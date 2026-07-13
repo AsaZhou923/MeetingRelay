@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f1 are Done/Passed; f1 source/local/remote `0fd1179b170293e67919d9a7ef7c25df4375baa2`, CI run `29185489301`, and its independent verifier all passed. WP-0.4.3f2b is In Progress as a pure in-memory candidate-input planner: it computes source/artifact/license mappings and canonical document bytes only, with no filesystem write, bundle or seal, hardware/fixture/run-plan input, model execution/evidence, quality/performance result, ranking, or selection authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open. The completed narrow slices establish adapter, functional-smoke, deterministic input, input-only validation, Release host-provenance, and privacy-safe measured HW-REF collector foundations; they do not establish accuracy, quality, controlled performance, candidate eligibility, distribution approval, hardware recommendation, or production readiness.
+MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f2b are Done/Passed; f2b source `97920c76e8c782d96364942e40d12c1543b8b3b1` supplies the pure 20-material candidate-input plan. WP-0.4.3f3a1 now derives a deterministic in-memory sealed bundle plan: 26 input entries plus a canonical contract manifest and ASCII seal. Its `proposedContractSha256` is only a digest proposal; it is not an independently supplied trust anchor. This slice performs no filesystem materialization, candidate/model execution, evidence collection, quality/performance measurement, ranking, selection, distribution approval, or production authorization. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
 
 ## Prerequisites
 
@@ -28,6 +28,7 @@ pnpm phase0:hw-ref:test
 pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:sherpa-candidate-plan:test
+pnpm phase0:sherpa-candidate-bundle-plan:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -57,6 +58,7 @@ pnpm phase0:hw-ref:test
 pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:sherpa-candidate-plan:test
+pnpm phase0:sherpa-candidate-bundle-plan:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test

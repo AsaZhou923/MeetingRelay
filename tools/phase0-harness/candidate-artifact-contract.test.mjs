@@ -193,7 +193,7 @@ async function convertToCandidateRunBundle(root, role) {
     candidate.build.toolchain = "rust-1.95.0";
     candidate.publishability_status = "accepted";
     candidate.schema_version = "1.1";
-    candidate.source.source_revision = "source-rev-1";
+    candidate.source.source_revision = sourceCommit;
     candidate.source.source_url = "https://example.invalid/source";
     candidate.worker_manifest_projection.role = role;
     candidate.worker_manifest_projection.descriptor.execution_provider = "cpu";
@@ -799,6 +799,19 @@ test("candidate input validates without evidence while combined validation still
     await expectCode(
       validateCandidateArtifactBundle(root, trust),
       "ART_INVENTORY_MISMATCH",
+    );
+  });
+});
+
+test("candidate-run source commit must join the sealed candidate source revision", async () => {
+  await withBundle(async (root) => {
+    await convertToRawCandidateInputBundle(root);
+    await mutateContractJson(root, "manifests/run-plan.json", (runPlan) => {
+      runPlan.source_commit = "b".repeat(40);
+    });
+    await expectCode(
+      validateCandidateArtifactInputBundle(root, await currentInputTrust(root)),
+      "ART_JOIN_MISMATCH",
     );
   });
 });
