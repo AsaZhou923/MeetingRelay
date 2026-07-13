@@ -900,8 +900,8 @@ async function validateSeal(root, manifestPath, sealPath, sealFileName) {
   assertDigest(digest, manifestPath + ".sha256");
   const sealTarget = await assertRealPathComponents(root, sealPath);
   const sealBytes = await readFile(sealTarget);
-  const expected = digest + "  " + sealFileName + "\n";
-  if (sealBytes.toString("ascii") !== expected) {
+  const expected = Buffer.from(digest + "  " + sealFileName + "\n", "ascii");
+  if (!sealBytes.equals(expected)) {
     fail("ART_DIGEST_SEAL_MISMATCH", sealPath + " does not seal " + manifestPath, sealPath);
   }
   return { digest, value: manifest.value };

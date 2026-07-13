@@ -444,6 +444,10 @@ jobs:
           }
         timeout-minutes: 10
 
+      - name: Test WP-0.4 sherpa candidate-input materializer
+        run: pnpm phase0:sherpa-candidate-materializer:test
+        timeout-minutes: 5
+
       - name: Typecheck desktop frontend
         run: pnpm desktop:typecheck
         timeout-minutes: 10

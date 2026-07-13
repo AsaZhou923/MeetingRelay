@@ -17,6 +17,7 @@
     "phase0:sherpa-assets:validate": "node tools/sherpa-native/validate-lock.mjs",
     "phase0:sherpa-candidate-plan:test": "node --test tools/sherpa-native/candidate-input-plan.test.mjs",
     "phase0:sherpa-candidate-bundle-plan:test": "node --test tools/sherpa-native/candidate-input-bundle-plan.test.mjs",
+    "phase0:sherpa-candidate-materializer:test": "node --test tools/sherpa-native/candidate-input-materializer.test.mjs",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",
     "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",

@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f2b are Done/Passed; f2b source `97920c76e8c782d96364942e40d12c1543b8b3b1` supplies the pure 20-material candidate-input plan. WP-0.4.3f3a1 now derives a deterministic in-memory sealed bundle plan: 26 input entries plus a canonical contract manifest and ASCII seal. Its `proposedContractSha256` is only a digest proposal; it is not an independently supplied trust anchor. This slice performs no filesystem materialization, candidate/model execution, evidence collection, quality/performance measurement, ranking, selection, distribution approval, or production authorization. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
+MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f3a1 are Done/Passed; f3a1 source `122b1d930188fcc773d1086a0f7c4a5c63adb7e4` supplies the deterministic 28-material/26-entry sealed bundle plan without granting trust. WP-0.4.3f3a2a is implementing the Windows local-filesystem core materializer and externally pinned input-only validation, while deterministic hostile-writer race hardening remains in f3a2b. Neither slice executes the candidate/model, captures measured hardware or evidence, claims quality/performance, ranks or selects a candidate, approves distribution, or grants production authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
 
 ## Prerequisites
 
@@ -29,6 +29,7 @@ pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:sherpa-candidate-bundle-plan:test
+pnpm phase0:sherpa-candidate-materializer:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -59,6 +60,7 @@ pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:sherpa-candidate-bundle-plan:test
+pnpm phase0:sherpa-candidate-materializer:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -90,6 +92,8 @@ The WP-0.4.2 artifact validator generates an ignored bundle under `target/wp-0.4
 Historical contract-fixture candidate manifests remain schema `1.0`. Candidate-input manifests use schema `1.1`, and every license record preserves both its review scope and upstream review-source status. Internal-evaluation review accepts only `accepted-for-internal-evaluation` or conservative `unlicensed` source states and cannot authorize accepted distribution; the generic distribution scope uses the normalized `pending|accepted|rejected` review states and retains the independent approved-license digest gate. The descriptor's `model_license_id` binds the model artifact only: the project-generated aggregate model manifest may use another resolved license record, while every artifact still requires a unique role/path/ID and a sealed digest/license join. These fields record review inputs; they do not create license text or grant redistribution rights.
 
 Release candidate-host provenance reports the executable digest and its canonical decimal `executableSizeBytes` from the already collected file metadata; the CLI renders the same value as `executable_size_bytes`. This remains build provenance only, not model execution, performance, or quality evidence.
+
+The candidate-input materializer requires a non-zero contract digest supplied independently from the plan; it never promotes the plan's `proposedContractSha256` into trust. Its v1 core publish boundary is limited to namespace-atomic rename on a same-volume Windows local filesystem with no concurrent namespace writer. It rejects UNC/network-share path syntax, requires the caller to supply actual local-filesystem roots, is not crash-durable, and does not claim a cross-platform or malicious-writer transaction. Source files are streamed from pinned handles, hashed during the write, and identity-checked before the temporary bundle passes the existing input-only validator. The core refuses outputs present at either explicit absence check, but Node's Windows directory rename can replace a file raced into the target name after the final check. True atomic no-replace, deterministic pre-write-hash, hostile-writer rename tests, and cleanup-identity-swap coverage are mandatory in the follow-up hardening slice; this core slice fails closed and removes its identity-owned temporary directory when the single streaming pass detects drift.
 
 The same validator accepts structurally complete native, sidecar, and fallback candidate-run bundles, measured `HW-REF` records, multiple assets/licenses, and completed raw evidence. Those bundles must be validated with an independently pinned input-contract digest:
 

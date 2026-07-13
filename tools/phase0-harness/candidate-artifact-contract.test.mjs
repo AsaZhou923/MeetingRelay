@@ -1232,6 +1232,24 @@ test("contract and evidence seals reject checksum-preserving manifest rewrites",
   });
 });
 
+test("contract and evidence seals reject high-bit ASCII aliases", async () => {
+  for (const relativePath of [
+    "contract-manifest.sha256",
+    "evidence/evidence-manifest.sha256",
+  ]) {
+    await withBundle(async (root) => {
+      const target = path.join(root, ...relativePath.split("/"));
+      const bytes = await readFile(target);
+      bytes[0] |= 0x80;
+      await writeFile(target, bytes);
+      await expectCode(
+        validateCandidateArtifactBundle(root),
+        "ART_DIGEST_SEAL_MISMATCH",
+      );
+    });
+  }
+});
+
 test("exact inventory rejects extra and missing files", async () => {
   await withBundle(async (root) => {
     await writeFile(path.join(root, "extra.txt"), "extra\n");
