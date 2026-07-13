@@ -7,6 +7,7 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rename,
   rm,
   lstat,
@@ -1202,6 +1203,114 @@ test(
       assert.equal(script.includes(sourceDirectory), false);
       assert.equal(script.includes(destinationDirectory), false);
       assert.equal((script.match(/\[System\.IO\.Directory\]::Move/gu) ?? []).length, 1);
+
+      const aliasAncestor = await realpath(path.dirname(temp));
+      const canonicalAncestor = path.join(
+        path.dirname(aliasAncestor),
+        `${path.basename(aliasAncestor)}-canonicalized-for-test`,
+      );
+      const canonicalizingRealpath = async (value) => {
+        const resolved = await realpath(value);
+        const relative = path.relative(aliasAncestor, resolved);
+        return relative === ""
+          ? canonicalAncestor
+          : !relative.startsWith(`..${path.sep}`) &&
+              relative !== ".." &&
+              !path.isAbsolute(relative)
+            ? path.join(canonicalAncestor, relative)
+            : resolved;
+      };
+      await assert.doesNotReject(
+        __publishWindowsDirectoryNoReplaceForTest(
+          { destinationDirectory, sourceDirectory },
+          {
+            environment: { SystemRoot: process.env.SystemRoot },
+            execFileImpl: (_executable, _args, _options, callback) => {
+              callback(
+                null,
+                Buffer.from(protocol.successToken, "ascii"),
+                Buffer.alloc(0),
+              );
+            },
+            platform: "win32",
+            realpathImpl: canonicalizingRealpath,
+          },
+        ),
+      );
+
+      let finalAliasExecCalled = false;
+      await assert.rejects(
+        __publishWindowsDirectoryNoReplaceForTest(
+          { destinationDirectory, sourceDirectory },
+          {
+            environment: { SystemRoot: process.env.SystemRoot },
+            execFileImpl: () => {
+              finalAliasExecCalled = true;
+            },
+            platform: "win32",
+            realpathImpl: async (value) => {
+              const resolved = await realpath(value);
+              return value.toLowerCase() === sourceDirectory.toLowerCase()
+                ? path.join(path.dirname(resolved), "canonical-source-name")
+                : resolved;
+            },
+          },
+        ),
+        (error) =>
+          error instanceof WindowsDirectoryPublishError &&
+          error.code === "WINDOWS_DIRECTORY_PUBLISH_REPARSE",
+      );
+      assert.equal(finalAliasExecCalled, false);
+
+      const junctionTarget = path.join(temp, "junction-target");
+      const junctionParent = path.join(temp, "junction-parent");
+      await mkdir(path.join(junctionTarget, "source"), { recursive: true });
+      await symlink(junctionTarget, junctionParent, "junction");
+      let junctionExecCalled = false;
+      await assert.rejects(
+        __publishWindowsDirectoryNoReplaceForTest(
+          {
+            destinationDirectory: path.join(junctionParent, "destination"),
+            sourceDirectory: path.join(junctionParent, "source"),
+          },
+          {
+            environment: { SystemRoot: process.env.SystemRoot },
+            execFileImpl: () => {
+              junctionExecCalled = true;
+            },
+            platform: "win32",
+          },
+        ),
+        (error) =>
+          error instanceof WindowsDirectoryPublishError &&
+          error.code === "WINDOWS_DIRECTORY_PUBLISH_REPARSE",
+      );
+      assert.equal(junctionExecCalled, false);
+
+      const finalJunctionTarget = path.join(temp, "final-junction-target");
+      const finalJunction = path.join(temp, "final-junction");
+      await mkdir(finalJunctionTarget);
+      await symlink(finalJunctionTarget, finalJunction, "junction");
+      let finalJunctionExecCalled = false;
+      await assert.rejects(
+        __publishWindowsDirectoryNoReplaceForTest(
+          {
+            destinationDirectory: path.join(temp, "final-destination"),
+            sourceDirectory: finalJunction,
+          },
+          {
+            environment: { SystemRoot: process.env.SystemRoot },
+            execFileImpl: () => {
+              finalJunctionExecCalled = true;
+            },
+            platform: "win32",
+          },
+        ),
+        (error) =>
+          error instanceof WindowsDirectoryPublishError &&
+          error.code === "WINDOWS_DIRECTORY_PUBLISH_REPARSE",
+      );
+      assert.equal(finalJunctionExecCalled, false);
 
       const failures = [
         {

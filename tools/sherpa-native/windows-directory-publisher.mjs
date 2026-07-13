@@ -70,7 +70,12 @@ function assertLocalDrivePath(value, field) {
   }
 }
 
-async function assertDirectPath(value, finalKind, field) {
+async function assertDirectPath(
+  value,
+  finalKind,
+  field,
+  { lstatImpl = lstat, realpathImpl = realpath } = {},
+) {
   const root = path.parse(value).root;
   const segments = path.relative(root, value).split(path.sep).filter(Boolean);
   let current = root;
@@ -78,7 +83,7 @@ async function assertDirectPath(value, finalKind, field) {
     current = path.join(current, segment);
     let stat;
     try {
-      stat = await lstat(current);
+      stat = await lstatImpl(current);
     } catch {
       publishFail(
         "WINDOWS_DIRECTORY_PUBLISH_PATH",
@@ -99,15 +104,20 @@ async function assertDirectPath(value, finalKind, field) {
     }
   }
   let resolved;
+  let resolvedParent;
   try {
-    resolved = await realpath(value);
+    [resolved, resolvedParent] = await Promise.all([
+      realpathImpl(value),
+      realpathImpl(path.dirname(value)),
+    ]);
   } catch {
     publishFail(
       "WINDOWS_DIRECTORY_PUBLISH_PATH",
       `${field} cannot be resolved`,
     );
   }
-  if (pathKey(resolved) !== pathKey(value)) {
+  const expectedResolved = path.join(resolvedParent, path.basename(value));
+  if (pathKey(resolved) !== pathKey(expectedResolved)) {
     publishFail(
       "WINDOWS_DIRECTORY_PUBLISH_REPARSE",
       `${field} must resolve to its direct path`,
@@ -129,7 +139,13 @@ function invokeExecFile(execFileImpl, executable, args, options) {
 
 async function publishDirectoryNoReplaceCore(
   { sourceDirectory, destinationDirectory },
-  { environment, execFileImpl, platform },
+  {
+    environment,
+    execFileImpl,
+    lstatImpl = lstat,
+    platform,
+    realpathImpl = realpath,
+  },
 ) {
   if (platform !== "win32") {
     publishFail(
@@ -152,12 +168,24 @@ async function publishDirectoryNoReplaceCore(
   const systemRoot = environment.SystemRoot ?? environment.SYSTEMROOT;
   assertLocalDrivePath(systemRoot, "SystemRoot");
   const powershell = path.join(systemRoot, POWERSHELL_RELATIVE_PATH);
-  await assertDirectPath(powershell, "file", "system PowerShell");
-  await assertDirectPath(sourceDirectory, "directory", "sourceDirectory");
+  const pathDependencies = { lstatImpl, realpathImpl };
+  await assertDirectPath(
+    powershell,
+    "file",
+    "system PowerShell",
+    pathDependencies,
+  );
+  await assertDirectPath(
+    sourceDirectory,
+    "directory",
+    "sourceDirectory",
+    pathDependencies,
+  );
   await assertDirectPath(
     path.dirname(destinationDirectory),
     "directory",
     "destination parent",
+    pathDependencies,
   );
 
   const childEnvironment = Object.freeze({
@@ -207,7 +235,9 @@ async function publishDirectoryNoReplaceCore(
 const PRODUCTION_DEPENDENCIES = Object.freeze({
   environment: process.env,
   execFileImpl: execFile,
+  lstatImpl: lstat,
   platform: process.platform,
+  realpathImpl: realpath,
 });
 
 export async function publishWindowsDirectoryNoReplace(input) {

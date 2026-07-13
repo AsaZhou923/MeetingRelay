@@ -548,8 +548,15 @@ async function assertOwnedTempDirectoryChain(
 async function assertRecordedTargetParentIdentities(
   root,
   directoryIdentities,
-  { rootWasMoved = false } = {},
+  { expectedResolvedRoot = null, rootWasMoved = false } = {},
 ) {
+  if (rootWasMoved && expectedResolvedRoot === null) {
+    fail(
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "moved target parents require a pinned resolved output root",
+      null,
+    );
+  }
   for (const [relativePath, expected] of directoryIdentities) {
     const current = path.join(root, relativePath);
     const stat = await lstat(current, { bigint: true }).catch((error) => {
@@ -575,7 +582,7 @@ async function assertRecordedTargetParentIdentities(
       relativePath,
     );
     const expectedResolved = rootWasMoved
-      ? path.join(root, relativePath)
+      ? path.join(expectedResolvedRoot, relativePath)
       : expected.resolved;
     if (
       !stat.isDirectory() ||
@@ -872,7 +879,11 @@ async function assertParentIdentity(parent, expectedStat, expectedRealpath) {
   }
 }
 
-async function inspectPublishedOutput(output, tempIdentity) {
+async function inspectPublishedOutput(
+  output,
+  tempIdentity,
+  expectedResolvedOutput,
+) {
   let stat;
   try {
     stat = await lstat(output, { bigint: true });
@@ -891,7 +902,10 @@ async function inspectPublishedOutput(output, tempIdentity) {
     sameIdentity(stat, tempIdentity.stat)
   ) {
     const resolved = await realpath(output).catch(() => null);
-    if (resolved !== null && pathKey(resolved) === pathKey(output)) {
+    if (
+      resolved !== null &&
+      pathKey(resolved) === pathKey(expectedResolvedOutput)
+    ) {
       return { exists: true, owned: true };
     }
   }
@@ -1069,7 +1083,11 @@ async function materializeSherpaCandidateInputBundleCore(
         sourceDirectory: tempRoot,
       });
     } catch (error) {
-      const result = await inspectPublishedOutput(output, tempIdentity);
+      const result = await inspectPublishedOutput(
+        output,
+        tempIdentity,
+        prospectiveOutput,
+      );
       if (result.owned) {
         nativePublished = true;
         fail(
@@ -1085,7 +1103,11 @@ async function materializeSherpaCandidateInputBundleCore(
       fail("BUNDLE_MATERIALIZE_PUBLISH", "native no-replace publish failed", "outputRoot", { cause: error });
     }
     nativePublished = true;
-    const publishResult = await inspectPublishedOutput(output, tempIdentity);
+    const publishResult = await inspectPublishedOutput(
+      output,
+      tempIdentity,
+      prospectiveOutput,
+    );
     if (!publishResult.owned) {
       fail(
         "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
@@ -1101,6 +1123,7 @@ async function materializeSherpaCandidateInputBundleCore(
     const postCheckpointPublishResult = await inspectPublishedOutput(
       output,
       tempIdentity,
+      prospectiveOutput,
     );
     if (!postCheckpointPublishResult.owned) {
       fail(
@@ -1113,7 +1136,10 @@ async function materializeSherpaCandidateInputBundleCore(
     await assertRecordedTargetParentIdentities(
       output,
       directoryIdentities,
-      { rootWasMoved: true },
+      {
+        expectedResolvedRoot: prospectiveOutput,
+        rootWasMoved: true,
+      },
     );
     try {
       await lstat(tempRoot);
@@ -1138,7 +1164,11 @@ async function materializeSherpaCandidateInputBundleCore(
       expectedContractSha256,
     });
     await assertParentIdentity(parent, parentStat, resolvedParent);
-    const finalPublishResult = await inspectPublishedOutput(output, tempIdentity);
+    const finalPublishResult = await inspectPublishedOutput(
+      output,
+      tempIdentity,
+      prospectiveOutput,
+    );
     if (!finalPublishResult.owned) {
       fail(
         "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
@@ -1149,7 +1179,10 @@ async function materializeSherpaCandidateInputBundleCore(
     await assertRecordedTargetParentIdentities(
       output,
       directoryIdentities,
-      { rootWasMoved: true },
+      {
+        expectedResolvedRoot: prospectiveOutput,
+        rootWasMoved: true,
+      },
     );
     published = true;
     return { ...validation, bundleRoot: output };
