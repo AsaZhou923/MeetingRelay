@@ -6,7 +6,10 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  readlink,
+  rename,
   rm,
+  lstat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -26,9 +29,16 @@ import {
 import { buildSherpaCandidateInputBundlePlan } from "./candidate-input-bundle-plan.mjs";
 import {
   CandidateInputMaterializeError,
+  __assertUsableIdentityForTest,
+  __materializeSherpaCandidateInputBundleForTest,
   materializeSherpaCandidateInputBundle,
 } from "./candidate-input-materializer.mjs";
 import { planSherpaCandidateInput } from "./candidate-input-plan.mjs";
+import {
+  __publishWindowsDirectoryNoReplaceForTest,
+  __WINDOWS_DIRECTORY_PUBLISH_PROTOCOL_FOR_TEST,
+  WindowsDirectoryPublishError,
+} from "./windows-directory-publisher.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "../..");
@@ -296,6 +306,16 @@ async function expectCode(promise, code) {
       error.code === code,
     `expected ${code}`,
   );
+}
+
+async function captureCode(promise, code) {
+  try {
+    await promise;
+  } catch (error) {
+    assert.equal(error?.code, code);
+    return error;
+  }
+  assert.fail(`expected ${code}`);
 }
 
 async function assertNoOwnedTemporaryBundle(fixture) {
@@ -641,5 +661,595 @@ test(
       );
       assert.deepEqual(await readdir(fixture.publishParent), []);
     });
+  },
+);
+
+test(
+  "native publish never replaces a competitor injected after the absence preflight",
+  { skip: process.platform !== "win32", timeout: 60_000 },
+  async (context) => {
+    const competitors = [
+      {
+        name: "regular file",
+        create: async (fixture) => {
+          await writeFile(fixture.outputRoot, "attacker-file\n", "utf8");
+        },
+        verify: async (fixture) => {
+          assert.equal(await readFile(fixture.outputRoot, "utf8"), "attacker-file\n");
+        },
+      },
+      {
+        name: "valid file symlink",
+        optional: true,
+        create: async (fixture) => {
+          const target = path.join(fixture.temp, "valid-link-target.txt");
+          await writeFile(target, "valid-link-target\n", "utf8");
+          await symlink(target, fixture.outputRoot, "file");
+        },
+        verify: async (fixture) => {
+          assert.equal(await readFile(fixture.outputRoot, "utf8"), "valid-link-target\n");
+        },
+      },
+      {
+        name: "dangling file symlink",
+        optional: true,
+        create: async (fixture) => {
+          await symlink(
+            path.join(fixture.temp, "missing-link-target.txt"),
+            fixture.outputRoot,
+            "file",
+          );
+        },
+      },
+      {
+        name: "junction",
+        create: async (fixture) => {
+          const target = path.join(fixture.temp, "junction-target");
+          await mkdir(target);
+          await writeFile(path.join(target, "sentinel.txt"), "junction\n", "utf8");
+          await symlink(target, fixture.outputRoot, "junction");
+        },
+        verify: async (fixture) => {
+          assert.equal(
+            await readFile(path.join(fixture.outputRoot, "sentinel.txt"), "utf8"),
+            "junction\n",
+          );
+        },
+      },
+      {
+        name: "directory symlink",
+        optional: true,
+        create: async (fixture) => {
+          const target = path.join(fixture.temp, "directory-link-target");
+          await mkdir(target);
+          await writeFile(path.join(target, "sentinel.txt"), "directory-link\n", "utf8");
+          await symlink(target, fixture.outputRoot, "dir");
+        },
+        verify: async (fixture) => {
+          assert.equal(
+            await readFile(path.join(fixture.outputRoot, "sentinel.txt"), "utf8"),
+            "directory-link\n",
+          );
+        },
+      },
+      {
+        name: "empty directory",
+        create: async (fixture) => mkdir(fixture.outputRoot),
+      },
+      {
+        name: "nonempty directory",
+        create: async (fixture) => {
+          await mkdir(fixture.outputRoot);
+          await writeFile(
+            path.join(fixture.outputRoot, "sentinel.txt"),
+            "nonempty\n",
+            "utf8",
+          );
+        },
+        verify: async (fixture) => {
+          assert.equal(
+            await readFile(path.join(fixture.outputRoot, "sentinel.txt"), "utf8"),
+            "nonempty\n",
+          );
+        },
+      },
+    ];
+
+    const exercisedMandatory = new Set();
+    for (const competitor of competitors) {
+      await context.test(competitor.name, async (subtest) => {
+        await withFixture(async (fixture) => {
+          let before;
+          let beforeLink = null;
+          let capabilityUnavailable = false;
+          let injected = false;
+          const operation = __materializeSherpaCandidateInputBundleForTest(
+            fixture,
+            {
+              hooks: {
+                beforePublishRevalidation: async () => {
+                  try {
+                    await competitor.create(fixture);
+                  } catch (error) {
+                    if (
+                      competitor.optional &&
+                      error?.syscall === "symlink" &&
+                      ["EACCES", "EPERM", "UNKNOWN"].includes(error?.code)
+                    ) {
+                      capabilityUnavailable = true;
+                      return;
+                    }
+                    throw error;
+                  }
+                  injected = true;
+                  before = await lstat(fixture.outputRoot, { bigint: true });
+                  if (before.isSymbolicLink()) {
+                    beforeLink = await readlink(fixture.outputRoot);
+                  }
+                },
+              },
+            },
+          );
+          let operationError = null;
+          try {
+            await operation;
+          } catch (error) {
+            operationError = error;
+          }
+          if (capabilityUnavailable) {
+            assert.equal(operationError, null, competitor.name);
+            subtest.skip("host cannot create this optional symbolic link");
+            return;
+          }
+          assert.equal(injected, true, competitor.name);
+          assert.equal(
+            operationError?.code,
+            "BUNDLE_MATERIALIZE_OUTPUT_EXISTS",
+            competitor.name,
+          );
+          const after = await lstat(fixture.outputRoot, { bigint: true });
+          assert.equal(after.dev, before.dev, competitor.name);
+          assert.equal(after.ino, before.ino, competitor.name);
+          if (beforeLink !== null) {
+            assert.equal(
+              await readlink(fixture.outputRoot),
+              beforeLink,
+              competitor.name,
+            );
+          }
+          await competitor.verify?.(fixture);
+          await assertNoOwnedTemporaryBundle(fixture);
+          if (!competitor.optional) {
+            exercisedMandatory.add(competitor.name);
+          }
+        });
+      });
+    }
+    assert.deepEqual(
+      [...exercisedMandatory].sort(),
+      ["empty directory", "junction", "nonempty directory", "regular file"],
+    );
+  },
+);
+
+test(
+  "source identity swaps before open and after read fail closed",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async () => {
+    for (const checkpoint of ["beforeSourceOpen", "beforeSourcePostcheck"]) {
+      await withFixture(async (fixture) => {
+        const selected = fixture.plan.materials.find(
+          (entry) => entry.kind === "copy" && entry.target_path === "assets/Cargo.lock",
+        );
+        assert.ok(selected);
+        let swapped = false;
+        const hooks = {
+          [checkpoint]: async ({ material: current, sourcePath }) => {
+            if (swapped || current.target_path !== selected.target_path) return;
+            const bytes = await readFile(sourcePath);
+            await rename(sourcePath, `${sourcePath}.original`);
+            await writeFile(sourcePath, bytes);
+            swapped = true;
+          },
+        };
+        await expectCode(
+          __materializeSherpaCandidateInputBundleForTest(fixture, { hooks }),
+          "BUNDLE_MATERIALIZE_SOURCE_IDENTITY",
+        );
+        assert.equal(swapped, true, checkpoint);
+        await assertNoOwnedTemporaryBundle(fixture);
+      });
+    }
+  },
+);
+
+test(
+  "parent and temporary bundle identity swaps fail closed",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async () => {
+    await withFixture(async (fixture) => {
+      let replacementParent;
+      const error = await captureCode(
+        __materializeSherpaCandidateInputBundleForTest(fixture, {
+          hooks: {
+            beforePublishRevalidation: async ({ parent }) => {
+              replacementParent = parent;
+              await rename(parent, `${parent}.displaced`);
+              await mkdir(parent);
+              await writeFile(path.join(parent, "attacker.txt"), "parent\n", "utf8");
+            },
+          },
+        }),
+        "BUNDLE_MATERIALIZE_OUTPUT",
+      );
+      assert.equal(error.cleanupCompleted, false);
+      assert.match(error.cleanupReason, /disappeared|safely removed|identity changed/u);
+      assert.equal(
+        await readFile(path.join(replacementParent, "attacker.txt"), "utf8"),
+        "parent\n",
+      );
+    });
+
+    await withFixture(async (fixture) => {
+      let replacementTemp;
+      const error = await captureCode(
+        __materializeSherpaCandidateInputBundleForTest(fixture, {
+          hooks: {
+            beforePublishRevalidation: async ({ tempRoot }) => {
+              replacementTemp = tempRoot;
+              await rename(tempRoot, `${tempRoot}.displaced`);
+              await mkdir(tempRoot);
+              await writeFile(path.join(tempRoot, "attacker.txt"), "temp\n", "utf8");
+            },
+          },
+        }),
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      );
+      assert.equal(error.cleanupCompleted, false);
+      assert.match(error.cleanupReason, /identity changed/u);
+      assert.equal(
+        await readFile(path.join(replacementTemp, "attacker.txt"), "utf8"),
+        "temp\n",
+      );
+    });
+  },
+);
+
+test(
+  "nested target-parent replacement fails closed without deleting either tree",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async () => {
+    await withFixture(async (fixture) => {
+      let assetsDirectory;
+      const error = await captureCode(
+        __materializeSherpaCandidateInputBundleForTest(fixture, {
+          hooks: {
+            afterInputValidation: async ({ tempRoot }) => {
+              assetsDirectory = path.join(tempRoot, "assets");
+              await rename(assetsDirectory, `${assetsDirectory}.displaced`);
+              await mkdir(assetsDirectory);
+              await writeFile(
+                path.join(assetsDirectory, "attacker.txt"),
+                "nested-parent\n",
+                "utf8",
+              );
+            },
+          },
+        }),
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      );
+      assert.equal(error.cleanupCompleted, false);
+      assert.equal(
+        await readFile(path.join(assetsDirectory, "attacker.txt"), "utf8"),
+        "nested-parent\n",
+      );
+      assert.equal(
+        (await lstat(`${assetsDirectory}.displaced`)).isDirectory(),
+        true,
+      );
+      await assert.rejects(lstat(fixture.outputRoot), { code: "ENOENT" });
+    });
+  },
+);
+
+test(
+  "post-validation and post-move tampering cannot return input-valid",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async () => {
+    await withFixture(async (fixture) => {
+      let publishCalled = false;
+      let caught = null;
+      try {
+        await __materializeSherpaCandidateInputBundleForTest(fixture, {
+          hooks: {
+            afterInputValidation: async ({ tempRoot }) => {
+              const sealPath = path.join(tempRoot, "contract-manifest.sha256");
+              const bytes = await readFile(sealPath);
+              bytes[0] = bytes[0] === 0x30 ? 0x31 : 0x30;
+              await writeFile(sealPath, bytes);
+            },
+          },
+          publishDirectory: async () => {
+            publishCalled = true;
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      assert.ok(caught instanceof Error);
+      assert.equal(publishCalled, false);
+      await assert.rejects(lstat(fixture.outputRoot), { code: "ENOENT" });
+      await assertNoOwnedTemporaryBundle(fixture);
+    });
+
+    await withFixture(async (fixture) => {
+      let tampered = false;
+      let caught = null;
+      try {
+        await __materializeSherpaCandidateInputBundleForTest(fixture, {
+          hooks: {
+            afterNativePublishBeforeValidation: async ({ output }) => {
+              const sealPath = path.join(output, "contract-manifest.sha256");
+              const bytes = await readFile(sealPath);
+              bytes[0] = bytes[0] === 0x30 ? 0x31 : 0x30;
+              await writeFile(sealPath, bytes);
+              tampered = true;
+            },
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      assert.ok(caught instanceof Error);
+      assert.equal(tampered, true);
+      assert.equal((await lstat(fixture.outputRoot)).isDirectory(), true);
+      await assertNoOwnedTemporaryBundle(fixture);
+    });
+  },
+);
+
+test(
+  "cleanup identity swaps before either check never remove attacker trees",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async () => {
+    for (const checkpoint of ["beforeCleanup", "beforeCleanupRemove"]) {
+      await withFixture(async (fixture) => {
+        let replacementTemp;
+        const error = await captureCode(
+          __materializeSherpaCandidateInputBundleForTest(fixture, {
+            hooks: {
+              [checkpoint]: async ({ tempRoot }) => {
+                replacementTemp = tempRoot;
+                await rename(tempRoot, `${tempRoot}.displaced`);
+                await mkdir(tempRoot);
+                await writeFile(
+                  path.join(tempRoot, "attacker.txt"),
+                  `${checkpoint}\n`,
+                  "utf8",
+                );
+              },
+            },
+            publishDirectory: async () => {
+              throw new Error("deterministic publish failure");
+            },
+          }),
+          "BUNDLE_MATERIALIZE_PUBLISH",
+        );
+        assert.equal(error.cleanupCompleted, false);
+        assert.match(
+          error.cleanupReason,
+          /identity changed|safely inspected/u,
+        );
+        assert.equal(
+          await readFile(path.join(replacementTemp, "attacker.txt"), "utf8"),
+          `${checkpoint}\n`,
+        );
+        assert.equal(
+          (await lstat(`${replacementTemp}.displaced`)).isDirectory(),
+          true,
+        );
+      });
+    }
+  },
+);
+
+test(
+  "ambiguous publisher states never return success or delete uncertain output",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async () => {
+    await withFixture(async (fixture) => {
+      await captureCode(
+        __materializeSherpaCandidateInputBundleForTest(fixture, {
+          publishDirectory: async () => {
+            throw new Error("failed before move");
+          },
+        }),
+        "BUNDLE_MATERIALIZE_PUBLISH",
+      );
+      await assert.rejects(lstat(fixture.outputRoot), { code: "ENOENT" });
+      await assertNoOwnedTemporaryBundle(fixture);
+    });
+
+    await withFixture(async (fixture) => {
+      await captureCode(
+        __materializeSherpaCandidateInputBundleForTest(fixture, {
+          publishDirectory: async ({
+            destinationDirectory,
+            sourceDirectory,
+          }) => {
+            await rename(sourceDirectory, destinationDirectory);
+            throw new Error("move completed before protocol failure");
+          },
+        }),
+        "BUNDLE_MATERIALIZE_PUBLISH",
+      );
+      assert.equal((await lstat(fixture.outputRoot)).isDirectory(), true);
+      await assertNoOwnedTemporaryBundle(fixture);
+    });
+
+    await withFixture(async (fixture) => {
+      await captureCode(
+        __materializeSherpaCandidateInputBundleForTest(fixture, {
+          publishDirectory: async () => {},
+        }),
+        "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
+      );
+      await assert.rejects(lstat(fixture.outputRoot), { code: "ENOENT" });
+      const prefix = `.${path.basename(fixture.outputRoot)}.meetingrelay-tmp-`;
+      assert.equal(
+        (await readdir(fixture.publishParent)).filter((entry) =>
+          entry.startsWith(prefix)
+        ).length,
+        1,
+      );
+    });
+  },
+);
+
+test("zero, missing, and non-bigint identities fail closed", () => {
+  assert.doesNotThrow(() =>
+    __assertUsableIdentityForTest({ dev: 1n, ino: 1n }),
+  );
+  for (const stat of [
+    {},
+    { dev: 0n, ino: 1n },
+    { dev: 1n, ino: 0n },
+    { dev: 1, ino: 1n },
+    { dev: 1n, ino: 1 },
+  ]) {
+    assert.throws(
+      () => __assertUsableIdentityForTest(stat),
+      (error) =>
+        error instanceof CandidateInputMaterializeError &&
+        error.code === "BUNDLE_MATERIALIZE_IDENTITY_UNAVAILABLE",
+    );
+  }
+});
+
+test(
+  "PowerShell publisher uses a static encoded protocol and ignores PATH",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-publisher-"));
+    try {
+      const sourceDirectory = path.join(temp, "source");
+      const destinationDirectory = path.join(temp, "destination");
+      await mkdir(sourceDirectory);
+      let invocation;
+      const protocol = __WINDOWS_DIRECTORY_PUBLISH_PROTOCOL_FOR_TEST;
+      await __publishWindowsDirectoryNoReplaceForTest(
+        { destinationDirectory, sourceDirectory },
+        {
+          environment: {
+            PATH: path.join(temp, "attacker-path"),
+            SystemRoot: process.env.SystemRoot,
+          },
+          execFileImpl: (executable, args, options, callback) => {
+            invocation = { args, executable, options };
+            callback(null, Buffer.from(protocol.successToken, "ascii"), Buffer.alloc(0));
+          },
+          platform: "win32",
+        },
+      );
+      assert.equal(
+        invocation.executable.toLowerCase(),
+        path.join(process.env.SystemRoot, protocol.powershellRelativePath).toLowerCase(),
+      );
+      assert.equal(invocation.options.shell, false);
+      assert.equal("PATH" in invocation.options.env, false);
+      assert.deepEqual(Object.keys(invocation.options.env).sort(), [
+        protocol.destinationEnvironmentName,
+        protocol.sourceEnvironmentName,
+        "SystemRoot",
+        "WINDIR",
+      ].sort());
+      assert.equal(
+        invocation.options.env[protocol.sourceEnvironmentName],
+        sourceDirectory,
+      );
+      assert.equal(
+        invocation.options.env[protocol.destinationEnvironmentName],
+        destinationDirectory,
+      );
+      assert.equal(invocation.options.env.SystemRoot, process.env.SystemRoot);
+      assert.equal(invocation.options.env.WINDIR, process.env.SystemRoot);
+      assert.deepEqual(invocation.args, [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        protocol.encodedCommand,
+      ]);
+      assert.equal(invocation.options.encoding, null);
+      assert.equal(invocation.options.maxBuffer, 64 * 1024);
+      assert.equal(invocation.options.timeout, 30_000);
+      assert.equal(invocation.options.windowsHide, true);
+      const script = Buffer.from(protocol.encodedCommand, "base64").toString("utf16le");
+      assert.equal(
+        script,
+        [
+          "$ErrorActionPreference='Stop'",
+          "if($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or -not [Environment]::Is64BitProcess){throw 'unsupported controlled publisher runtime'}",
+          `$source=[Environment]::GetEnvironmentVariable('${protocol.sourceEnvironmentName}','Process')`,
+          `$destination=[Environment]::GetEnvironmentVariable('${protocol.destinationEnvironmentName}','Process')`,
+          "if([String]::IsNullOrEmpty($source)-or[String]::IsNullOrEmpty($destination)){throw 'missing controlled directory-move input'}",
+          "[System.IO.Directory]::Move($source,$destination)",
+          `[Console]::Out.Write('${protocol.successToken}')`,
+        ].join(";"),
+      );
+      assert.equal(script.includes(sourceDirectory), false);
+      assert.equal(script.includes(destinationDirectory), false);
+      assert.equal((script.match(/\[System\.IO\.Directory\]::Move/gu) ?? []).length, 1);
+
+      const failures = [
+        {
+          code: "WINDOWS_DIRECTORY_PUBLISH_NATIVE",
+          invoke: (callback) => callback(new Error("spawn failed")),
+          label: "exec error",
+        },
+        {
+          code: "WINDOWS_DIRECTORY_PUBLISH_PROTOCOL",
+          invoke: (callback) =>
+            callback(
+              null,
+              Buffer.from(protocol.successToken, "ascii"),
+              Buffer.from("unexpected stderr", "ascii"),
+            ),
+          label: "stderr",
+        },
+        ...["", "wrong-token", `${protocol.successToken}extra`].map(
+          (stdout) => ({
+            code: "WINDOWS_DIRECTORY_PUBLISH_PROTOCOL",
+            invoke: (callback) =>
+              callback(null, Buffer.from(stdout, "ascii"), Buffer.alloc(0)),
+            label: `stdout ${JSON.stringify(stdout)}`,
+          }),
+        ),
+      ];
+      for (const failure of failures) {
+        await assert.rejects(
+          __publishWindowsDirectoryNoReplaceForTest(
+            { destinationDirectory, sourceDirectory },
+            {
+              environment: { SystemRoot: process.env.SystemRoot },
+              execFileImpl: (_executable, _args, _options, callback) => {
+                failure.invoke(callback);
+              },
+              platform: "win32",
+            },
+          ),
+          (error) =>
+            error instanceof WindowsDirectoryPublishError &&
+            error.code === failure.code &&
+            !error.message.includes(sourceDirectory) &&
+            !error.message.includes(destinationDirectory),
+          failure.label,
+        );
+      }
+    } finally {
+      await rm(temp, { force: true, recursive: true });
+    }
   },
 );

@@ -5,7 +5,6 @@ import {
   mkdtemp,
   open,
   realpath,
-  rename,
   rm,
 } from "node:fs/promises";
 import path from "node:path";
@@ -15,6 +14,7 @@ import {
   validateArtifactPath,
   validateCandidateArtifactInputBundle,
 } from "../phase0-harness/candidate-artifact-contract.mjs";
+import { publishWindowsDirectoryNoReplace } from "./windows-directory-publisher.mjs";
 
 const PLAN_KIND = "meetingrelay-sherpa-candidate-input-bundle-plan-v1";
 const PLAN_SCHEMA_VERSION = "1.0";
@@ -294,7 +294,29 @@ function pathsOverlap(left, right) {
 }
 
 function sameIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
+  return (
+    typeof left?.dev === "bigint" &&
+    typeof left?.ino === "bigint" &&
+    typeof right?.dev === "bigint" &&
+    typeof right?.ino === "bigint" &&
+    left.dev > 0n &&
+    left.ino > 0n &&
+    right.dev > 0n &&
+    right.ino > 0n &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
+}
+
+function assertUsableIdentity(stat, code, message, field) {
+  if (
+    typeof stat?.dev !== "bigint" ||
+    typeof stat?.ino !== "bigint" ||
+    stat.dev <= 0n ||
+    stat.ino <= 0n
+  ) {
+    fail(code, message, field);
+  }
 }
 
 function assertLocalWindowsAbsolutePath(value, field) {
@@ -394,6 +416,12 @@ async function inspectDirectory(root, field) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
     fail("BUNDLE_MATERIALIZE_ROOT", "source root must be a direct directory, not a reparse link", field);
   }
+  assertUsableIdentity(
+    stat,
+    "BUNDLE_MATERIALIZE_SOURCE_IDENTITY",
+    "source root has no usable filesystem identity",
+    field,
+  );
   const resolved = await realpath(lexical);
   return { lexical, resolved, stat };
 }
@@ -419,13 +447,175 @@ async function writeAll(handle, bytes) {
   }
 }
 
-async function createTarget(tempRoot, targetPath) {
+async function runCheckpoint(hooks, name, context) {
+  const hook = hooks[name];
+  if (hook !== undefined) {
+    await hook(Object.freeze({ ...context }));
+  }
+}
+
+async function assertOwnedTempDirectoryChain(
+  tempRoot,
+  targetParent,
+  identity,
+  directoryIdentities = null,
+) {
+  const currentRoot = await lstat(tempRoot, { bigint: true }).catch((error) => {
+    fail(
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "temporary bundle root cannot be re-inspected",
+      null,
+      { cause: error },
+    );
+  });
+  const currentRootRealpath = await realpath(tempRoot).catch((error) => {
+    fail(
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "temporary bundle root cannot be resolved again",
+      null,
+      { cause: error },
+    );
+  });
+  if (
+    !currentRoot.isDirectory() ||
+    currentRoot.isSymbolicLink() ||
+    !sameIdentity(currentRoot, identity.stat) ||
+    pathKey(currentRootRealpath) !== pathKey(identity.resolved)
+  ) {
+    fail(
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "temporary bundle root identity changed",
+    );
+  }
+  const relative = path.relative(tempRoot, targetParent);
+  if (
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    fail("BUNDLE_MATERIALIZE_TEMP_IDENTITY", "target parent escaped the temporary bundle");
+  }
+  let current = tempRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stat = await lstat(current, { bigint: true }).catch((error) => {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+        "target parent cannot be inspected",
+        null,
+        { cause: error },
+      );
+    });
+    assertUsableIdentity(
+      stat,
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "target parent has no usable filesystem identity",
+      null,
+    );
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_REPARSE",
+        "target parents must be direct directories",
+      );
+    }
+    const resolved = await realpath(current).catch((error) => {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+        "target parent cannot be resolved",
+        null,
+        { cause: error },
+      );
+    });
+    const relativeKey = path.relative(tempRoot, current);
+    const expected = directoryIdentities?.get(relativeKey);
+    if (
+      expected !== undefined &&
+      (!sameIdentity(stat, expected.stat) ||
+        pathKey(resolved) !== pathKey(expected.resolved))
+    ) {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+        "target parent identity changed",
+        relativeKey,
+      );
+    }
+    if (directoryIdentities !== null && expected === undefined) {
+      directoryIdentities.set(relativeKey, { resolved, stat });
+    }
+  }
+}
+
+async function assertRecordedTargetParentIdentities(
+  root,
+  directoryIdentities,
+  { rootWasMoved = false } = {},
+) {
+  for (const [relativePath, expected] of directoryIdentities) {
+    const current = path.join(root, relativePath);
+    const stat = await lstat(current, { bigint: true }).catch((error) => {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+        "recorded target parent cannot be inspected",
+        relativePath,
+        { cause: error },
+      );
+    });
+    const resolved = await realpath(current).catch((error) => {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+        "recorded target parent cannot be resolved",
+        relativePath,
+        { cause: error },
+      );
+    });
+    assertUsableIdentity(
+      stat,
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "recorded target parent has no usable filesystem identity",
+      relativePath,
+    );
+    const expectedResolved = rootWasMoved
+      ? path.join(root, relativePath)
+      : expected.resolved;
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      !sameIdentity(stat, expected.stat) ||
+      pathKey(resolved) !== pathKey(expectedResolved)
+    ) {
+      fail(
+        "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+        "recorded target parent identity changed",
+        relativePath,
+      );
+    }
+  }
+}
+
+async function createTarget(
+  tempRoot,
+  targetPath,
+  tempIdentity,
+  directoryIdentities,
+) {
   const target = path.join(tempRoot, ...targetPath.split("/"));
-  await mkdir(path.dirname(target), { recursive: true });
+  const targetParent = path.dirname(target);
+  await mkdir(targetParent, { recursive: true });
+  await assertOwnedTempDirectoryChain(
+    tempRoot,
+    targetParent,
+    tempIdentity,
+    directoryIdentities,
+  );
   return target;
 }
 
-async function writeDocument(tempRoot, material) {
+async function writeDocument(
+  tempRoot,
+  tempIdentity,
+  directoryIdentities,
+  material,
+) {
   const bytes = Buffer.from(material.bytes);
   if (
     sha256(bytes) !== material.sha256 ||
@@ -433,7 +623,12 @@ async function writeDocument(tempRoot, material) {
   ) {
     fail("BUNDLE_MATERIALIZE_PLAN", "document buffer changed after validation", material.target_path);
   }
-  const target = await createTarget(tempRoot, material.target_path);
+  const target = await createTarget(
+    tempRoot,
+    material.target_path,
+    tempIdentity,
+    directoryIdentities,
+  );
   const handle = await open(target, "wx", 0o600);
   try {
     await writeAll(handle, bytes);
@@ -442,7 +637,14 @@ async function writeDocument(tempRoot, material) {
   }
 }
 
-async function streamCopy(tempRoot, material, source) {
+async function streamCopy(
+  tempRoot,
+  tempIdentity,
+  directoryIdentities,
+  material,
+  source,
+  hooks,
+) {
   const currentRootStat = await lstat(source.lexical, { bigint: true }).catch((error) => {
     fail("BUNDLE_MATERIALIZE_SOURCE_IDENTITY", "source root cannot be re-inspected", material.source_root, { cause: error });
   });
@@ -472,6 +674,12 @@ async function streamCopy(tempRoot, material, source) {
   if (!before.isFile() || before.isSymbolicLink()) {
     fail("BUNDLE_MATERIALIZE_SOURCE_REPARSE", "source must be a direct regular file", material.source_relative_path);
   }
+  assertUsableIdentity(
+    before,
+    "BUNDLE_MATERIALIZE_SOURCE_IDENTITY",
+    "source file has no usable filesystem identity",
+    material.source_relative_path,
+  );
   const resolvedBefore = await realpath(sourcePath);
   const relative = path.relative(source.resolved, resolvedBefore);
   if (
@@ -482,10 +690,20 @@ async function streamCopy(tempRoot, material, source) {
     fail("BUNDLE_MATERIALIZE_SOURCE_REPARSE", "source resolves outside its named root", material.source_relative_path);
   }
 
+  await runCheckpoint(hooks, "beforeSourceOpen", {
+    material,
+    sourcePath,
+  });
   const input = await open(sourcePath, "r");
   let output;
   try {
     const opened = await input.stat({ bigint: true });
+    assertUsableIdentity(
+      opened,
+      "BUNDLE_MATERIALIZE_SOURCE_IDENTITY",
+      "opened source has no usable filesystem identity",
+      material.source_relative_path,
+    );
     if (!opened.isFile() || !sameIdentity(before, opened)) {
       fail("BUNDLE_MATERIALIZE_SOURCE_IDENTITY", "opened source identity differs from lstat", material.source_relative_path);
     }
@@ -496,7 +714,12 @@ async function streamCopy(tempRoot, material, source) {
         material.source_relative_path,
       );
     }
-    const target = await createTarget(tempRoot, material.target_path);
+    const target = await createTarget(
+      tempRoot,
+      material.target_path,
+      tempIdentity,
+      directoryIdentities,
+    );
     output = await open(target, "wx", 0o600);
     const hash = createHash("sha256");
     let size = 0n;
@@ -505,6 +728,10 @@ async function streamCopy(tempRoot, material, source) {
       size += BigInt(chunk.length);
       await writeAll(output, chunk);
     }
+    await runCheckpoint(hooks, "beforeSourcePostcheck", {
+      material,
+      sourcePath,
+    });
     const afterHandle = await input.stat({ bigint: true });
     const afterPath = await lstat(sourcePath, { bigint: true }).catch((error) => {
       fail("BUNDLE_MATERIALIZE_SOURCE_IDENTITY", "source path disappeared while streaming", material.source_relative_path, { cause: error });
@@ -559,7 +786,11 @@ async function validateHarness(tempRoot) {
   }
 }
 
-async function cleanupOwnedTemp(tempRoot, identity) {
+async function inspectOwnedTempForCleanup(
+  tempRoot,
+  identity,
+  directoryIdentities,
+) {
   try {
     const current = await lstat(tempRoot, { bigint: true });
     const resolved = await realpath(tempRoot);
@@ -569,30 +800,124 @@ async function cleanupOwnedTemp(tempRoot, identity) {
       !sameIdentity(current, identity.stat) ||
       pathKey(resolved) !== pathKey(identity.resolved)
     ) {
-      return false;
+      return "temporary bundle identity changed before cleanup";
     }
-    await rm(tempRoot, { force: false, recursive: true });
-    return true;
+    await assertRecordedTargetParentIdentities(
+      tempRoot,
+      directoryIdentities,
+    );
+    return null;
   } catch (error) {
-    return error?.code === "ENOENT";
+    return error?.code === "ENOENT"
+      ? "temporary bundle disappeared before cleanup"
+      : "temporary bundle could not be safely inspected for cleanup";
   }
 }
 
+async function cleanupOwnedTemp(
+  tempRoot,
+  identity,
+  directoryIdentities,
+  hooks,
+) {
+  const firstInspection = await inspectOwnedTempForCleanup(
+    tempRoot,
+    identity,
+    directoryIdentities,
+  );
+  if (firstInspection !== null) {
+    return { completed: false, reason: firstInspection };
+  }
+  try {
+    await runCheckpoint(hooks, "beforeCleanupRemove", { tempRoot });
+  } catch {
+    return {
+      completed: false,
+      reason: "cleanup checkpoint failed before removal",
+    };
+  }
+  const secondInspection = await inspectOwnedTempForCleanup(
+    tempRoot,
+    identity,
+    directoryIdentities,
+  );
+  if (secondInspection !== null) {
+    return { completed: false, reason: secondInspection };
+  }
+  try {
+    await rm(tempRoot, { force: false, recursive: true });
+    return { completed: true, reason: null };
+  } catch {
+    return {
+      completed: false,
+      reason: "temporary bundle could not be safely removed",
+    };
+  }
+}
+
+async function assertParentIdentity(parent, expectedStat, expectedRealpath) {
+  const current = await lstat(parent, { bigint: true }).catch((error) => {
+    fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent cannot be re-inspected", "outputRoot", { cause: error });
+  });
+  const currentRealpath = await realpath(parent).catch((error) => {
+    fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent cannot be resolved again", "outputRoot", { cause: error });
+  });
+  if (
+    !current.isDirectory() ||
+    current.isSymbolicLink() ||
+    !sameIdentity(current, expectedStat) ||
+    pathKey(currentRealpath) !== pathKey(expectedRealpath)
+  ) {
+    fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent identity changed", "outputRoot");
+  }
+}
+
+async function inspectPublishedOutput(output, tempIdentity) {
+  let stat;
+  try {
+    stat = await lstat(output, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return { exists: false, owned: false };
+    fail(
+      "BUNDLE_MATERIALIZE_OUTPUT",
+      "publish result cannot be inspected",
+      "outputRoot",
+      { cause: error },
+    );
+  }
+  if (
+    stat.isDirectory() &&
+    !stat.isSymbolicLink() &&
+    sameIdentity(stat, tempIdentity.stat)
+  ) {
+    const resolved = await realpath(output).catch(() => null);
+    if (resolved !== null && pathKey(resolved) === pathKey(output)) {
+      return { exists: true, owned: true };
+    }
+  }
+  return { exists: true, owned: false };
+}
+
+const PRODUCTION_HOOKS = Object.freeze({});
+const PRODUCTION_MATERIALIZER_DEPENDENCIES = Object.freeze({
+  hooks: PRODUCTION_HOOKS,
+  publishDirectory: publishWindowsDirectoryNoReplace,
+});
+
 /**
  * Materializes and namespace-atomically publishes one externally authorized
- * candidate-input bundle under a no-concurrent-namespace-writer assumption.
- * This v1 core operation is Windows-only and assumes a same-volume local
+ * candidate-input bundle with a native no-replace destination operation.
+ * This v1 operation is Windows-only and assumes a same-volume local
  * filesystem. It is not crash-durable, does not support network shares, and
- * does not provide atomic no-replace against a malicious concurrent writer.
+ * its source, temporary-root, and parent checks are fail-closed path
+ * revalidations rather than a handle-bound transaction.
  * `expectedContractSha256` is mandatory and never defaults from the plan's
  * merely proposed digest.
  */
-export async function materializeSherpaCandidateInputBundle({
-  plan,
-  sourceRoots,
-  outputRoot,
-  expectedContractSha256,
-}) {
+async function materializeSherpaCandidateInputBundleCore(
+  { plan, sourceRoots, outputRoot, expectedContractSha256 },
+  { hooks, publishDirectory },
+) {
   if (expectedContractSha256 === undefined) {
     fail(
       "BUNDLE_MATERIALIZE_TRUST_REQUIRED",
@@ -644,6 +969,12 @@ export async function materializeSherpaCandidateInputBundle({
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
     fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent must be a direct directory", "outputRoot");
   }
+  assertUsableIdentity(
+    parentStat,
+    "BUNDLE_MATERIALIZE_OUTPUT",
+    "output parent has no usable filesystem identity",
+    "outputRoot",
+  );
   const resolvedParent = await realpath(parent);
   const prospectiveOutput = path.join(resolvedParent, path.basename(output));
   for (const [name, source] of Object.entries(inspectedRoots)) {
@@ -661,73 +992,236 @@ export async function materializeSherpaCandidateInputBundle({
   await assertOutputAbsent(output);
 
   const tempRoot = await mkdtemp(path.join(parent, `.${path.basename(output)}.meetingrelay-tmp-`));
-  const tempIdentity = {
-    resolved: await realpath(tempRoot),
-    stat: await lstat(tempRoot, { bigint: true }),
-  };
+  const directoryIdentities = new Map();
+  let tempIdentity = null;
   let published = false;
+  let nativePublished = false;
   let failure = null;
   try {
+    tempIdentity = {
+      resolved: await realpath(tempRoot),
+      stat: await lstat(tempRoot, { bigint: true }),
+    };
+    assertUsableIdentity(
+      tempIdentity.stat,
+      "BUNDLE_MATERIALIZE_TEMP_IDENTITY",
+      "temporary bundle has no usable filesystem identity",
+      null,
+    );
     for (const material of materials) {
       if (material.kind === "document") {
-        await writeDocument(tempRoot, material);
+        await writeDocument(
+          tempRoot,
+          tempIdentity,
+          directoryIdentities,
+          material,
+        );
       } else {
-        await streamCopy(tempRoot, material, inspectedRoots[material.source_root]);
+        await streamCopy(
+          tempRoot,
+          tempIdentity,
+          directoryIdentities,
+          material,
+          inspectedRoots[material.source_root],
+          hooks,
+        );
       }
     }
+    await runCheckpoint(hooks, "beforePublishRevalidation", {
+      output,
+      parent,
+      tempRoot,
+    });
+    await assertParentIdentity(parent, parentStat, resolvedParent);
+    await assertOwnedTempDirectoryChain(tempRoot, tempRoot, tempIdentity);
+    await assertRecordedTargetParentIdentities(
+      tempRoot,
+      directoryIdentities,
+    );
     await validateHarness(tempRoot);
-    const validation = await validateCandidateArtifactInputBundle(tempRoot, {
+    await validateCandidateArtifactInputBundle(tempRoot, {
       expectedContractSha256,
     });
-    await assertOutputAbsent(output);
-    const currentParent = await lstat(parent, { bigint: true }).catch((error) => {
-      fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent cannot be re-inspected", "outputRoot", { cause: error });
+    await runCheckpoint(hooks, "afterInputValidation", {
+      output,
+      parent,
+      tempRoot,
     });
-    const currentParentRealpath = await realpath(parent).catch((error) => {
-      fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent cannot be resolved again", "outputRoot", { cause: error });
+    await assertParentIdentity(parent, parentStat, resolvedParent);
+    await assertOwnedTempDirectoryChain(tempRoot, tempRoot, tempIdentity);
+    await assertRecordedTargetParentIdentities(
+      tempRoot,
+      directoryIdentities,
+    );
+    await validateHarness(tempRoot);
+    await validateCandidateArtifactInputBundle(tempRoot, {
+      expectedContractSha256,
     });
-    if (
-      !currentParent.isDirectory() ||
-      currentParent.isSymbolicLink() ||
-      !sameIdentity(currentParent, parentStat) ||
-      pathKey(currentParentRealpath) !== pathKey(resolvedParent)
-    ) {
-      fail("BUNDLE_MATERIALIZE_OUTPUT", "output parent identity changed", "outputRoot");
-    }
+    await assertParentIdentity(parent, parentStat, resolvedParent);
+    await assertOwnedTempDirectoryChain(tempRoot, tempRoot, tempIdentity);
+    await assertRecordedTargetParentIdentities(
+      tempRoot,
+      directoryIdentities,
+    );
     try {
-      await rename(tempRoot, output);
+      await publishDirectory({
+        destinationDirectory: output,
+        sourceDirectory: tempRoot,
+      });
     } catch (error) {
-      try {
-        await lstat(output);
-        fail("BUNDLE_MATERIALIZE_OUTPUT_EXISTS", "output path appeared before publish", "outputRoot", { cause: error });
-      } catch (inspectionError) {
-        if (inspectionError instanceof CandidateInputMaterializeError) throw inspectionError;
-        if (inspectionError?.code !== "ENOENT") {
-          fail("BUNDLE_MATERIALIZE_OUTPUT", "publish failure could not inspect output", "outputRoot", { cause: inspectionError });
-        }
+      const result = await inspectPublishedOutput(output, tempIdentity);
+      if (result.owned) {
+        nativePublished = true;
+        fail(
+          "BUNDLE_MATERIALIZE_PUBLISH",
+          "native publish completed without a valid success result",
+          "outputRoot",
+          { cause: error },
+        );
       }
-      fail("BUNDLE_MATERIALIZE_PUBLISH", "namespace-atomic publish failed", "outputRoot", { cause: error });
+      if (result.exists) {
+        fail("BUNDLE_MATERIALIZE_OUTPUT_EXISTS", "output path appeared before publish", "outputRoot", { cause: error });
+      }
+      fail("BUNDLE_MATERIALIZE_PUBLISH", "native no-replace publish failed", "outputRoot", { cause: error });
     }
+    nativePublished = true;
+    const publishResult = await inspectPublishedOutput(output, tempIdentity);
+    if (!publishResult.owned) {
+      fail(
+        "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
+        "published output identity differs from the temporary bundle",
+        "outputRoot",
+      );
+    }
+    await runCheckpoint(hooks, "afterNativePublishBeforeValidation", {
+      output,
+      parent,
+      tempRoot,
+    });
+    const postCheckpointPublishResult = await inspectPublishedOutput(
+      output,
+      tempIdentity,
+    );
+    if (!postCheckpointPublishResult.owned) {
+      fail(
+        "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
+        "published output identity changed before final validation",
+        "outputRoot",
+      );
+    }
+    await assertParentIdentity(parent, parentStat, resolvedParent);
+    await assertRecordedTargetParentIdentities(
+      output,
+      directoryIdentities,
+      { rootWasMoved: true },
+    );
+    try {
+      await lstat(tempRoot);
+      fail(
+        "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
+        "temporary bundle name remained after publish",
+        "outputRoot",
+      );
+    } catch (error) {
+      if (error instanceof CandidateInputMaterializeError) throw error;
+      if (error?.code !== "ENOENT") {
+        fail(
+          "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
+          "temporary bundle absence cannot be verified",
+          "outputRoot",
+          { cause: error },
+        );
+      }
+    }
+    await validateHarness(output);
+    const validation = await validateCandidateArtifactInputBundle(output, {
+      expectedContractSha256,
+    });
+    await assertParentIdentity(parent, parentStat, resolvedParent);
+    const finalPublishResult = await inspectPublishedOutput(output, tempIdentity);
+    if (!finalPublishResult.owned) {
+      fail(
+        "BUNDLE_MATERIALIZE_PUBLISH_VERIFY",
+        "published output identity changed after final validation",
+        "outputRoot",
+      );
+    }
+    await assertRecordedTargetParentIdentities(
+      output,
+      directoryIdentities,
+      { rootWasMoved: true },
+    );
     published = true;
     return { ...validation, bundleRoot: output };
   } catch (error) {
     failure = error;
     throw error;
   } finally {
-    if (!published) {
-      const cleaned = await cleanupOwnedTemp(tempRoot, tempIdentity);
-      if (!cleaned) {
+    if (!published && !nativePublished) {
+      let cleanupHookFailed = false;
+      try {
+        await runCheckpoint(hooks, "beforeCleanup", {
+          failure,
+          tempRoot,
+        });
+      } catch {
+        cleanupHookFailed = true;
+      }
+      const cleanup = cleanupHookFailed
+        ? {
+            completed: false,
+            reason: "cleanup checkpoint failed before identity verification",
+          }
+        : tempIdentity === null
+          ? {
+              completed: false,
+              reason: "temporary bundle identity snapshot was not established",
+            }
+          : await cleanupOwnedTemp(
+              tempRoot,
+              tempIdentity,
+              directoryIdentities,
+              hooks,
+            );
+      if (!cleanup.completed) {
         if (failure !== null && typeof failure === "object") {
           failure.cleanupCompleted = false;
           failure.cleanupPath = tempRoot;
+          failure.cleanupReason = cleanup.reason;
         } else {
           fail(
             "BUNDLE_MATERIALIZE_CLEANUP",
-            "temporary bundle identity could not be proven for cleanup",
+            cleanup.reason,
             tempRoot,
           );
         }
       }
     }
   }
+}
+
+export async function materializeSherpaCandidateInputBundle(input) {
+  return materializeSherpaCandidateInputBundleCore(
+    input,
+    PRODUCTION_MATERIALIZER_DEPENDENCIES,
+  );
+}
+
+export async function __materializeSherpaCandidateInputBundleForTest(
+  input,
+  { hooks = PRODUCTION_HOOKS, publishDirectory = publishWindowsDirectoryNoReplace } = {},
+) {
+  return materializeSherpaCandidateInputBundleCore(input, {
+    hooks,
+    publishDirectory,
+  });
+}
+
+export function __assertUsableIdentityForTest(stat) {
+  assertUsableIdentity(
+    stat,
+    "BUNDLE_MATERIALIZE_IDENTITY_UNAVAILABLE",
+    "filesystem identity is unavailable",
+    "identity",
+  );
 }
