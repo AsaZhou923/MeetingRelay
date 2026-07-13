@@ -1070,23 +1070,63 @@ async function assertReservedOutput(outputPath, openedStatus) {
   }
 }
 
-async function cleanupReservedOutput(outputPath, openedStatus) {
-  try {
-    await assertSafeOutputPath(outputPath);
-    await assertReservedOutput(outputPath, openedStatus);
-    await unlink(outputPath);
-  } catch {
-    // Never follow a changed path merely to clean up a failed collection.
+async function runCheckpoint(hooks, name, context) {
+  const hook = hooks[name];
+  if (hook !== undefined) {
+    await hook(Object.freeze({ ...context }));
   }
 }
 
-export async function runHwRefCollectorCli({
-  argv = process.argv.slice(2),
-  collectRawFacts = collectWindowsRawFacts,
-  digestSource = () => sha256File(collectorSourcePath),
-  now = () => new Date(),
-  stdout = process.stdout,
-} = {}) {
+async function cleanupReservedOutput(outputPath, openedStatus, hooks) {
+  try {
+    await assertSafeOutputPath(outputPath);
+    await assertReservedOutput(outputPath, openedStatus);
+    await runCheckpoint(hooks, "beforeFailureUnlink", { outputPath });
+    await assertSafeOutputPath(outputPath);
+    await assertReservedOutput(outputPath, openedStatus);
+    await unlink(outputPath);
+  } catch (error) {
+    if (error instanceof HwRefCollectorError) {
+      throw error;
+    }
+    fail(
+      "HW_REF_OUTPUT_CLEANUP",
+      "failed collector output could not be safely removed",
+    );
+  }
+}
+
+const PRODUCTION_HOOKS = Object.freeze({});
+
+async function writeOutput(outputHandle, bytes) {
+  await outputHandle.writeFile(bytes, { encoding: "utf8" });
+}
+
+async function syncOutput(outputHandle) {
+  await outputHandle.sync();
+}
+
+async function closeOutput(outputHandle) {
+  await outputHandle.close();
+}
+
+const PRODUCTION_CLI_DEPENDENCIES = Object.freeze({
+  closeOutput,
+  hooks: PRODUCTION_HOOKS,
+  syncOutput,
+  writeOutput,
+});
+
+async function runHwRefCollectorCliCore(
+  {
+    argv = process.argv.slice(2),
+    collectRawFacts = collectWindowsRawFacts,
+    digestSource = () => sha256File(collectorSourcePath),
+    now = () => new Date(),
+    stdout = process.stdout,
+  } = {},
+  { closeOutput, hooks, syncOutput, writeOutput },
+) {
   const parsed = parseArgs(argv);
   const outputPath = await assertSafeOutputPath(parsed.outputPath);
   let outputHandle;
@@ -1134,25 +1174,55 @@ export async function runHwRefCollectorCli({
       fail("HW_REF_OUTPUT_REPARSE", "collector output path changed during collection");
     }
     await assertReservedOutput(outputPath, openedStatus);
-    await outputHandle.writeFile(encodeCollectedHardwareReference(hardwareReference), {
-      encoding: "utf8",
-    });
-    await outputHandle.sync();
-    await outputHandle.close();
+    await writeOutput(
+      outputHandle,
+      encodeCollectedHardwareReference(hardwareReference),
+    );
+    await syncOutput(outputHandle);
+    await closeOutput(outputHandle);
     outputHandle = undefined;
     persisted = true;
     const summary = validateCollectedHardwareReference(hardwareReference);
     stdout.write(encodeCanonicalJsonLine(summary));
     return summary;
   } catch (error) {
+    let cleanupError;
+    if (!persisted) {
+      try {
+        await cleanupReservedOutput(outputPath, openedStatus, hooks);
+      } catch (failure) {
+        cleanupError = failure;
+      }
+    }
     if (outputHandle) {
       await outputHandle.close().catch(() => {});
     }
-    if (!persisted) {
-      await cleanupReservedOutput(outputPath, openedStatus);
+    if (cleanupError) {
+      throw cleanupError;
     }
     throw error;
   }
+}
+
+export async function runHwRefCollectorCli(input = undefined) {
+  return runHwRefCollectorCliCore(input, PRODUCTION_CLI_DEPENDENCIES);
+}
+
+export async function __runHwRefCollectorCliForTest(
+  input,
+  {
+    closeOutput = PRODUCTION_CLI_DEPENDENCIES.closeOutput,
+    hooks = PRODUCTION_HOOKS,
+    syncOutput = PRODUCTION_CLI_DEPENDENCIES.syncOutput,
+    writeOutput = PRODUCTION_CLI_DEPENDENCIES.writeOutput,
+  } = {},
+) {
+  return runHwRefCollectorCliCore(input, {
+    closeOutput,
+    hooks,
+    syncOutput,
+    writeOutput,
+  });
 }
 
 const isMain =

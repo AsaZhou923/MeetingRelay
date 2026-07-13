@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f3a2a are Done/Passed; f3a1 source `122b1d930188fcc773d1086a0f7c4a5c63adb7e4` supplies the deterministic 28-material/26-entry sealed bundle plan without granting trust, and f3a2a source `2e02db4a6721fd3dc85c68f044e3080adc38c56c` supplies the externally pinned Windows materializer core. WP-0.4.3f3a2b hardens that core with a native destination no-replace publish operation, deterministic hostile-writer checkpoints, identity-swap rejection, and conservative cleanup reporting. These slices do not execute the candidate/model, capture measured hardware or evidence, claim quality/performance, rank or select a candidate, approve distribution, or grant production authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
+MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f3a2b are Done/Passed; f3a1 source `122b1d930188fcc773d1086a0f7c4a5c63adb7e4` supplies the deterministic 28-material/26-entry sealed bundle plan without granting trust, f3a2a source `2e02db4a6721fd3dc85c68f044e3080adc38c56c` supplies the externally pinned Windows materializer core, and f3a2b source `95e91317142b1475f6d79eec13851ab95f9f70ff` hardens that core with a native destination no-replace publish operation, deterministic hostile-writer checkpoints, identity-swap rejection, and conservative cleanup reporting. The f3b foundation adds measured-HW input closeout without executing the candidate/model or creating evidence. These slices do not claim quality/performance, rank or select a candidate, approve distribution, or grant production authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
 
 ## Prerequisites
 
@@ -29,6 +29,7 @@ pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:sherpa-candidate-bundle-plan:test
+pnpm phase0:sherpa-candidate-measured-closeout:test
 pnpm phase0:sherpa-candidate-materializer:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
@@ -60,6 +61,7 @@ pnpm phase0:sherpa-assets:test
 pnpm phase0:sherpa-assets:validate
 pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:sherpa-candidate-bundle-plan:test
+pnpm phase0:sherpa-candidate-measured-closeout:test
 pnpm phase0:sherpa-candidate-materializer:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
@@ -97,6 +99,12 @@ The candidate-input materializer requires a non-zero contract digest supplied in
 
 The materializer rejects UNC/network-share path syntax and requires actual local-filesystem roots. Source files are streamed from opened handles, hashed during the write, and checked against both the opened handle and current path. Generated target parents are direct-path checked and identity-recorded when created; the output parent, owned temporary root, and recorded target parents are rechecked around two pre-publish input validations. After the native move, the destination identity and contents are validated again before `input-valid` can be returned. Deterministic test-only checkpoints cover source-before-open, source-post-read, parent, nested-parent, temporary-root, post-validation content, destination-competitor, post-move content, and cleanup identity swaps. Cleanup performs two identity passes and refuses recursive removal when either pass is uncertain, reporting `cleanupCompleted=false`. These protections are fail-closed path revalidations, not a handle-bound transaction: a final path-reopen window remains after every last check, including the last cleanup check before recursive removal. Publication is not crash-durable, cross-volume, cross-platform, or a transaction against an administrator able to mutate process/runtime state.
 
+The f3b measured closeout boundary reads only a canonical collector output below the ignored `target/` tree (the documented location is `target/wp-0.4/hw-ref/`) and pins the repository collector source by path, version, SHA-256, byte size, and copied material. Its schema `1.1` plan contains exactly 29 materials and 27 sealed entries: 18 copied sources and 11 generated documents. The measured HW document replaces the fixture HW in the run contract, while the run plan joins its `hw_ref_id`, cooling mode, and power plan. Materialization still requires a non-zero `expectedContractSha256` supplied separately from the proposed plan and can return only `input-valid` / `input-only` with `formalClaims=none` and `productionEvidence=false`.
+
+The closeout surface is the programmatic `proposeMeasuredSherpaCandidateInputCloseout` and `materializeMeasuredSherpaCandidateInputCloseout` API. It deliberately does not define a shell CLI or a serialized `Buffer` plan format; the measured-HW collector CLI captures the canonical source document, while trusted application code retains the typed plan and supplies the separately approved contract digest.
+
+The collector digest binds the document's declared collector source identity and format source; it is not cryptographic attestation that the collector ran, nor evidence that a model or benchmark ran. A real f3b closeout still requires the operator to provide all nine observed fields explicitly: ambient temperature, audio device model, audio logical role, cooling mode, GPU device model, GPU VRAM bytes, power source, storage medium, and storage volume. Synthetic CI fixtures test the plumbing only and cannot close the real measured-HW work package or create execution, quality, performance, eligibility, ranking, selection, default, or production authority.
+
 The same validator accepts structurally complete native, sidecar, and fallback candidate-run bundles, measured `HW-REF` records, multiple assets/licenses, and completed raw evidence. Those bundles must be validated with an independently pinned input-contract digest:
 
 ```powershell
@@ -130,6 +138,8 @@ node tools/phase0-harness/hw-ref-collector.mjs `
 Only the canonical built-in base aliases `balanced`, `high-performance`, `ultimate-performance`, and `power-saver` are accepted; custom base schemes fail closed. `power.plan` is stored as `<base-alias>@<sha256>`. The digest uses length-framed canonical LF/NFC text from both an explicit base-scheme `powercfg /Q <guid>` query and the effective no-argument `powercfg /Q` query, so overlays and modified built-in settings change the identity without exposing a GUID or friendly name. Active GUID plus both query surfaces are read before/after and any drift aborts capture. The f1 document itself remains unsealed/unjoined; a later slice must bind this exact value into the same-condition run contract.
 
 The runnable collector is one self-contained source file: its streaming SHA-256 covers argument policy, canonical encoding, privacy/semantic validation, embedded PowerShell collection, and the CLI itself. The CLI emits canonical NFC JSON, refuses output outside `target/`, reserves the output with an exclusive `wx` handle before collection, rejects reparse-point ancestors, and never overwrites an existing file. Its stdout summary is `validationPhase=collector-only` and `sealed=false`; those fields are deliberately not inserted into the exact HW-REF schema. The HW-REF document is measured/captured with claims fixed to none, but it remains unsealed and unjoined. This command does not build a candidate-input bundle, execute a candidate or model, create run evidence, or support quality, performance, eligibility, ranking, default, publishability, hardware-recommendation, PERF, SLO, or product claims. A plumbing smoke that uses synthetic operator annotations must not persist a HW-REF document and is not measured evidence.
+
+On a failed write, the collector keeps its reservation handle open while it performs two direct-path and file-identity checks before removing its own partial output. The final identity-check-to-`unlink` interval is still a path-based race window: cleanup is not a handle-bound delete and does not claim safety against any concurrent namespace writer able to replace that path during the interval. If identity or cleanup cannot be established, the command fails without reporting the output as persisted.
 
 The provider harness performs two clean, byte-identical virtual-clock runs under ignored `target/wp-0.3/provider-harness/`. Version 1.0 intentionally accepts only the committed empty fault plan; any non-empty or unknown fault step fails before the first emission. Logical offsets are ordering inputs, not latency observations or performance evidence.
 

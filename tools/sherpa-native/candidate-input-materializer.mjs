@@ -13,16 +13,24 @@ import { encodeCanonicalJson } from "../phase0-harness/canonical-json.mjs";
 import {
   validateArtifactPath,
   validateCandidateArtifactInputBundle,
+  validateCollectorOnlyMeasuredHardwareReference,
 } from "../phase0-harness/candidate-artifact-contract.mjs";
 import { publishWindowsDirectoryNoReplace } from "./windows-directory-publisher.mjs";
 
 const PLAN_KIND = "meetingrelay-sherpa-candidate-input-bundle-plan-v1";
-const PLAN_SCHEMA_VERSION = "1.0";
+const PLAN_PROFILES = Object.freeze({
+  "1.0": Object.freeze({ copies: 17, documents: 11, entries: 26, materials: 28 }),
+  "1.1": Object.freeze({ copies: 18, documents: 11, entries: 27, materials: 29 }),
+});
 const CONTRACT_MANIFEST_PATH = "contract-manifest.json";
 const CONTRACT_SEAL_PATH = "contract-manifest.sha256";
 const CANDIDATE_MANIFEST_PATH = "manifests/candidate-manifest.json";
+const HW_REF_PATH = "manifests/hw-ref.json";
 const RUN_PLAN_PATH = "manifests/run-plan.json";
 const HARNESS_PLAN_PATH = "assets/input-only-harness-plan.json";
+const HW_REF_COLLECTOR_ASSET_PATH = "assets/hw-ref-collector.mjs";
+const HW_REF_COLLECTOR_SOURCE_PATH =
+  "tools/phase0-harness/hw-ref-collector.mjs";
 const DIGEST = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 const PROJECT_COMMIT_URL_PREFIX =
@@ -131,12 +139,25 @@ function validatePlan(plan) {
     ["kind", "materials", "proposedContractSha256", "schema_version"],
     "plan",
   );
-  if (plan.kind !== PLAN_KIND || plan.schema_version !== PLAN_SCHEMA_VERSION) {
+  const schemaVersion = plan.schema_version;
+  if (
+    plan.kind !== PLAN_KIND ||
+    typeof schemaVersion !== "string" ||
+    !Object.hasOwn(PLAN_PROFILES, schemaVersion)
+  ) {
     fail("BUNDLE_MATERIALIZE_PLAN", "bundle plan identity differs", "plan");
   }
+  const profile = PLAN_PROFILES[schemaVersion];
   assertDigest(plan.proposedContractSha256, "plan.proposedContractSha256");
-  if (!Array.isArray(plan.materials) || plan.materials.length !== 28) {
-    fail("BUNDLE_MATERIALIZE_PLAN", "bundle plan must contain exactly 28 materials", "plan.materials");
+  if (
+    !Array.isArray(plan.materials) ||
+    plan.materials.length !== profile.materials
+  ) {
+    fail(
+      "BUNDLE_MATERIALIZE_PLAN",
+      `bundle plan schema ${schemaVersion} must contain exactly ${profile.materials} materials`,
+      "plan.materials",
+    );
   }
 
   const byPath = new Map();
@@ -183,8 +204,12 @@ function validatePlan(plan) {
     validatedMaterials.push(validated);
     previous = material.target_path;
   }
-  if (copies !== 17 || documents !== 11) {
-    fail("BUNDLE_MATERIALIZE_PLAN", "bundle plan must contain 17 copies and 11 documents", "plan.materials");
+  if (copies !== profile.copies || documents !== profile.documents) {
+    fail(
+      "BUNDLE_MATERIALIZE_PLAN",
+      `bundle plan schema ${schemaVersion} must contain ${profile.copies} copies and ${profile.documents} documents`,
+      "plan.materials",
+    );
   }
 
   for (const [targetPath, material] of byPath) {
@@ -210,7 +235,7 @@ function validatePlan(plan) {
     contract.schema_version !== "1.0" ||
     contract.formal_claims !== "none" ||
     !Array.isArray(contract.entries) ||
-    contract.entries.length !== 26
+    contract.entries.length !== profile.entries
   ) {
     fail("BUNDLE_MATERIALIZE_PLAN", "contract manifest identity or inventory differs", CONTRACT_MANIFEST_PATH);
   }
@@ -243,11 +268,16 @@ function validatePlan(plan) {
     fail("BUNDLE_MATERIALIZE_PLAN", "proposed contract digest or seal differs", "plan.proposedContractSha256");
   }
   const candidateMaterial = byPath.get(CANDIDATE_MANIFEST_PATH);
+  const hardwareMaterial = byPath.get(HW_REF_PATH);
   const runPlanMaterial = byPath.get(RUN_PLAN_PATH);
-  if (candidateMaterial?.kind !== "document" || runPlanMaterial?.kind !== "document") {
+  if (
+    candidateMaterial?.kind !== "document" ||
+    hardwareMaterial?.kind !== "document" ||
+    runPlanMaterial?.kind !== "document"
+  ) {
     fail(
       "BUNDLE_MATERIALIZE_PLAN",
-      "candidate manifest and run plan documents are required",
+      "candidate, measured-HW, and run plan documents are required",
     );
   }
   const candidate = parseCanonicalDocument(candidateMaterial, CANDIDATE_MANIFEST_PATH);
@@ -271,6 +301,43 @@ function validatePlan(plan) {
       "run plan source commit differs from the candidate revision",
       "runPlan.source_commit",
     );
+  }
+  const hardware = parseCanonicalDocument(hardwareMaterial, HW_REF_PATH);
+  const collectorMaterial = byPath.get(HW_REF_COLLECTOR_ASSET_PATH);
+  if (schemaVersion === "1.0") {
+    if (
+      collectorMaterial !== undefined ||
+      hardware.capture_scope !== "contract-fixture" ||
+      hardware.measurement_status !== "not-measured"
+    ) {
+      fail(
+        "BUNDLE_MATERIALIZE_PLAN",
+        "legacy plans must retain fixture-only HW without the measured collector source",
+        HW_REF_PATH,
+      );
+    }
+  } else if (
+    collectorMaterial?.kind !== "copy" ||
+    collectorMaterial.source_root !== "repository" ||
+    collectorMaterial.source_relative_path !== HW_REF_COLLECTOR_SOURCE_PATH ||
+    hardware.capture_scope !== "measured" ||
+    hardware.measurement_status !== "captured" ||
+    hardware.collector?.path !== HW_REF_COLLECTOR_ASSET_PATH ||
+    hardware.collector?.sha256 !== collectorMaterial.sha256 ||
+    runPlan.hw_ref_id !== hardware.hw_ref_id ||
+    runPlan.same_condition_contract?.cooling_mode !==
+      hardware.environment?.cooling?.mode ||
+    runPlan.same_condition_contract?.power_plan !==
+      hardware.environment?.power?.plan
+  ) {
+    fail(
+      "BUNDLE_MATERIALIZE_PLAN",
+      "measured plan HW, collector source, and run-plan joins differ",
+      HW_REF_PATH,
+    );
+  }
+  if (schemaVersion === "1.1") {
+    validateCollectorOnlyMeasuredHardwareReference(hardware);
   }
   return validatedMaterials;
 }

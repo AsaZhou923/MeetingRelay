@@ -4,6 +4,7 @@ import { encodeCanonicalJson } from "../phase0-harness/canonical-json.mjs";
 import {
   HW_REF_ID,
   validateArtifactPath,
+  validateCollectorOnlyMeasuredHardwareReference,
   validatePlannedCandidateManifest,
 } from "../phase0-harness/candidate-artifact-contract.mjs";
 
@@ -20,6 +21,9 @@ const RUN_PLAN_PATH = "manifests/run-plan.json";
 const HARNESS_PLAN_PATH = "assets/input-only-harness-plan.json";
 const VAD_ENDPOINT_PLAN_PATH = "assets/vad-endpoint-plan.json";
 const WARMUP_PLAN_PATH = "assets/warmup-plan.json";
+const HW_REF_COLLECTOR_ASSET_PATH = "assets/hw-ref-collector.mjs";
+const HW_REF_COLLECTOR_SOURCE_PATH =
+  "tools/phase0-harness/hw-ref-collector.mjs";
 const MAX_U64 = (1n << 64n) - 1n;
 const DIGEST = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
@@ -339,6 +343,20 @@ function validateFixtureProjection(projection) {
     }
   }
   return { fixtures, manifestSha256: projection.manifestSha256 };
+}
+
+function validateMeasuredSourceDescriptor(source, field) {
+  exactKeys(source, ["path", "sha256", "size_bytes"], field);
+  if (
+    typeof source.path !== "string" ||
+    source.path.length === 0 ||
+    source.path.includes("\0")
+  ) {
+    fail("BUNDLE_PLAN_VALUE", "measured source path differs", `${field}.path`);
+  }
+  digest(source.sha256, `${field}.sha256`);
+  canonicalU64(source.size_bytes, `${field}.size_bytes`);
+  return { ...source };
 }
 
 function claims() {
@@ -665,7 +683,169 @@ export function buildSherpaCandidateInputBundlePlan(input) {
   });
 }
 
+/**
+ * Derives the measured-HW variant of the sealed candidate-input plan. The
+ * caller remains responsible for reading both source files and supplying
+ * their independently calculated identities; this pure function grants no
+ * filesystem or trust authority.
+ */
+export function buildMeasuredSherpaCandidateInputBundlePlan(input) {
+  exactKeys(
+    input,
+    [
+      "candidatePlan",
+      "collectorSource",
+      "fixtureRegistryProjection",
+      "measuredHardwareReference",
+      "measuredHardwareReferenceSource",
+    ],
+    "input",
+  );
+  const collectorSource = validateMeasuredSourceDescriptor(
+    input.collectorSource,
+    "collectorSource",
+  );
+  if (collectorSource.path !== HW_REF_COLLECTOR_SOURCE_PATH) {
+    fail(
+      "BUNDLE_PLAN_JOIN",
+      "collector source must be the repository-owned measured HW collector",
+      "collectorSource.path",
+    );
+  }
+  validateArtifactPath(collectorSource.path, "collectorSource.path");
+  const measuredHardwareReferenceSource = validateMeasuredSourceDescriptor(
+    input.measuredHardwareReferenceSource,
+    "measuredHardwareReferenceSource",
+  );
+  validateCollectorOnlyMeasuredHardwareReference(
+    input.measuredHardwareReference,
+  );
+  const hardwareMaterial = canonicalJsonMaterial(
+    HW_REF_PATH,
+    input.measuredHardwareReference,
+  );
+  if (
+    measuredHardwareReferenceSource.sha256 !== hardwareMaterial.sha256 ||
+    measuredHardwareReferenceSource.size_bytes !== hardwareMaterial.size_bytes
+  ) {
+    fail(
+      "BUNDLE_PLAN_JOIN",
+      "measured HW source identity differs from its canonical document bytes",
+      "measuredHardwareReferenceSource",
+    );
+  }
+  if (
+    input.measuredHardwareReference.collector.path !==
+      HW_REF_COLLECTOR_ASSET_PATH ||
+    input.measuredHardwareReference.collector.sha256 !== collectorSource.sha256
+  ) {
+    fail(
+      "BUNDLE_PLAN_JOIN",
+      "measured HW collector identity differs from the repository source copy",
+      "measuredHardwareReference.collector",
+    );
+  }
+
+  const legacyPlan = buildSherpaCandidateInputBundlePlan({
+    candidatePlan: input.candidatePlan,
+    fixtureRegistryProjection: input.fixtureRegistryProjection,
+  });
+  const legacyContractMaterial = legacyPlan.materials.find(
+    (material) => material.target_path === CONTRACT_MANIFEST_PATH,
+  );
+  const legacyRunPlanMaterial = legacyPlan.materials.find(
+    (material) => material.target_path === RUN_PLAN_PATH,
+  );
+  const legacyContract = parseCanonicalDocument(
+    legacyContractMaterial,
+    CONTRACT_MANIFEST_PATH,
+  ).value;
+  const runPlan = parseCanonicalDocument(
+    legacyRunPlanMaterial,
+    RUN_PLAN_PATH,
+  ).value;
+  runPlan.hw_ref_id = input.measuredHardwareReference.hw_ref_id;
+  runPlan.same_condition_contract.cooling_mode =
+    input.measuredHardwareReference.environment.cooling.mode;
+  runPlan.same_condition_contract.power_plan =
+    input.measuredHardwareReference.environment.power.plan;
+  const runPlanMaterial = canonicalJsonMaterial(RUN_PLAN_PATH, runPlan);
+  const collectorMaterial = {
+    kind: "copy",
+    sha256: collectorSource.sha256,
+    size_bytes: collectorSource.size_bytes,
+    source_relative_path: HW_REF_COLLECTOR_SOURCE_PATH,
+    source_root: "repository",
+    target_path: HW_REF_COLLECTOR_ASSET_PATH,
+  };
+  const contractInputs = [
+    ...legacyPlan.materials.filter(
+      (material) =>
+        ![
+          CONTRACT_MANIFEST_PATH,
+          CONTRACT_SEAL_PATH,
+          HW_REF_PATH,
+          RUN_PLAN_PATH,
+        ].includes(material.target_path),
+    ),
+    collectorMaterial,
+    hardwareMaterial,
+    runPlanMaterial,
+  ].sort((left, right) => compareStrings(left.target_path, right.target_path));
+  if (
+    contractInputs.length !== 27 ||
+    contractInputs.filter((material) => material.kind === "copy").length !== 18 ||
+    contractInputs.filter((material) => material.kind === "document").length !== 9 ||
+    new Set(contractInputs.map((material) => material.target_path)).size !== 27
+  ) {
+    fail(
+      "BUNDLE_PLAN_COUNT",
+      "measured sealed input inventory must be 27 unique entries",
+      "materials",
+    );
+  }
+  const contract = {
+    contract_id: legacyContract.contract_id,
+    entries: contractInputs.map((material) => ({
+      path: material.target_path,
+      sha256: material.sha256,
+      size_bytes: material.size_bytes,
+    })),
+    formal_claims: "none",
+    schema_version: "1.0",
+  };
+  const contractMaterial = canonicalJsonMaterial(CONTRACT_MANIFEST_PATH, contract);
+  const proposedContractSha256 = contractMaterial.sha256;
+  const sealMaterial = documentMaterial(
+    CONTRACT_SEAL_PATH,
+    Buffer.from(`${proposedContractSha256}  ${CONTRACT_MANIFEST_PATH}\n`, "ascii"),
+  );
+  const materials = [...contractInputs, contractMaterial, sealMaterial].sort(
+    (left, right) => compareStrings(left.target_path, right.target_path),
+  );
+  if (
+    materials.length !== 29 ||
+    materials.filter((material) => material.kind === "copy").length !== 18 ||
+    materials.filter((material) => material.kind === "document").length !== 11 ||
+    new Set(materials.map((material) => material.target_path)).size !== 29
+  ) {
+    fail(
+      "BUNDLE_PLAN_COUNT",
+      "measured bundle plan must contain 29 unique materials",
+      "materials",
+    );
+  }
+  return freezePlan({
+    kind: PLAN_KIND,
+    materials,
+    proposedContractSha256,
+    schema_version: "1.1",
+  });
+}
+
 export const candidateInputBundlePlanPaths = Object.freeze({
+  collectorAsset: HW_REF_COLLECTOR_ASSET_PATH,
+  collectorSource: HW_REF_COLLECTOR_SOURCE_PATH,
   contractManifest: CONTRACT_MANIFEST_PATH,
   contractSeal: CONTRACT_SEAL_PATH,
   wrappers: WRAPPER_PATHS,

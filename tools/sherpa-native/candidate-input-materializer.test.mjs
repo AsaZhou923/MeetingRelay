@@ -27,7 +27,15 @@ import {
   fixturePaths,
   validateFixtureTree,
 } from "../phase0-harness/fixture-contract.mjs";
-import { buildSherpaCandidateInputBundlePlan } from "./candidate-input-bundle-plan.mjs";
+import {
+  buildMeasuredHardwareReference,
+  HW_REF_COLLECTOR_VERSION,
+  WINDOWS_COLLECTOR_ASSET_PATH,
+} from "../phase0-harness/hw-ref-collector.mjs";
+import {
+  buildMeasuredSherpaCandidateInputBundlePlan,
+  buildSherpaCandidateInputBundlePlan,
+} from "./candidate-input-bundle-plan.mjs";
 import {
   CandidateInputMaterializeError,
   __assertUsableIdentityForTest,
@@ -52,6 +60,7 @@ const SOURCE_ROOT_NAMES = [
   "sherpa-runtime-extraction",
 ];
 let basePlanPromise;
+let baseMeasuredPlanPromise;
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -84,7 +93,56 @@ function runBuilder() {
   return Buffer.from(result.stdout);
 }
 
-async function buildRealPlan() {
+function syntheticRawFacts() {
+  return {
+    audio_devices: [{
+      driver_version: "10.0.26100.1",
+      logical_role: "synthetic-test-audio-path",
+      model: "Synthetic Test Audio",
+      signature_status: "signed",
+      vendor: "SyntheticTestVendor",
+    }],
+    background_process_allowlist: [],
+    bios: {
+      release_date: "2026-01-01",
+      vendor: "SyntheticTestVendor",
+      version: "1.0.0-test",
+    },
+    cooling: { ambient_celsius: "23.5", mode: "synthetic-test-active" },
+    cpu: {
+      logical_processor_count: "16",
+      model: "Synthetic Test CPU",
+      physical_core_count: "8",
+      vendor: "SyntheticTestVendor",
+    },
+    gpus: [{
+      driver_version: "32.0.15.7283",
+      execution_providers: [],
+      model: "Synthetic Test GPU",
+      vendor: "SyntheticTestVendor",
+      vram_bytes: "8589934592",
+    }],
+    memory: { total_bytes: "34359738368" },
+    operating_system: {
+      architecture: "x64",
+      build: "26100",
+      product: "Windows 11 Pro Synthetic Test",
+      ubr: "4652",
+      version: "24H2-test",
+    },
+    power: { plan: `balanced@${"a".repeat(64)}`, source: "ac" },
+    storage: [{
+      capacity_bytes: "1000202273280",
+      driver_version: "10.0.26100.1",
+      filesystem: "NTFS",
+      medium: "ssd",
+      model: "Synthetic Test Storage",
+      vendor: "SyntheticTestVendor",
+    }],
+  };
+}
+
+async function buildRealPlan({ measured = false } = {}) {
   const [
     assetsLockBytes,
     cargoLockBytes,
@@ -143,12 +201,47 @@ async function buildRealPlan() {
     pcmSha256: fixture.audio.pcm_sha256,
     referenceSha256: fixture.reference.sha256,
   }));
-  return buildSherpaCandidateInputBundlePlan({
+  const planInput = {
     candidatePlan,
     fixtureRegistryProjection: {
       ...fixtures[0],
       fixtures,
       manifestSha256: validatedFixture.manifestDigest,
+    },
+  };
+  if (!measured) {
+    return buildSherpaCandidateInputBundlePlan(planInput);
+  }
+  const collectorBytes = await readFile(
+    path.join(REPO_ROOT, "tools", "phase0-harness", "hw-ref-collector.mjs"),
+  );
+  const collectorSha256 = sha256(collectorBytes);
+  const measuredHardwareReference = buildMeasuredHardwareReference({
+    capturedAt: "2026-07-13T01:02:03.456Z",
+    collector: {
+      path: WINDOWS_COLLECTOR_ASSET_PATH,
+      sha256: collectorSha256,
+      version: HW_REF_COLLECTOR_VERSION,
+    },
+    hwRefId: "hw-ref-synthetic-test-only-001",
+    rawFacts: syntheticRawFacts(),
+  });
+  const hardwareBytes = Buffer.from(
+    encodeCanonicalJson(measuredHardwareReference),
+    "utf8",
+  );
+  return buildMeasuredSherpaCandidateInputBundlePlan({
+    ...planInput,
+    collectorSource: {
+      path: "tools/phase0-harness/hw-ref-collector.mjs",
+      sha256: collectorSha256,
+      size_bytes: String(collectorBytes.length),
+    },
+    measuredHardwareReference,
+    measuredHardwareReferenceSource: {
+      path: "target/synthetic-test-only/hw-ref.json",
+      sha256: sha256(hardwareBytes),
+      size_bytes: String(hardwareBytes.length),
     },
   });
 }
@@ -210,7 +303,7 @@ function rebuildContract(plan) {
   seal.size_bytes = String(seal.bytes.length);
 }
 
-async function makeFixture() {
+async function makeFixture({ measured = false } = {}) {
   const temp = await mkdtemp(
     path.join(os.tmpdir(), "meetingrelay-candidate-materializer-"),
   );
@@ -225,13 +318,19 @@ async function makeFixture() {
     Object.values(sourceRoots).map((root) => mkdir(root, { recursive: true })),
   );
   const plan = clonePlan(
-    await (basePlanPromise ??= buildRealPlan()),
+    measured
+      ? await (baseMeasuredPlanPromise ??= buildRealPlan({ measured: true }))
+      : await (basePlanPromise ??= buildRealPlan()),
   );
 
   for (const entry of plan.materials.filter((value) => value.kind === "copy")) {
     const bytes = entry.target_path === "assets/candidate-schema-registry.json"
       ? await readFile(path.join(HERE, "candidate-schema-registry.json"))
-      : Buffer.from(`fixture bytes for ${entry.target_path}\n`, "utf8");
+      : entry.target_path === "assets/hw-ref-collector.mjs"
+        ? await readFile(
+            path.join(REPO_ROOT, "tools", "phase0-harness", "hw-ref-collector.mjs"),
+          )
+        : Buffer.from(`fixture bytes for ${entry.target_path}\n`, "utf8");
     const target = path.join(
       sourceRoots[entry.source_root],
       ...entry.source_relative_path.split("/"),
@@ -267,7 +366,9 @@ async function makeFixture() {
   setPlanJson(plan, "manifests/candidate-manifest.json", candidate);
 
   const hardware = readPlanJson(plan, "manifests/hw-ref.json");
-  hardware.collector.sha256 = byRole.get("schema-registry").sha256;
+  hardware.collector.sha256 = measured
+    ? material(plan, "assets/hw-ref-collector.mjs").sha256
+    : byRole.get("schema-registry").sha256;
   setPlanJson(plan, "manifests/hw-ref.json", hardware);
 
   const runPlan = readPlanJson(plan, "manifests/run-plan.json");
@@ -289,8 +390,8 @@ async function makeFixture() {
   };
 }
 
-async function withFixture(run) {
-  const fixture = await makeFixture();
+async function withFixture(run, options = {}) {
+  const fixture = await makeFixture(options);
   try {
     return await run(fixture);
   } finally {
@@ -392,6 +493,209 @@ test(
         fixture.plan.materials.map((entry) => entry.target_path),
       );
     });
+  },
+);
+
+test(
+  "materializes measured schema 1.1 through the native publisher with input-only authority",
+  { skip: process.platform !== "win32" },
+  async () => {
+    await withFixture(async (fixture) => {
+      const result = await materializeSherpaCandidateInputBundle(fixture);
+      const hardware = readPlanJson(fixture.plan, "manifests/hw-ref.json");
+      const runPlan = readPlanJson(fixture.plan, "manifests/run-plan.json");
+      const collectorBytes = await readFile(
+        path.join(fixture.outputRoot, "assets", "hw-ref-collector.mjs"),
+      );
+      assert.equal(fixture.plan.schema_version, "1.1");
+      assert.equal(fixture.plan.materials.length, 29);
+      assert.equal(
+        fixture.plan.materials.filter((entry) => entry.kind === "copy").length,
+        18,
+      );
+      assert.equal(result.status, "input-valid");
+      assert.equal(result.validationPhase, "input-only");
+      assert.equal(result.formalClaims, "none");
+      assert.equal(result.productionEvidence, false);
+      assert.equal(runPlan.hw_ref_id, hardware.hw_ref_id);
+      assert.equal(
+        runPlan.same_condition_contract.cooling_mode,
+        hardware.environment.cooling.mode,
+      );
+      assert.equal(
+        runPlan.same_condition_contract.power_plan,
+        hardware.environment.power.plan,
+      );
+      assert.equal(sha256(collectorBytes), hardware.collector.sha256);
+      assert.deepEqual(
+        await listFiles(fixture.outputRoot),
+        fixture.plan.materials.map((entry) => entry.target_path),
+      );
+    }, { measured: true });
+  },
+);
+
+test(
+  "schema 1.0 and 1.1 material counts cannot be relabeled",
+  { skip: process.platform !== "win32" },
+  async (context) => {
+    await context.test("legacy plan relabeled as measured", async () => {
+      await withFixture(async (fixture) => {
+        fixture.plan.schema_version = "1.1";
+        await expectCode(
+          materializeSherpaCandidateInputBundle(fixture),
+          "BUNDLE_MATERIALIZE_PLAN",
+        );
+        assert.deepEqual(await readdir(fixture.publishParent), []);
+      });
+    });
+    await context.test("measured plan relabeled as legacy", async () => {
+      await withFixture(async (fixture) => {
+        fixture.plan.schema_version = "1.0";
+        await expectCode(
+          materializeSherpaCandidateInputBundle(fixture),
+          "BUNDLE_MATERIALIZE_PLAN",
+        );
+        assert.deepEqual(await readdir(fixture.publishParent), []);
+      }, { measured: true });
+    });
+    await context.test("object-coercible measured schema", async () => {
+      await withFixture(async (fixture) => {
+        fixture.plan.schema_version = {
+          toString() {
+            return "1.1";
+          },
+        };
+        await expectCode(
+          materializeSherpaCandidateInputBundle(fixture),
+          "BUNDLE_MATERIALIZE_PLAN",
+        );
+        assert.deepEqual(await readdir(fixture.publishParent), []);
+      }, { measured: true });
+    });
+  },
+);
+
+test(
+  "legacy schema cannot smuggle measured HW through another sealed collector entry",
+  { skip: process.platform !== "win32" },
+  async () => {
+    await withFixture(async (fixture) => {
+      const alternateCollector = material(
+        fixture.plan,
+        "assets/candidate-schema-registry.json",
+      );
+      const hardware = JSON.parse(
+        JSON.stringify(
+          buildMeasuredHardwareReference({
+            capturedAt: "2026-07-13T01:02:03.456Z",
+            collector: {
+              path: WINDOWS_COLLECTOR_ASSET_PATH,
+              sha256: alternateCollector.sha256,
+              version: HW_REF_COLLECTOR_VERSION,
+            },
+            hwRefId: "hw-ref-legacy-smuggling-test-001",
+            rawFacts: syntheticRawFacts(),
+          }),
+        ),
+      );
+      hardware.collector.path = alternateCollector.target_path;
+      setPlanJson(fixture.plan, "manifests/hw-ref.json", hardware);
+      const runPlan = readPlanJson(fixture.plan, "manifests/run-plan.json");
+      runPlan.hw_ref_id = hardware.hw_ref_id;
+      runPlan.same_condition_contract.cooling_mode =
+        hardware.environment.cooling.mode;
+      runPlan.same_condition_contract.power_plan =
+        hardware.environment.power.plan;
+      setPlanJson(fixture.plan, "manifests/run-plan.json", runPlan);
+      rebuildContract(fixture.plan);
+      fixture.expectedContractSha256 = fixture.plan.proposedContractSha256;
+
+      await expectCode(
+        materializeSherpaCandidateInputBundle(fixture),
+        "BUNDLE_MATERIALIZE_PLAN",
+      );
+      assert.deepEqual(await readdir(fixture.publishParent), []);
+    });
+  },
+);
+
+test(
+  "measured HW and collector joins fail closed even after resealing",
+  { skip: process.platform !== "win32" },
+  async () => {
+    await withFixture(async (fixture) => {
+      const hardware = readPlanJson(fixture.plan, "manifests/hw-ref.json");
+      hardware.collector.sha256 = "f".repeat(64);
+      setPlanJson(fixture.plan, "manifests/hw-ref.json", hardware);
+      rebuildContract(fixture.plan);
+      fixture.expectedContractSha256 = fixture.plan.proposedContractSha256;
+      await expectCode(
+        materializeSherpaCandidateInputBundle(fixture),
+        "BUNDLE_MATERIALIZE_PLAN",
+      );
+      assert.deepEqual(await readdir(fixture.publishParent), []);
+    }, { measured: true });
+  },
+);
+
+test(
+  "resealed measured HW overclaims fail before filesystem materialization",
+  { skip: process.platform !== "win32" },
+  async () => {
+    await withFixture(async (fixture) => {
+      const hardware = readPlanJson(fixture.plan, "manifests/hw-ref.json");
+      hardware.claims.production_evidence = true;
+      setPlanJson(fixture.plan, "manifests/hw-ref.json", hardware);
+      rebuildContract(fixture.plan);
+      fixture.expectedContractSha256 = fixture.plan.proposedContractSha256;
+      await expectCode(
+        materializeSherpaCandidateInputBundle(fixture),
+        "ART_CLAIM_UNSUPPORTED",
+      );
+      assert.deepEqual(await readdir(fixture.publishParent), []);
+    }, { measured: true });
+  },
+);
+
+test(
+  "measured collector source tampering is cleaned without publishing",
+  { skip: process.platform !== "win32" },
+  async () => {
+    await withFixture(async (fixture) => {
+      const collectorPath = path.join(
+        fixture.sourceRoots.repository,
+        "tools",
+        "phase0-harness",
+        "hw-ref-collector.mjs",
+      );
+      const bytes = await readFile(collectorPath);
+      bytes[0] ^= 0xff;
+      await writeFile(collectorPath, bytes);
+      await expectCode(
+        materializeSherpaCandidateInputBundle(fixture),
+        "BUNDLE_MATERIALIZE_DIGEST",
+      );
+      await assert.rejects(lstat(fixture.outputRoot), { code: "ENOENT" });
+      await assertNoOwnedTemporaryBundle(fixture);
+    }, { measured: true });
+  },
+);
+
+test(
+  "measured publication preserves an existing destination competitor",
+  { skip: process.platform !== "win32" },
+  async () => {
+    await withFixture(async (fixture) => {
+      const competitor = Buffer.from("measured competitor\n", "utf8");
+      await writeFile(fixture.outputRoot, competitor, { flag: "wx" });
+      await expectCode(
+        materializeSherpaCandidateInputBundle(fixture),
+        "BUNDLE_MATERIALIZE_OUTPUT_EXISTS",
+      );
+      assert.deepEqual(await readFile(fixture.outputRoot), competitor);
+      await assertNoOwnedTemporaryBundle(fixture);
+    }, { measured: true });
   },
 );
 

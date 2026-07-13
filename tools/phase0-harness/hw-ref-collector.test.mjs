@@ -12,6 +12,7 @@ import {
   Wp04ArtifactContractError,
 } from "./candidate-artifact-contract.mjs";
 import {
+  __runHwRefCollectorCliForTest,
   buildMeasuredHardwareReference,
   collectorSourcePath,
   collectWindowsRawFacts,
@@ -133,6 +134,25 @@ function validCliArgs(outputPath) {
     "--storage-volume",
     "E",
   ];
+}
+
+function deterministicCliOptions(outputPath, overrides = {}) {
+  return {
+    argv: validCliArgs(outputPath),
+    async collectRawFacts() {
+      return rawFacts();
+    },
+    digestSource: async () => "a".repeat(64),
+    now: () => new Date("2026-07-12T01:02:03.456Z"),
+    ...overrides,
+  };
+}
+
+function writeThenFail(message) {
+  return async (outputHandle, bytes) => {
+    await outputHandle.writeFile(bytes, { encoding: "utf8" });
+    throw new Error(message);
+  };
 }
 
 function windowsOperatorFacts() {
@@ -1111,6 +1131,119 @@ test("CLI holds its wx reservation and rejects a swapped parent before handle wr
     await assert.rejects(readFile(path.join(replacement, "hw-ref.json")), {
       code: "ENOENT",
     });
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("CLI removes its owned partial output across write, sync, and close failure boundaries", async () => {
+  await mkdir(hwRefCollectorTargetRoot, { recursive: true });
+  const root = await mkdtemp(
+    path.join(hwRefCollectorTargetRoot, "meetingrelay-hw-ref-failure-boundary-"),
+  );
+  const cases = [
+    {
+      name: "partial-write",
+      dependencies: {
+        async writeOutput(outputHandle, bytes) {
+          await outputHandle.writeFile(bytes.slice(0, 17), { encoding: "utf8" });
+          throw new Error("injected partial-write failure");
+        },
+      },
+    },
+    {
+      name: "sync",
+      dependencies: {
+        async syncOutput() {
+          throw new Error("injected sync failure");
+        },
+      },
+    },
+    {
+      name: "close",
+      dependencies: {
+        async closeOutput() {
+          throw new Error("injected close failure");
+        },
+      },
+    },
+  ];
+  try {
+    for (const failureCase of cases) {
+      const outputPath = path.join(root, `${failureCase.name}.json`);
+      let summaryBytes = "";
+      await assert.rejects(
+        __runHwRefCollectorCliForTest(
+          deterministicCliOptions(outputPath, {
+            stdout: {
+              write(bytes) {
+                summaryBytes += bytes;
+              },
+            },
+          }),
+          failureCase.dependencies,
+        ),
+        new RegExp(`injected ${failureCase.name} failure`),
+      );
+      assert.equal(summaryBytes, "");
+      await assert.rejects(readFile(outputPath), { code: "ENOENT" });
+    }
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("CLI reports cleanup failure without treating partial output as persisted", async () => {
+  await mkdir(hwRefCollectorTargetRoot, { recursive: true });
+  const root = await mkdtemp(
+    path.join(hwRefCollectorTargetRoot, "meetingrelay-hw-ref-cleanup-failure-"),
+  );
+  const outputPath = path.join(root, "hw-ref.json");
+  try {
+    await assert.rejects(
+      __runHwRefCollectorCliForTest(
+        deterministicCliOptions(outputPath),
+        {
+          writeOutput: writeThenFail("injected collection failure"),
+          hooks: {
+            beforeFailureUnlink() {
+              throw new Error("injected unlink failure");
+            },
+          },
+        },
+      ),
+      (error) => error?.code === "HW_REF_OUTPUT_CLEANUP",
+    );
+    assert.ok((await readFile(outputPath)).length > 0);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("CLI never unlinks an attacker replacement during failure cleanup", async () => {
+  await mkdir(hwRefCollectorTargetRoot, { recursive: true });
+  const root = await mkdtemp(
+    path.join(hwRefCollectorTargetRoot, "meetingrelay-hw-ref-cleanup-swap-"),
+  );
+  const outputPath = path.join(root, "hw-ref.json");
+  const attackerBytes = Buffer.from("attacker-output-must-survive\n", "utf8");
+  try {
+    await assert.rejects(
+      __runHwRefCollectorCliForTest(
+        deterministicCliOptions(outputPath),
+        {
+          writeOutput: writeThenFail("injected collection failure"),
+          hooks: {
+            async beforeFailureUnlink({ outputPath: reservedPath }) {
+              await rm(reservedPath, { force: true });
+              await writeFile(reservedPath, attackerBytes, { flag: "wx" });
+            },
+          },
+        },
+      ),
+      (error) => error?.code === "HW_REF_OUTPUT_REPARSE",
+    );
+    assert.deepEqual(await readFile(outputPath), attackerBytes);
   } finally {
     await rm(root, { force: true, recursive: true });
   }
