@@ -85,3 +85,61 @@ pnpm phase0:sherpa-candidate-quality-smoke:run `
   $env:MEETINGRELAY_SHERPA_WAV
 pnpm phase0:sherpa-candidate-quality-smoke:validate $evidencePath
 ```
+
+## Measured-HW native contract-stage evidence
+
+`native-candidate-measured-evidence.mjs` joins the measured candidate-input closeout, materialized sealed bundle, external measured-HW reference, locked `zh.wav`, and one actual Release native conformance execution. Its scope is deliberately limited to `native-contract-stage-only`: it records 12/12 conformance checks and exactly one backend execution, while fixing `formal_claims=none` and `production_evidence=false`. Quality, performance, resource use, publishability, ranking, selection/default, the parent candidate closeout, and the full calibration run all remain unassessed or not executed.
+
+The programmatic runner requires three independent trust anchors: `expectedContractSha256`, `expectedHardwareReferenceSha256` plus `expectedHwRefId`, and `expectedOperatorFactsSha256`. The operator-facts digest is supplied externally; the runner does not infer it from the facts it receives. It is SHA-256 over MeetingRelay canonical JSON: recursively key-sorted, NFC-normalized string values, UTF-8 encoded, two-space indented, and terminated by exactly one LF (`\n`). All nine onsite facts are mandatory and must be measured values, never defaults, guesses, synthetic values, or placeholders:
+
+- `ambientCelsius`
+- `audioDeviceModel`
+- `audioLogicalRole`
+- `coolingMode`
+- `gpuDeviceModel`
+- `gpuVramBytes`
+- `powerSource`
+- `storageMedium`
+- `storageVolume`
+
+Use the exported API for a real run. There is intentionally no `--run` CLI because `candidatePlan` carries sealed in-memory material; callers must assemble and retain that typed plan explicitly. All filesystem paths below must be normalized absolute paths.
+
+```js
+import { runNativeCandidateMeasuredEvidence } from "./tools/sherpa-native/native-candidate-measured-evidence.mjs";
+
+const result = await runNativeCandidateMeasuredEvidence({
+  candidatePlan,
+  expectedContractSha256,
+  expectedHardwareReferenceSha256,
+  expectedHwRefId,
+  expectedOperatorFactsSha256,
+  fixtureRegistryProjection,
+  measuredHardwareReferencePath,
+  operatorFacts: {
+    ambientCelsius,
+    audioDeviceModel,
+    audioLogicalRole,
+    coolingMode,
+    gpuDeviceModel,
+    gpuVramBytes,
+    powerSource,
+    storageMedium,
+    storageVolume,
+  },
+  outputBundleRoot,
+  outputEvidencePath,
+  sourceRoots,
+  wavPath,
+});
+```
+
+The execution host is selected from the sealed worker material but runs from its `rust-target/release` directory, where the locked DLLs are staged. The first six arguments resolve from the materialized bundle (schema registry, model, tokens, runtime-library directory, model manifest, and package lock); the seventh is the separately sealed external `zh.wav`. The bundle's full run plan must remain `execution_status=planned` with `harness.command.argv=[]`. The calibration fixture named by that plan is not executed and is not claimed by this evidence.
+
+Evidence publication is create-new and identity-gated; an existing or concurrently replaced output is never overwritten. Validate a persisted evidence file with the read-only CLI:
+
+```powershell
+pnpm phase0:sherpa-candidate-measured-evidence:test
+pnpm phase0:sherpa-candidate-measured-evidence:validate <absolute-evidence-path>
+```
+
+CI runs only the synthetic contract test. It neither supplies the nine onsite facts nor emits actual measured-HW evidence, and therefore cannot close the onsite or parent work packages.

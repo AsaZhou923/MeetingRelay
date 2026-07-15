@@ -18,6 +18,8 @@
     "phase0:sherpa-candidate-plan:test": "node --test tools/sherpa-native/candidate-input-plan.test.mjs",
     "phase0:sherpa-candidate-bundle-plan:test": "node --test tools/sherpa-native/candidate-input-bundle-plan.test.mjs",
     "phase0:sherpa-candidate-measured-closeout:test": "node --test tools/sherpa-native/candidate-input-measured-closeout.test.mjs",
+    "phase0:sherpa-candidate-measured-evidence:test": "node --test tools/sherpa-native/native-candidate-measured-evidence.test.mjs",
+    "phase0:sherpa-candidate-measured-evidence:validate": "node tools/sherpa-native/native-candidate-measured-evidence.mjs --validate",
     "phase0:sherpa-candidate-materializer:test": "node --test tools/sherpa-native/candidate-input-materializer.test.mjs",
     "phase0:sherpa-candidate-conformance:test": "node --test tools/sherpa-native/candidate-conformance.test.mjs",
     "phase0:sherpa-candidate-quality-smoke:test": "node --test tools/sherpa-native/native-candidate-quality-smoke.test.mjs",

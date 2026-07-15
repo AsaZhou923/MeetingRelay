@@ -105,6 +105,10 @@ jobs:
         run: pnpm phase0:sherpa-candidate-measured-closeout:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 measured-HW native contract-stage evidence (synthetic only)
+        run: pnpm phase0:sherpa-candidate-measured-evidence:test
+        timeout-minutes: 5
+
       - name: Test WP-0.4 native candidate conformance contract
         run: pnpm phase0:sherpa-candidate-conformance:test
         timeout-minutes: 5

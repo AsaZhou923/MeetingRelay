@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meetingrelay.local/schemas/meetingrelay-native-candidate-measured-evidence-v1.schema.json",
+  "title": "MeetingRelay native candidate measured-HW contract-stage evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "assessment_status",
+    "authority",
+    "execution",
+    "execution_descriptor",
+    "input_identity",
+    "kind",
+    "limitations",
+    "schema_version"
+  ],
+  "properties": {
+    "assessment_status": { "$ref": "#/$defs/assessmentStatus" },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formal_claims", "production_evidence"],
+      "properties": {
+        "formal_claims": { "const": "none" },
+        "production_evidence": { "const": false }
+      }
+    },
+    "execution": { "$ref": "#/$defs/execution" },
+    "execution_descriptor": { "$ref": "#/$defs/executionDescriptor" },
+    "input_identity": { "$ref": "#/$defs/inputIdentity" },
+    "kind": { "const": "meetingrelay-native-candidate-measured-evidence-v1" },
+    "limitations": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "prefixItems": [
+        { "const": "operator-facts-recorded-by-digest-only" },
+        { "const": "storage-volume-selection-not-persisted-in-hw-ref" },
+        { "const": "quality-not-assessed" },
+        { "const": "performance-not-assessed" },
+        { "const": "resource-usage-not-assessed" },
+        { "const": "publishability-ranking-selection-default-not-assessed" },
+        { "const": "calibration-full-run-plan-not-executed" },
+        { "const": "ct-worker-candidate-and-parent-closeout-not-authorized" },
+        { "const": "phase-1-not-authorized" }
+      ],
+      "items": false
+    },
+    "schema_version": { "const": "1.0" }
+  },
+  "$defs": {
+    "assessmentStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ct_worker_candidate_status",
+        "default_status",
+        "full_run_plan_status",
+        "parent_closeout_status",
+        "performance_status",
+        "publishability_status",
+        "quality_status",
+        "ranking_status",
+        "resources_status",
+        "selection_status"
+      ],
+      "properties": {
+        "ct_worker_candidate_status": { "const": "not-assessed" },
+        "default_status": { "const": "not-assessed" },
+        "full_run_plan_status": { "const": "not-executed" },
+        "parent_closeout_status": { "const": "not-assessed" },
+        "performance_status": { "const": "not-assessed" },
+        "publishability_status": { "const": "not-assessed" },
+        "quality_status": { "const": "not-assessed" },
+        "ranking_status": { "const": "not-assessed" },
+        "resources_status": { "const": "not-assessed" },
+        "selection_status": { "const": "not-assessed" }
+      }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": { "const": "0000000000000000000000000000000000000000000000000000000000000000" }
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "not": { "const": "0000000000000000000000000000000000000000" }
+    },
+    "checkSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "total"],
+      "properties": {
+        "passed": { "const": 12 },
+        "total": { "const": 12 }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actual_native_inference",
+        "backend_execute_calls",
+        "check_summary",
+        "conformance_record_sha256"
+      ],
+      "properties": {
+        "actual_native_inference": { "const": true },
+        "backend_execute_calls": { "const": 1 },
+        "check_summary": { "$ref": "#/$defs/checkSummary" },
+        "conformance_record_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "executionDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv_roles",
+        "full_run_plan_argv_used",
+        "full_run_plan_fixture_used",
+        "scope"
+      ],
+      "properties": {
+        "argv_roles": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "prefixItems": [
+            { "const": "schema-registry" },
+            { "const": "model" },
+            { "const": "tokens" },
+            { "const": "runtime-library-directory" },
+            { "const": "model-manifest" },
+            { "const": "package-lock" },
+            { "const": "external-sealed-reference-wav" }
+          ],
+          "items": false
+        },
+        "full_run_plan_argv_used": { "const": false },
+        "full_run_plan_fixture_used": { "const": false },
+        "scope": { "const": "native-contract-stage-only" }
+      }
+    },
+    "inputIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_sha256",
+        "contract_manifest_sha256",
+        "execution_host_sha256",
+        "hw_ref_id",
+        "locked_input_snapshot_sha256",
+        "measured_hardware_reference_sha256",
+        "model_sha256",
+        "operator_facts_sha256",
+        "quality_reference_manifest_sha256",
+        "run_plan_sha256",
+        "runtime_bundle_sha256",
+        "schema_registry_sha256",
+        "source_commit",
+        "wav_sha256",
+        "worker_id"
+      ],
+      "properties": {
+        "config_sha256": { "$ref": "#/$defs/digest" },
+        "contract_manifest_sha256": { "$ref": "#/$defs/digest" },
+        "execution_host_sha256": { "$ref": "#/$defs/digest" },
+        "hw_ref_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        },
+        "locked_input_snapshot_sha256": { "$ref": "#/$defs/digest" },
+        "measured_hardware_reference_sha256": { "$ref": "#/$defs/digest" },
+        "model_sha256": { "$ref": "#/$defs/digest" },
+        "operator_facts_sha256": { "$ref": "#/$defs/digest" },
+        "quality_reference_manifest_sha256": {
+          "const": "cc2afff6bc92a6fe6e2b58e15332422dc3ecddae790eac6235fa543e2bd76590"
+        },
+        "run_plan_sha256": { "$ref": "#/$defs/digest" },
+        "runtime_bundle_sha256": { "$ref": "#/$defs/digest" },
+        "schema_registry_sha256": { "$ref": "#/$defs/digest" },
+        "source_commit": { "$ref": "#/$defs/commit" },
+        "wav_sha256": {
+          "const": "b77f1794fe374a0ba1ee1dc458bfaf9349496cbbfc32780c50ba3c5a7ad8e373"
+        },
+        "worker_id": { "const": "meetingrelay-sherpa-native-candidate-host-v1" }
+      }
+    }
+  }
+}
