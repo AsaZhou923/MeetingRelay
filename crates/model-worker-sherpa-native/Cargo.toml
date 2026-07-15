@@ -10,6 +10,7 @@ publish.workspace = true
 [features]
 default = []
 native-sherpa = ["dep:sherpa-onnx"]
+native-fault-fixture = []
 
 [dependencies]
 meetingrelay-model-worker-contract = { path = "../model-worker-contract" }
@@ -30,6 +31,13 @@ bench = false
 name = "meetingrelay-sherpa-candidate-execution-host"
 path = "src/bin/meetingrelay_sherpa_candidate_execution_host.rs"
 required-features = ["native-sherpa"]
+test = false
+bench = false
+
+[[bin]]
+name = "meetingrelay-sherpa-candidate-fault-host"
+path = "src/bin/meetingrelay_sherpa_candidate_fault_host.rs"
+required-features = ["native-sherpa", "native-fault-fixture"]
 test = false
 bench = false
 

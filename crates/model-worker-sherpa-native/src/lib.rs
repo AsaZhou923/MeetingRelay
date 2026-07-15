@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 mod candidate_builder_input;
 #[cfg(feature = "native-sherpa")]
 mod candidate_execution;
+#[cfg(feature = "native-fault-fixture")]
+mod candidate_fault;
 mod worker_provenance;
 
 pub use candidate_builder_input::{
@@ -38,6 +40,10 @@ pub use candidate_execution::{
     LOCKED_CONFORMANCE_WAV_SHA256_HEX, NativeCandidateExecutionError,
     NativeCandidateExecutionInput, run_locked_native_candidate_conformance,
 };
+#[cfg(all(feature = "native-sherpa", feature = "native-fault-fixture"))]
+pub use candidate_fault::run_locked_native_candidate_fault;
+#[cfg(feature = "native-fault-fixture")]
+pub use candidate_fault::{NATIVE_CANDIDATE_FAULT_CHECKPOINT_KIND, NativeCandidateFaultMode};
 pub use worker_provenance::{
     LOCKED_SCHEMA_REGISTRY_BYTES, LOCKED_WORKER_ID, MAX_SCHEMA_REGISTRY_BYTES,
     WorkerProvenanceError, locked_schema_registry_sha256, locked_worker_manifest,

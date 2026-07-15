@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meetingrelay.local/schemas/meetingrelay-native-candidate-fault-evidence-v1.schema.json",
+  "title": "MeetingRelay native candidate fault evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authority",
+    "kind",
+    "lanes",
+    "limitations",
+    "locked_input_snapshot_sha256",
+    "schema_version"
+  ],
+  "properties": {
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formal_claims", "production_evidence"],
+      "properties": {
+        "formal_claims": { "const": "none" },
+        "production_evidence": { "const": false }
+      }
+    },
+    "kind": { "const": "meetingrelay-native-candidate-fault-evidence-v1" },
+    "lanes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        { "$ref": "#/$defs/abortLane" },
+        { "$ref": "#/$defs/hangLane" },
+        { "$ref": "#/$defs/representativeAvLane" }
+      ],
+      "items": false
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        { "const": "injected-faults-not-natural-sherpa-defects" },
+        { "const": "fresh-process-recovery-only" },
+        { "const": "product-replay-and-restart-budget-not-tested" },
+        { "const": "onsite-quality-performance-resources-not-measured" }
+      ],
+      "items": false
+    },
+    "locked_input_snapshot_sha256": { "$ref": "#/$defs/digest" },
+    "schema_version": { "const": "1.0" }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "loadedRuntimeEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sha256"],
+      "properties": {
+        "name": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "lockedRuntime": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/loadedRuntimeEntry" },
+            { "properties": { "name": { "const": "onnxruntime.dll" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/loadedRuntimeEntry" },
+            { "properties": { "name": { "const": "sherpa-onnx-c-api.dll" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "checkSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "total"],
+      "properties": {
+        "passed": { "const": 12 },
+        "total": { "const": 12 }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend_execute_calls",
+        "check_summary",
+        "conformance_record_sha256",
+        "fresh_process"
+      ],
+      "properties": {
+        "backend_execute_calls": { "const": 1 },
+        "check_summary": { "$ref": "#/$defs/checkSummary" },
+        "conformance_record_sha256": { "$ref": "#/$defs/digest" },
+        "fresh_process": { "const": true }
+      }
+    },
+    "laneBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "checkpoint",
+        "fault_injected",
+        "representative_only",
+        "fault_artifact_sha256",
+        "marker_sha256",
+        "loaded_runtime",
+        "observation",
+        "postflight_snapshot_sha256",
+        "recovery"
+      ],
+      "properties": {
+        "mode": { "type": "string" },
+        "checkpoint": { "type": "string" },
+        "fault_injected": { "const": true },
+        "representative_only": { "type": "boolean" },
+        "fault_artifact_sha256": { "$ref": "#/$defs/digest" },
+        "marker_sha256": { "$ref": "#/$defs/digest" },
+        "loaded_runtime": { "type": "array" },
+        "observation": { "type": "object" },
+        "postflight_snapshot_sha256": { "$ref": "#/$defs/digest" },
+        "recovery": { "$ref": "#/$defs/recovery" }
+      }
+    },
+    "statusObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "natural_ntstatus",
+        "ntstatus_hex",
+        "signed_i32",
+        "timed_out",
+        "unsigned_u32"
+      ],
+      "properties": {
+        "natural_ntstatus": { "const": true },
+        "ntstatus_hex": { "type": "string", "pattern": "^0x[0-9a-f]{8}$" },
+        "signed_i32": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "timed_out": { "const": false },
+        "unsigned_u32": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "timeoutObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "natural_ntstatus",
+        "ntstatus_hex",
+        "signed_i32",
+        "timed_out",
+        "unsigned_u32"
+      ],
+      "properties": {
+        "natural_ntstatus": { "const": false },
+        "ntstatus_hex": { "type": "null" },
+        "signed_i32": { "type": "null" },
+        "timed_out": { "const": true },
+        "unsigned_u32": { "type": "null" }
+      }
+    },
+    "abortLane": {
+      "allOf": [
+        { "$ref": "#/$defs/laneBase" },
+        {
+          "properties": {
+            "mode": { "const": "abort-after-prepare" },
+            "checkpoint": { "const": "real-prepare-loaded-runtime-identity" },
+            "representative_only": { "const": false },
+            "loaded_runtime": { "$ref": "#/$defs/lockedRuntime" },
+            "observation": { "$ref": "#/$defs/statusObservation" }
+          }
+        }
+      ]
+    },
+    "hangLane": {
+      "allOf": [
+        { "$ref": "#/$defs/laneBase" },
+        {
+          "properties": {
+            "mode": { "const": "hang-after-inference" },
+            "checkpoint": { "const": "successful-real-inference" },
+            "representative_only": { "const": false },
+            "loaded_runtime": { "$ref": "#/$defs/lockedRuntime" },
+            "observation": { "$ref": "#/$defs/timeoutObservation" }
+          }
+        }
+      ]
+    },
+    "representativeAvLane": {
+      "allOf": [
+        { "$ref": "#/$defs/laneBase" },
+        {
+          "properties": {
+            "mode": { "const": "representative-av" },
+            "checkpoint": { "const": "before-injected-access-violation" },
+            "representative_only": { "const": true },
+            "loaded_runtime": { "type": "array", "maxItems": 0 },
+            "observation": {
+              "allOf": [
+                { "$ref": "#/$defs/statusObservation" },
+                {
+                  "properties": {
+                    "ntstatus_hex": { "const": "0xc0000005" },
+                    "signed_i32": { "const": -1073741819 },
+                    "unsigned_u32": { "const": 3221225477 }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

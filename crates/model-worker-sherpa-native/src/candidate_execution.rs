@@ -36,6 +36,8 @@ const MODULE_PROBE_READY_FILE_ENV: &str = "MEETINGRELAY_SHERPA_MODULE_PROBE_READ
 const MODULE_PROBE_HOLD_MS_ENV: &str = "MEETINGRELAY_SHERPA_MODULE_PROBE_HOLD_MS";
 const MODULE_PROBE_BACKEND_FAILURE: &str = "SHERPA_MODULE_PROBE_UNAVAILABLE";
 const RUNTIME_IDENTITY_BACKEND_FAILURE: &str = "SHERPA_RUNTIME_IDENTITY_UNAVAILABLE";
+#[cfg(feature = "native-fault-fixture")]
+const CHECKPOINT_BACKEND_FAILURE: &str = "SHERPA_CHECKPOINT_UNAVAILABLE";
 const REQUIRED_LOADED_RUNTIME_MODULES: [&str; 2] = ["sherpa-onnx-c-api.dll", "onnxruntime.dll"];
 const LOCKED_STAGED_RUNTIME_DLL_COUNT: usize = 4;
 
@@ -62,6 +64,8 @@ pub enum NativeCandidateExecutionError {
     Provenance,
     ModuleProbeConfiguration,
     ModuleProbeUnavailable,
+    #[cfg(feature = "native-fault-fixture")]
+    Checkpoint,
 }
 
 impl NativeCandidateExecutionError {
@@ -77,6 +81,8 @@ impl NativeCandidateExecutionError {
             Self::Provenance => "SHERPA_CONFORMANCE_PROVENANCE",
             Self::ModuleProbeConfiguration => "SHERPA_CONFORMANCE_MODULE_PROBE_CONFIGURATION",
             Self::ModuleProbeUnavailable => "SHERPA_CONFORMANCE_MODULE_PROBE_UNAVAILABLE",
+            #[cfg(feature = "native-fault-fixture")]
+            Self::Checkpoint => "SHERPA_CONFORMANCE_CHECKPOINT_UNAVAILABLE",
         }
     }
 }
@@ -89,6 +95,24 @@ impl fmt::Display for NativeCandidateExecutionError {
 
 impl std::error::Error for NativeCandidateExecutionError {}
 
+#[cfg(feature = "native-fault-fixture")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCandidateCheckpoint {
+    RealPrepareLoadedRuntimeIdentity,
+    SuccessfulRealInference { backend_execute_calls: usize },
+}
+
+#[cfg(feature = "native-fault-fixture")]
+pub(crate) trait NativeCandidateCheckpointObserver: Send + Sync {
+    fn observe(
+        &self,
+        checkpoint: NativeCandidateCheckpoint,
+    ) -> Result<(), NativeCandidateExecutionError>;
+}
+
+#[cfg(feature = "native-fault-fixture")]
+type CheckpointObserver = Arc<dyn NativeCandidateCheckpointObserver>;
+
 /// Executes the locked native adapter through the Rust semantic contract and
 /// returns one canonical supporting-conformance JSON line.
 ///
@@ -97,6 +121,28 @@ impl std::error::Error for NativeCandidateExecutionError {}
 /// still negotiates the protocol-required in-process transport.
 pub fn run_locked_native_candidate_conformance(
     input: NativeCandidateExecutionInput,
+) -> Result<Vec<u8>, NativeCandidateExecutionError> {
+    #[cfg(feature = "native-fault-fixture")]
+    {
+        run_locked_native_candidate_conformance_inner(input, None)
+    }
+    #[cfg(not(feature = "native-fault-fixture"))]
+    {
+        run_locked_native_candidate_conformance_inner(input)
+    }
+}
+
+#[cfg(feature = "native-fault-fixture")]
+pub(crate) fn run_locked_native_candidate_conformance_with_observer(
+    input: NativeCandidateExecutionInput,
+    observer: CheckpointObserver,
+) -> Result<Vec<u8>, NativeCandidateExecutionError> {
+    run_locked_native_candidate_conformance_inner(input, Some(observer))
+}
+
+fn run_locked_native_candidate_conformance_inner(
+    input: NativeCandidateExecutionInput,
+    #[cfg(feature = "native-fault-fixture")] observer: Option<CheckpointObserver>,
 ) -> Result<Vec<u8>, NativeCandidateExecutionError> {
     validate_absolute_inputs(&input)?;
     let module_probe = module_probe_configuration(
@@ -120,6 +166,8 @@ pub fn run_locked_native_candidate_conformance(
     let execute_calls = Arc::new(AtomicUsize::new(0));
     let module_probe_failure = Arc::new(AtomicUsize::new(0));
     let runtime_identity_failure = Arc::new(AtomicUsize::new(0));
+    #[cfg(feature = "native-fault-fixture")]
+    let checkpoint_failure = Arc::new(AtomicUsize::new(0));
     let backend = SherpaNativeBackend::new(locked_config(&input)?)
         .map_err(|_| NativeCandidateExecutionError::Configuration)?;
     let counting = CountingBackend {
@@ -129,6 +177,10 @@ pub fn run_locked_native_candidate_conformance(
         module_probe,
         module_probe_failure: Arc::clone(&module_probe_failure),
         runtime_identity_failure: Arc::clone(&runtime_identity_failure),
+        #[cfg(feature = "native-fault-fixture")]
+        checkpoint_failure: Arc::clone(&checkpoint_failure),
+        #[cfg(feature = "native-fault-fixture")]
+        observer: observer.clone(),
     };
     let mut session =
         DirectWorkerSession::new(manifest.clone(), limits, counting).map_err(map_contract_error)?;
@@ -147,10 +199,22 @@ pub fn run_locked_native_candidate_conformance(
     if module_probe_failure.load(Ordering::Relaxed) != 0 {
         return Err(NativeCandidateExecutionError::ModuleProbeUnavailable);
     }
+    #[cfg(feature = "native-fault-fixture")]
+    if checkpoint_failure.load(Ordering::Relaxed) != 0 {
+        return Err(NativeCandidateExecutionError::Checkpoint);
+    }
     let observation = observation.map_err(map_conformance_error)?;
-    if execute_calls.load(Ordering::Relaxed) != 1 {
+    let backend_execute_calls = execute_calls.load(Ordering::Relaxed);
+    if backend_execute_calls != 1 {
         return Err(NativeCandidateExecutionError::Observation);
     }
+    #[cfg(feature = "native-fault-fixture")]
+    observe_checkpoint(
+        observer.as_ref(),
+        NativeCandidateCheckpoint::SuccessfulRealInference {
+            backend_execute_calls,
+        },
+    )?;
     drop(session);
 
     run_stable_failure_lane(&input, &manifest, limits)?;
@@ -181,6 +245,10 @@ struct CountingBackend {
     module_probe: Option<ModuleProbeConfiguration>,
     module_probe_failure: Arc<AtomicUsize>,
     runtime_identity_failure: Arc<AtomicUsize>,
+    #[cfg(feature = "native-fault-fixture")]
+    checkpoint_failure: Arc<AtomicUsize>,
+    #[cfg(feature = "native-fault-fixture")]
+    observer: Option<CheckpointObserver>,
 }
 
 impl ModelBackend for CountingBackend {
@@ -206,12 +274,38 @@ impl ModelBackend for CountingBackend {
                 None,
             ));
         }
+        #[cfg(feature = "native-fault-fixture")]
+        if observe_checkpoint(
+            self.observer.as_ref(),
+            NativeCandidateCheckpoint::RealPrepareLoadedRuntimeIdentity,
+        )
+        .is_err()
+        {
+            self.checkpoint_failure.store(1, Ordering::Relaxed);
+            return Err(BackendFailure::new(
+                Identifier::new(CHECKPOINT_BACKEND_FAILURE)
+                    .expect("stable checkpoint failure code is constant-valid"),
+                false,
+                None,
+            ));
+        }
         Ok(())
     }
 
     fn execute(&mut self, action: &BackendAction) -> BackendOutcome {
         self.execute_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.execute(action)
+    }
+}
+
+#[cfg(feature = "native-fault-fixture")]
+fn observe_checkpoint(
+    observer: Option<&CheckpointObserver>,
+    checkpoint: NativeCandidateCheckpoint,
+) -> Result<(), NativeCandidateExecutionError> {
+    match observer {
+        Some(observer) => observer.observe(checkpoint),
+        None => Ok(()),
     }
 }
 
@@ -1043,6 +1137,8 @@ fn job(label: &str) -> JobKey {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    #[cfg(feature = "native-fault-fixture")]
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1052,6 +1148,78 @@ mod tests {
         size_bytes: 1,
         sha256: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
     };
+
+    #[cfg(feature = "native-fault-fixture")]
+    struct RecordingCheckpointObserver {
+        checkpoints: Arc<Mutex<Vec<NativeCandidateCheckpoint>>>,
+    }
+
+    #[cfg(feature = "native-fault-fixture")]
+    impl NativeCandidateCheckpointObserver for RecordingCheckpointObserver {
+        fn observe(
+            &self,
+            checkpoint: NativeCandidateCheckpoint,
+        ) -> Result<(), NativeCandidateExecutionError> {
+            self.checkpoints
+                .lock()
+                .expect("checkpoint fixture lock")
+                .push(checkpoint);
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "native-fault-fixture")]
+    fn checkpoint_observer_receives_prepare_then_successful_inference() {
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let observer: CheckpointObserver = Arc::new(RecordingCheckpointObserver {
+            checkpoints: Arc::clone(&checkpoints),
+        });
+
+        observe_checkpoint(
+            Some(&observer),
+            NativeCandidateCheckpoint::RealPrepareLoadedRuntimeIdentity,
+        )
+        .expect("observe real prepare");
+        observe_checkpoint(
+            Some(&observer),
+            NativeCandidateCheckpoint::SuccessfulRealInference {
+                backend_execute_calls: 1,
+            },
+        )
+        .expect("observe successful inference");
+
+        assert_eq!(
+            *checkpoints.lock().expect("checkpoint fixture lock"),
+            [
+                NativeCandidateCheckpoint::RealPrepareLoadedRuntimeIdentity,
+                NativeCandidateCheckpoint::SuccessfulRealInference {
+                    backend_execute_calls: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native-fault-fixture")]
+    fn absent_checkpoint_observer_preserves_normal_execution_path() {
+        assert_eq!(
+            observe_checkpoint(
+                None,
+                NativeCandidateCheckpoint::RealPrepareLoadedRuntimeIdentity,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            observe_checkpoint(
+                None,
+                NativeCandidateCheckpoint::SuccessfulRealInference {
+                    backend_execute_calls: 1,
+                },
+            ),
+            Ok(())
+        );
+    }
 
     #[test]
     fn module_probe_configuration_is_bounded_and_fail_closed() {

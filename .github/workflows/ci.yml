@@ -108,6 +108,10 @@ jobs:
         run: pnpm phase0:sherpa-candidate-conformance:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 native fatal-process evidence contract
+        run: pnpm phase0:sherpa-candidate-fault-evidence:test
+        timeout-minutes: 5
+
       - name: Test and validate Phase 0 replay ledgers
         run: |
           pnpm phase0:ledgers:test
@@ -590,6 +594,235 @@ jobs:
             throw "actual locked-assets Release candidate conformance marker is missing or duplicated"
           }
         timeout-minutes: 10
+
+      - name: Build exact Release candidate fault-host executable
+        shell: pwsh
+        run: |
+          $repositoryTargetRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target'))
+          $fatalFixtureRoot = [IO.Path]::GetFullPath((Join-Path $repositoryTargetRoot 'sherpa-native/fatal-fixtures'))
+          $targetPrefix = $repositoryTargetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          if (-not $fatalFixtureRoot.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "fatal fixture root escaped the repository target directory"
+          }
+          $current = $fatalFixtureRoot
+          while ($true) {
+            if (Test-Path -LiteralPath $current) {
+              $attributes = [IO.File]::GetAttributes($current)
+              if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "fatal fixture cleanup path contains a reparse point: $current"
+              }
+            }
+            if ($current.Equals($repositoryTargetRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+            $parent = [IO.Directory]::GetParent($current)
+            if ($null -eq $parent) { throw "fatal fixture cleanup path did not reach the repository target root" }
+            $current = $parent.FullName
+          }
+          if (Test-Path -LiteralPath $fatalFixtureRoot) {
+            Remove-Item -LiteralPath $fatalFixtureRoot -Recurse -Force
+          }
+
+          $rustTargetRoot = [IO.Path]::GetFullPath((Join-Path $fatalFixtureRoot 'rust-target'))
+          $metadata = & cargo metadata --format-version 1 --no-deps --offline --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed for candidate fault-host selection" }
+          $packageIds = @($metadata.packages |
+            Where-Object { $_.name -eq 'meetingrelay-model-worker-sherpa-native' } |
+            ForEach-Object { [string]$_.id } |
+            Sort-Object -Unique)
+          if ($packageIds.Count -ne 1) {
+            throw "Expected exactly one sherpa-native package ID, got $($packageIds.Count)"
+          }
+
+          $rustcVersion = @(& rustc -vV)
+          if ($LASTEXITCODE -ne 0) { throw "rustc -vV failed for candidate fault-host target validation" }
+          $hostLines = @($rustcVersion | Where-Object { [string]$_ -like 'host: *' })
+          if ($hostLines.Count -ne 1 -or [string]$hostLines[0] -cne 'host: x86_64-pc-windows-msvc') {
+            throw "candidate fault host requires the x86_64-pc-windows-msvc Rust host triple"
+          }
+
+          $env:CARGO_TARGET_DIR = $rustTargetRoot
+          $cargoArguments = @(
+            'build', '--release',
+            '-p', 'meetingrelay-model-worker-sherpa-native',
+            '--features', 'native-sherpa,native-fault-fixture',
+            '--bin', 'meetingrelay-sherpa-candidate-fault-host',
+            '--message-format=json',
+            '--offline',
+            '--locked'
+          )
+          $messages = @(& cargo @cargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($LASTEXITCODE -ne 0) { throw "cargo failed to build the candidate fault host" }
+          $executables = @($messages |
+            Where-Object {
+              $_.reason -eq 'compiler-artifact' -and
+              [string]$_.package_id -eq $packageIds[0] -and
+              $_.target.name -eq 'meetingrelay-sherpa-candidate-fault-host' -and
+              @($_.target.kind).Count -eq 1 -and
+              [string]$_.target.kind[0] -eq 'bin' -and
+              -not [bool]$_.target.test -and
+              -not [bool]$_.profile.test -and
+              -not [bool]$_.profile.debug_assertions -and
+              [string]$_.profile.opt_level -ne '0' -and
+              -not [string]::IsNullOrWhiteSpace([string]$_.executable)
+            } |
+            ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
+            Sort-Object -Unique)
+          if ($executables.Count -ne 1) {
+            throw "Expected exactly one Cargo-reported candidate fault host, got $($executables.Count)"
+          }
+          $releaseExecutable = $executables[0]
+          $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $rustTargetRoot 'release/meetingrelay-sherpa-candidate-fault-host.exe'))
+          if (-not $releaseExecutable.Equals($expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Cargo-reported candidate fault host has an unexpected target or profile path"
+          }
+          $current = $releaseExecutable
+          while ($null -ne $current) {
+            $attributes = [IO.File]::GetAttributes($current)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Cargo-reported candidate fault-host path contains a reparse point"
+            }
+            if ($current.Equals($repositoryTargetRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+            $parent = [IO.Directory]::GetParent($current)
+            $current = if ($null -eq $parent) { $null } else { $parent.FullName }
+          }
+          if (-not (Test-Path -LiteralPath $releaseExecutable -PathType Leaf)) {
+            throw "Cargo-reported candidate fault host does not exist"
+          }
+          ./tools/sherpa-native/stage-runtime.ps1 `
+            -LibDir $env:SHERPA_ONNX_LIB_DIR `
+            -Configuration Release `
+            -DestinationRoot (Split-Path -Parent $releaseExecutable)
+          if ($LASTEXITCODE -ne 0) { throw "candidate fault-host runtime staging failed" }
+          if (@(git status --porcelain=v1 -- Cargo.lock).Count -ne 0) {
+            throw "candidate fault-host build changed Cargo.lock"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_FAULT_HOST_EXE=$releaseExecutable" -Encoding utf8
+        timeout-minutes: 20
+
+      - name: Audit Release candidate fault-host PE dependencies
+        shell: pwsh
+        run: |
+          $output = @(./tools/sherpa-native/audit-pe-dependencies.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -BinaryPath $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_FAULT_HOST_EXE)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "candidate fault-host PE dependency audit failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^PE_DEPENDENCY_AUDIT=PASS binary=.+\\target\\sherpa-native\\fatal-fixtures\\rust-target\\release\\meetingrelay-sherpa-candidate-fault-host\.exe imports=.*sherpa-onnx-c-api\.dll.*$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "candidate fault-host PE dependency audit marker is missing or duplicated"
+          }
+        timeout-minutes: 5
+
+      - name: Build and test exact MSVC native fatal-boundary fixture
+        shell: pwsh
+        run: |
+          $output = @(& ./tools/sherpa-native/native-fatal-boundary-fixture-build.test.ps1)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "native fatal-boundary fixture build/test failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -ceq 'NATIVE_FATAL_BOUNDARY_FIXTURE_TEST=PASS'
+          })
+          if ($marker.Count -ne 1) {
+            throw "native fatal-boundary fixture test marker is missing or duplicated"
+          }
+          $fixture = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/sherpa-native/fatal-fixtures/msvc/meetingrelay-native-fatal-boundary-fixture.exe'))
+          $metadata = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/sherpa-native/fatal-fixtures/msvc/meetingrelay-native-fatal-boundary-fixture.build.json'))
+          foreach ($path in @($fixture, $metadata)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "native fatal-boundary fixture build output is missing: $path"
+            }
+            $attributes = [IO.File]::GetAttributes($path)
+            if (($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)) -ne 0) {
+              throw "native fatal-boundary fixture build output is not a regular non-reparse file: $path"
+            }
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_NATIVE_FATAL_BOUNDARY_FIXTURE_EXE=$fixture" -Encoding utf8
+        timeout-minutes: 10
+
+      - name: Run actual native fatal-process containment and fresh-host recovery evidence
+        shell: pwsh
+        run: |
+          $schemaRegistry = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-schema-registry.json'))
+          $packageLock = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock'))
+          $evidencePath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/sherpa-native/native-candidate-fault-evidence.json'))
+          if (Test-Path -LiteralPath $evidencePath) {
+            throw "refusing to replace an existing native candidate fault-evidence file"
+          }
+          $output = @(& pnpm phase0:sherpa-candidate-fault-evidence:run -- `
+            $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_FAULT_HOST_EXE `
+            $env:MEETINGRELAY_NATIVE_FATAL_BOUNDARY_FIXTURE_EXE `
+            $evidencePath `
+            $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE `
+            $schemaRegistry `
+            $env:MEETINGRELAY_SHERPA_MODEL `
+            $env:MEETINGRELAY_SHERPA_TOKENS `
+            $env:SHERPA_ONNX_LIB_DIR `
+            $env:MEETINGRELAY_SHERPA_LOCK `
+            $packageLock `
+            $env:MEETINGRELAY_SHERPA_WAV)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "actual native candidate fatal-process evidence run failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^candidate-native-fault-evidence=verified evidence_sha256=[0-9a-f]{64} locked_input_snapshot_sha256=[0-9a-f]{64} lanes=3 formal_claims=none production_evidence=false$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "actual native candidate fault-evidence marker is missing or duplicated"
+          }
+
+          $validation = @(& pnpm phase0:sherpa-candidate-fault-evidence:validate -- $evidencePath)
+          $validation | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "persisted native candidate fault evidence failed strict validation" }
+          $validationMarker = @($validation | Where-Object {
+            [string]$_ -match '^candidate-native-fault-evidence-file=verified evidence_sha256=[0-9a-f]{64} locked_input_snapshot_sha256=[0-9a-f]{64} lanes=3 formal_claims=none production_evidence=false$'
+          })
+          if ($validationMarker.Count -ne 1) {
+            throw "persisted native candidate fault-evidence validation marker is missing or duplicated"
+          }
+          if (@(git status --porcelain=v1 -- Cargo.lock).Count -ne 0) {
+            throw "native fatal-process evidence changed Cargo.lock"
+          }
+        timeout-minutes: 15
+
+      - name: Clean native fatal-process build and evidence state
+        if: always()
+        shell: pwsh
+        run: |
+          $repositoryTargetRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target'))
+          $targetPrefix = $repositoryTargetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          $fatalFixtureRoot = [IO.Path]::GetFullPath((Join-Path $repositoryTargetRoot 'sherpa-native/fatal-fixtures'))
+          $evidencePath = [IO.Path]::GetFullPath((Join-Path $repositoryTargetRoot 'sherpa-native/native-candidate-fault-evidence.json'))
+          $evidenceParent = Split-Path -Parent $evidencePath
+          $stagingCandidates = @(
+            Get-ChildItem -LiteralPath $evidenceParent -Force -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -cmatch '^\.native-candidate-fault-evidence\.json\.[0-9a-f]{32}\.staging$' } |
+              ForEach-Object { [IO.Path]::GetFullPath($_.FullName) }
+          )
+          foreach ($candidate in @($fatalFixtureRoot, $evidencePath) + $stagingCandidates) {
+            if (-not $candidate.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "native fatal-process cleanup target escaped the repository target directory"
+            }
+            $current = $candidate
+            while ($true) {
+              if (Test-Path -LiteralPath $current) {
+                $attributes = [IO.File]::GetAttributes($current)
+                if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                  throw "native fatal-process cleanup path contains a reparse point: $current"
+                }
+              }
+              if ($current.Equals($repositoryTargetRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+              $parent = [IO.Directory]::GetParent($current)
+              if ($null -eq $parent) { throw "native fatal-process cleanup path did not reach the repository target root" }
+              $current = $parent.FullName
+            }
+            if (Test-Path -LiteralPath $candidate) {
+              Remove-Item -LiteralPath $candidate -Recurse -Force
+            }
+            if (Test-Path -LiteralPath $candidate) {
+              throw "native fatal-process cleanup left state behind: $candidate"
+            }
+          }
+        timeout-minutes: 5
 
       - name: Test WP-0.4 sherpa candidate-input materializer
         run: pnpm phase0:sherpa-candidate-materializer:test

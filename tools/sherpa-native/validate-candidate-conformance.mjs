@@ -547,6 +547,22 @@ async function validateInputs(
 export async function runReleaseNativeCandidateConformance(input) {
   const descriptor = emitLockedDescriptor();
   const before = await validateInputs(input, descriptor);
+  const lockedInputSnapshotBytes = Buffer.from(
+    encodeCanonicalJsonLine({
+      asset_lock_sha256: descriptor.model_manifest_sha256,
+      cargo_lock_sha256: before.packageLock.sha256,
+      model_sha256: before.model.sha256,
+      parameter_sha256: descriptor.parameter_sha256,
+      runtime_bundle_sha256: descriptor.runtime_sha256,
+      schema_registry_sha256: before.schemaRegistry.sha256,
+      tokens_sha256: before.tokens.sha256,
+      wav_sha256: before.wav.sha256,
+    }).slice(0, -1),
+    "utf8",
+  );
+  const lockedInputSnapshotSha256 = createHash("sha256")
+    .update(lockedInputSnapshotBytes)
+    .digest("hex");
   const result = spawnSync(
     before.executable.resolved,
     [
@@ -578,6 +594,7 @@ export async function runReleaseNativeCandidateConformance(input) {
     recordBytes,
     schemaRegistryBytes: await readFile(before.schemaRegistry.resolved),
   });
+  const record = parseCanonicalRecord(recordBytes);
   const after = await validateInputs(input, descriptor, "CONF_POSTFLIGHT_JOIN");
   if (
     after.executable.sha256 !== before.executable.sha256 ||
@@ -590,7 +607,16 @@ export async function runReleaseNativeCandidateConformance(input) {
   ) {
     fail("CONF_POSTFLIGHT_JOIN");
   }
-  return validated;
+  return {
+    ...validated,
+    backendExecuteCalls: record.execution.backend_execute_calls,
+    checkSummary: {
+      passed: CHECK_KEYS.filter((key) => record.checks[key] === true).length,
+      total: CHECK_KEYS.length,
+    },
+    conformanceRecordSha256: createHash("sha256").update(recordBytes).digest("hex"),
+    lockedInputSnapshotSha256,
+  };
 }
 
 async function main(arguments_) {
