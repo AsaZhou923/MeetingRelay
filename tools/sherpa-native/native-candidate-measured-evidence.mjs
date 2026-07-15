@@ -163,6 +163,15 @@ const OPERATOR_FACT_SENTINELS = new Set([
   "unset",
   "unspecified",
 ]);
+const OPERATOR_FACT_FREE_TEXT_KEYS = new Set([
+  "audioDeviceModel",
+  "audioLogicalRole",
+  "coolingMode",
+  "gpuDeviceModel",
+]);
+const OPERATOR_FACT_SENTINEL_MAX_LENGTH = Math.max(
+  ...[...OPERATOR_FACT_SENTINELS].map((sentinel) => sentinel.length),
+);
 
 export class NativeCandidateMeasuredEvidenceError extends Error {
   constructor(code, options = {}) {
@@ -217,6 +226,22 @@ function isOperatorFactSentinel(value) {
     .toLowerCase()
     .replace(/[\p{P}\p{S}\s]+/gu, "");
   return normalized.length === 0 || OPERATOR_FACT_SENTINELS.has(normalized);
+}
+
+function containsOperatorFactSentinel(key, value) {
+  if (!OPERATOR_FACT_FREE_TEXT_KEYS.has(key)) return false;
+  const tokens = value.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  for (let start = 0; start < tokens.length; start += 1) {
+    let candidate = "";
+    for (let end = start; end < tokens.length; end += 1) {
+      if (candidate.length + tokens[end].length > OPERATOR_FACT_SENTINEL_MAX_LENGTH) {
+        break;
+      }
+      candidate += tokens[end];
+      if (OPERATOR_FACT_SENTINELS.has(candidate)) return true;
+    }
+  }
+  return false;
 }
 
 function parseCanonicalJsonLine(bytes, code) {
@@ -330,7 +355,8 @@ function validateOperatorFacts(operatorFacts, expectedSha256) {
       (key) =>
         typeof operatorFacts[key] !== "string" ||
         operatorFacts[key].trim().length === 0 ||
-        isOperatorFactSentinel(operatorFacts[key]),
+        isOperatorFactSentinel(operatorFacts[key]) ||
+        containsOperatorFactSentinel(key, operatorFacts[key]),
     ) ||
     typeof operatorFacts.gpuVramBytes !== "string" ||
     !/^[1-9][0-9]*$/u.test(operatorFacts.gpuVramBytes) ||

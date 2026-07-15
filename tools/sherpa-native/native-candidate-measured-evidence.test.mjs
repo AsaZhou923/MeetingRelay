@@ -799,6 +799,81 @@ test("normalized operator sentinels are rejected across all nine facts", async (
   assert.equal(proposalCalls, 0);
 });
 
+test("field-aware compound operator placeholders fail before proposal", async (t) => {
+  const cases = [
+    ["gpuDeviceModel", "unknown GPU"],
+    ["gpuDeviceModel", "unknown NVIDIA"],
+    ["gpuDeviceModel", "unknown NVIDIA GPU"],
+    ["coolingMode", "TBD cooling mode"],
+    ["coolingMode", "TBD active cooling mode"],
+    ["coolingMode", "un-set cooling mode"],
+    ["audioDeviceModel", "synthetic audio device"],
+    ["audioDeviceModel", "syn-thetic microphone"],
+    ["audioDeviceModel", "test audio device"],
+    ["audioDeviceModel", "testing audio device"],
+    ["audioDeviceModel", "unknown microphone"],
+    ["audioDeviceModel", "unknown Realtek"],
+    ["audioDeviceModel", "place-holder audio device"],
+    ["audioLogicalRole", "TBD loopback capture"],
+    ["audioLogicalRole", "TBD input"],
+    ["coolingMode", "not collected yet"],
+    ["coolingMode", "not recorded thermal profile"],
+    ["gpuDeviceModel", "synthetic graphics adapter"],
+    ["gpuDeviceModel", "un-available GPU"],
+    ["gpuDeviceModel", "not collected GPU model"],
+    ["gpuDeviceModel", "not collected laptop GPU model"],
+  ];
+  for (const [key, placeholder] of cases) {
+    await t.test(`${key}: ${placeholder}`, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const input = structuredClone(fixture.input);
+      input.candidatePlan = fixture.input.candidatePlan;
+      input.operatorFacts[key] = placeholder;
+      input.expectedOperatorFactsSha256 = sha256(canonicalDocument(input.operatorFacts));
+      let proposalCalls = 0;
+      await assertRejectsCode(
+        () =>
+          __runNativeCandidateMeasuredEvidenceForTest(
+            input,
+            fixture.dependencies({
+              async propose() {
+                proposalCalls += 1;
+                return fixture.proposal;
+              },
+            }),
+          ),
+        "MEASURED_EVIDENCE_OPERATOR_FACTS",
+      );
+      assert.equal(proposalCalls, 0);
+    });
+  }
+});
+
+test("field-aware placeholder detection preserves legitimate device names", async (t) => {
+  for (const model of ["NVIDIA GPU Device Model 4090", "UnknownTech GPU Model 5000"]) {
+    await t.test(model, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      fixture.facts.gpuDeviceModel = model;
+      fixture.hardware.environment.gpus[0].model = fixture.facts.gpuDeviceModel;
+      fixture.rebuild();
+      await writeFile(
+        fixture.input.measuredHardwareReferencePath,
+        canonicalDocument(fixture.hardware),
+      );
+
+      const result = await __runNativeCandidateMeasuredEvidenceForTest(
+        fixture.input,
+        fixture.dependencies(),
+      );
+      assert.equal(result.record.execution.backend_execute_calls, 1);
+      assert.equal(
+        result.record.input_identity.operator_facts_sha256,
+        fixture.operatorFactsSha256,
+      );
+    });
+  }
+});
+
 test("contract, HW, operator, and seal mismatches stop before materialization", async (t) => {
   const cases = [
     {
