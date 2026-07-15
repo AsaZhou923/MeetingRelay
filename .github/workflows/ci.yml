@@ -104,6 +104,10 @@ jobs:
         run: pnpm phase0:sherpa-candidate-measured-closeout:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 native candidate conformance contract
+        run: pnpm phase0:sherpa-candidate-conformance:test
+        timeout-minutes: 5
+
       - name: Test and validate Phase 0 replay ledgers
         run: |
           pnpm phase0:ledgers:test
@@ -445,6 +449,145 @@ jobs:
           })
           if ($marker.Count -ne 1) {
             throw "actual Release candidate-host provenance marker is missing or duplicated"
+          }
+        timeout-minutes: 10
+
+      - name: Build exact Release candidate execution-host executable
+        shell: pwsh
+        run: |
+          $metadata = & cargo metadata --format-version 1 --no-deps --offline --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed for candidate execution-host selection" }
+          $packageIds = @($metadata.packages |
+            Where-Object { $_.name -eq 'meetingrelay-model-worker-sherpa-native' } |
+            ForEach-Object { [string]$_.id } |
+            Sort-Object -Unique)
+          if ($packageIds.Count -ne 1) {
+            throw "Expected exactly one sherpa-native package ID, got $($packageIds.Count)"
+          }
+          $packageId = $packageIds[0]
+          $targetRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target'))
+          $rustcVersion = @(& rustc -vV)
+          if ($LASTEXITCODE -ne 0) { throw "rustc -vV failed for candidate execution-host target validation" }
+          $hostLines = @($rustcVersion | Where-Object { [string]$_ -like 'host: *' })
+          if ($hostLines.Count -ne 1 -or [string]$hostLines[0] -cne 'host: x86_64-pc-windows-msvc') {
+            throw "candidate execution host requires the x86_64-pc-windows-msvc Rust host triple"
+          }
+
+          $cargoArguments = @(
+            'build', '--release',
+            '-p', 'meetingrelay-model-worker-sherpa-native',
+            '--features', 'native-sherpa',
+            '--bin', 'meetingrelay-sherpa-candidate-execution-host',
+            '--message-format=json',
+            '--offline',
+            '--locked'
+          )
+          $messages = @(& cargo @cargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($LASTEXITCODE -ne 0) { throw "cargo failed to build the candidate execution host" }
+          $executables = @($messages |
+            Where-Object {
+              $_.reason -eq 'compiler-artifact' -and
+              [string]$_.package_id -eq $packageId -and
+              $_.target.name -eq 'meetingrelay-sherpa-candidate-execution-host' -and
+              @($_.target.kind).Count -eq 1 -and
+              [string]$_.target.kind[0] -eq 'bin' -and
+              -not [bool]$_.target.test -and
+              -not [bool]$_.profile.test -and
+              -not [bool]$_.profile.debug_assertions -and
+              [string]$_.profile.opt_level -ne '0' -and
+              -not [string]::IsNullOrWhiteSpace([string]$_.executable)
+            } |
+            ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
+            Sort-Object -Unique)
+          if ($executables.Count -ne 1) {
+            throw "Expected exactly one Cargo-reported candidate execution host, got $($executables.Count)"
+          }
+          $releaseExecutable = $executables[0]
+          $targetPrefix = $targetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          if (-not $releaseExecutable.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Cargo-reported candidate execution host is outside the repository target directory"
+          }
+          if ((Split-Path -Leaf $releaseExecutable) -cne 'meetingrelay-sherpa-candidate-execution-host.exe' -or
+              (Split-Path -Leaf (Split-Path -Parent $releaseExecutable)) -cne 'release' -or
+              [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $releaseExecutable))) -ne $targetRoot) {
+            throw "Cargo-reported candidate execution host has an unexpected target or profile path"
+          }
+          $current = $releaseExecutable
+          while ($null -ne $current) {
+            $attributes = [IO.File]::GetAttributes($current)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Cargo-reported candidate execution host path contains a reparse point"
+            }
+            $parent = [IO.Directory]::GetParent($current)
+            $current = if ($null -eq $parent) { $null } else { $parent.FullName }
+          }
+          if (-not (Test-Path -LiteralPath $releaseExecutable -PathType Leaf)) {
+            throw "Cargo-reported candidate execution host does not exist"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE=$releaseExecutable" -Encoding utf8
+        timeout-minutes: 20
+
+      - name: Audit Release candidate execution-host PE dependencies
+        shell: pwsh
+        run: |
+          $output = @(./tools/sherpa-native/audit-pe-dependencies.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -ExecutionHostBinaryPath $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "candidate execution-host PE dependency audit failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^PE_EXECUTION_HOST_DEPENDENCY_AUDIT=PASS binary=.+\\target\\release\\meetingrelay-sherpa-candidate-execution-host\.exe imports=.*sherpa-onnx-c-api\.dll.*$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "candidate execution-host PE dependency audit marker is missing or duplicated"
+          }
+        timeout-minutes: 5
+
+      - name: Probe actual Release candidate execution-host loaded modules
+        shell: pwsh
+        run: |
+          $schemaRegistry = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-schema-registry.json'))
+          $packageLock = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock'))
+          $output = @(./tools/sherpa-native/probe-loaded-runtime.ps1 `
+            -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
+            -ExecutionHostExecutable $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE `
+            -SchemaRegistryPath $schemaRegistry `
+            -ModelPath $env:MEETINGRELAY_SHERPA_MODEL `
+            -TokensPath $env:MEETINGRELAY_SHERPA_TOKENS `
+            -AssetLockPath $env:MEETINGRELAY_SHERPA_LOCK `
+            -PackageLockPath $packageLock `
+            -WavPath $env:MEETINGRELAY_SHERPA_WAV)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "candidate execution-host loaded-module probe failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^CANDIDATE_EXECUTION_LOADED_RUNTIME_MODULES=PASS executable=.+\\target\\release\\meetingrelay-sherpa-candidate-execution-host\.exe modules=.*onnxruntime\.dll.*sherpa-onnx-c-api\.dll.*$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "candidate execution-host loaded-module marker is missing or duplicated"
+          }
+        timeout-minutes: 10
+
+      - name: Run actual locked-assets Release candidate conformance
+        shell: pwsh
+        run: |
+          $schemaRegistry = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-schema-registry.json'))
+          $packageLock = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock'))
+          $output = @(& node ./tools/sherpa-native/validate-candidate-conformance.mjs `
+            $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE `
+            $schemaRegistry `
+            $env:MEETINGRELAY_SHERPA_MODEL `
+            $env:MEETINGRELAY_SHERPA_TOKENS `
+            $env:SHERPA_ONNX_LIB_DIR `
+            $env:MEETINGRELAY_SHERPA_LOCK `
+            $packageLock `
+            $env:MEETINGRELAY_SHERPA_WAV)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "actual locked-assets Release candidate conformance failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^candidate-native-conformance=verified worker_id=meetingrelay-sherpa-native-candidate-host-v1 executable_sha256=[0-9a-f]{64} schema_registry_sha256=[0-9a-f]{64} final_transcript_sha256=[0-9a-f]{64} formal_claims=none production_evidence=false$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "actual locked-assets Release candidate conformance marker is missing or duplicated"
           }
         timeout-minutes: 10
 

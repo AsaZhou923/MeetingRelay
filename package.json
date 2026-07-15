@@ -19,6 +19,7 @@
     "phase0:sherpa-candidate-bundle-plan:test": "node --test tools/sherpa-native/candidate-input-bundle-plan.test.mjs",
     "phase0:sherpa-candidate-measured-closeout:test": "node --test tools/sherpa-native/candidate-input-measured-closeout.test.mjs",
     "phase0:sherpa-candidate-materializer:test": "node --test tools/sherpa-native/candidate-input-materializer.test.mjs",
+    "phase0:sherpa-candidate-conformance:test": "node --test tools/sherpa-native/candidate-conformance.test.mjs",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",
     "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",

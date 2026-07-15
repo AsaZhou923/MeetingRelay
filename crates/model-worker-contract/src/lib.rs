@@ -3,12 +3,17 @@
 //! Wire codecs, model SDKs, runtimes, and product features intentionally live
 //! outside this crate.
 
+mod candidate_conformance;
 mod engine;
 mod error;
 mod fake;
 mod identity;
 mod protocol;
 
+pub use candidate_conformance::{
+    CandidateConformanceError, NativeCandidateSemanticObservation,
+    run_native_candidate_semantic_conformance,
+};
 pub use engine::{
     AudioChunk, AudioFormat, AudioGap, AudioPayload, AudioSource, BackendAction, BackendFailure,
     BackendOutcome, CancelReason, CancelTarget, Cancellation, ErrorCategory, ErrorSeverity,

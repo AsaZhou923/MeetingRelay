@@ -24,12 +24,19 @@ use meetingrelay_model_worker_contract::{
 use sha2::{Digest, Sha256};
 
 mod candidate_builder_input;
+#[cfg(feature = "native-sherpa")]
+mod candidate_execution;
 mod worker_provenance;
 
 pub use candidate_builder_input::{
     LOCKED_CANDIDATE_BUILDER_INPUT_SHA256_HEX, LOCKED_CANDIDATE_ID,
     LOCKED_MODEL_LICENSE_TEXT_SHA256_HEX, locked_candidate_builder_input_json_bytes,
     locked_engine_descriptor,
+};
+#[cfg(feature = "native-sherpa")]
+pub use candidate_execution::{
+    LOCKED_CONFORMANCE_WAV_SHA256_HEX, NativeCandidateExecutionError,
+    NativeCandidateExecutionInput, run_locked_native_candidate_conformance,
 };
 pub use worker_provenance::{
     LOCKED_SCHEMA_REGISTRY_BYTES, LOCKED_WORKER_ID, MAX_SCHEMA_REGISTRY_BYTES,

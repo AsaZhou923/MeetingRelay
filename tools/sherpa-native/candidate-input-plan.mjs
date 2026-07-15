@@ -93,9 +93,10 @@ export const SHERPA_CANDIDATE_ARTIFACT_MAPPING = deepFreeze([
     license: "project",
     material_kind: "copy",
     role: "worker-executable",
-    source_relative_path: "release/meetingrelay-sherpa-candidate-host.exe",
+    source_relative_path:
+      "release/meetingrelay-sherpa-candidate-execution-host.exe",
     source_root: "rust-target",
-    target_path: "assets/meetingrelay-sherpa-candidate-host.exe",
+    target_path: "assets/meetingrelay-sherpa-candidate-execution-host.exe",
   },
   {
     artifact_id: "artifact-model",

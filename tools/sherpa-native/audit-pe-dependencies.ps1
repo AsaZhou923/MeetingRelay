@@ -3,7 +3,8 @@ param(
     [string]$RuntimeDir,
     [string[]]$BinaryPath,
     [string[]]$ProvenanceBinaryPath,
-    [switch]$ParserSelfTest
+    [switch]$ParserSelfTest,
+    [string[]]$ExecutionHostBinaryPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,9 +236,11 @@ if ($ParserSelfTest) {
 }
 else {
     $hasSmokeBinary = $null -ne $BinaryPath -and $BinaryPath.Count -gt 0
+    $hasExecutionHostBinary = $null -ne $ExecutionHostBinaryPath -and $ExecutionHostBinaryPath.Count -gt 0
     $hasProvenanceBinary = $null -ne $ProvenanceBinaryPath -and $ProvenanceBinaryPath.Count -gt 0
-    if ([string]::IsNullOrWhiteSpace($RuntimeDir) -or (-not $hasSmokeBinary -and -not $hasProvenanceBinary)) {
-        throw "RuntimeDir and at least one BinaryPath or ProvenanceBinaryPath are required outside ParserSelfTest mode"
+    if ([string]::IsNullOrWhiteSpace($RuntimeDir) -or
+        (-not $hasSmokeBinary -and -not $hasExecutionHostBinary -and -not $hasProvenanceBinary)) {
+        throw "RuntimeDir and at least one BinaryPath, ExecutionHostBinaryPath, or ProvenanceBinaryPath are required outside ParserSelfTest mode"
     }
 
     & node (Join-Path $scriptRoot "validate-lock.mjs") $lockPath
@@ -328,6 +331,31 @@ foreach ($requestedBinary in $BinaryPath) {
         }
     }
     Write-Output "PE_DEPENDENCY_AUDIT=PASS binary=$binary imports=$($dependencies -join ',')"
+}
+
+foreach ($requestedBinary in $ExecutionHostBinaryPath) {
+    $binary = Resolve-UnderTarget -Value $requestedBinary -Label "ExecutionHostBinaryPath"
+    $attributes = Get-ExistingPathAttributes -Path $binary
+    if ($null -eq $attributes -or ($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+        throw "ExecutionHostBinaryPath is not an existing regular file: $binary"
+    }
+    if ((Split-Path -Leaf $binary) -cne "meetingrelay-sherpa-candidate-execution-host.exe" -or
+        (Split-Path -Leaf (Split-Path -Parent $binary)) -cne "release" -or
+        [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $binary))) -ne $targetRoot) {
+        throw "Execution host binary is not the exact Release target: $binary"
+    }
+    $dependencies = @(Get-PeDependencies -Path $binary)
+    if ($dependencies -notcontains "sherpa-onnx-c-api.dll") {
+        throw "Execution host does not directly import sherpa-onnx-c-api.dll: $binary"
+    }
+    foreach ($dependency in $dependencies) {
+        $allowed = $lockedDllNames.ContainsKey($dependency) -or
+            $systemAllowed.ContainsKey($dependency)
+        if (-not $allowed) {
+            throw "Execution host imports a non-allowlisted DLL: $dependency ($binary)"
+        }
+    }
+    Write-Output "PE_EXECUTION_HOST_DEPENDENCY_AUDIT=PASS binary=$binary imports=$($dependencies -join ',')"
 }
 
 foreach ($requestedBinary in $ProvenanceBinaryPath) {

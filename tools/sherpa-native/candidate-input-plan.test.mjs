@@ -245,6 +245,20 @@ test("the immutable mapping is the single source for artifact and materializatio
   const candidate = candidateManifest(plan).value;
   assert.equal(Object.isFrozen(SHERPA_CANDIDATE_ARTIFACT_MAPPING), true);
   assert.equal(SHERPA_CANDIDATE_ARTIFACT_MAPPING.length, 15);
+  const workerExecutable = SHERPA_CANDIDATE_ARTIFACT_MAPPING.find(
+    (spec) => spec.role === "worker-executable",
+  );
+  assert.deepEqual(workerExecutable, {
+    artifact_id: "artifact-worker-executable",
+    identity: "worker-executable",
+    license: "project",
+    material_kind: "copy",
+    role: "worker-executable",
+    source_relative_path:
+      "release/meetingrelay-sherpa-candidate-execution-host.exe",
+    source_root: "rust-target",
+    target_path: "assets/meetingrelay-sherpa-candidate-execution-host.exe",
+  });
   for (const spec of SHERPA_CANDIDATE_ARTIFACT_MAPPING) {
     assert.equal(Object.isFrozen(spec), true);
     const artifact = candidate.artifacts.find((entry) => entry.path === spec.target_path);

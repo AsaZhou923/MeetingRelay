@@ -1,6 +1,6 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3f candidate-input preparation**. WP-0.4.3a through WP-0.4.3f3a2b are Done/Passed; f3a1 source `122b1d930188fcc773d1086a0f7c4a5c63adb7e4` supplies the deterministic 28-material/26-entry sealed bundle plan without granting trust, f3a2a source `2e02db4a6721fd3dc85c68f044e3080adc38c56c` supplies the externally pinned Windows materializer core, and f3a2b source `95e91317142b1475f6d79eec13851ab95f9f70ff` hardens that core with a native destination no-replace publish operation, deterministic hostile-writer checkpoints, identity-swap rejection, and conservative cleanup reporting. The f3b foundation adds measured-HW input closeout without executing the candidate/model or creating evidence. These slices do not claim quality/performance, rank or select a candidate, approve distribution, or grant production authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
+MeetingRelay is currently in **WP-0.4.3g native candidate execution/conformance foundation (In Progress)**. WP-0.4.3a through WP-0.4.3f3a2b are Done/Passed; f3a1 source `122b1d930188fcc773d1086a0f7c4a5c63adb7e4` supplies the deterministic 28-material/26-entry sealed bundle plan without granting trust, f3a2a source `2e02db4a6721fd3dc85c68f044e3080adc38c56c` supplies the externally pinned Windows materializer core, and f3a2b source `95e91317142b1475f6d79eec13851ab95f9f70ff` hardens that core with a native destination no-replace publish operation, deterministic hostile-writer checkpoints, identity-swap rejection, and conservative cleanup reporting. The f3b foundation adds measured-HW input closeout without executing the candidate/model or creating evidence; g adds a separately supervised Release host that exercises the locked native adapter and semantic contract while preserving `InProcess` protocol transport and non-production authority. These slices do not claim quality/performance, rank or select a candidate, approve distribution, or grant production authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
 
 ## Prerequisites
 
@@ -31,6 +31,7 @@ pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:sherpa-candidate-bundle-plan:test
 pnpm phase0:sherpa-candidate-measured-closeout:test
 pnpm phase0:sherpa-candidate-materializer:test
+pnpm phase0:sherpa-candidate-conformance:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -63,6 +64,7 @@ pnpm phase0:sherpa-candidate-plan:test
 pnpm phase0:sherpa-candidate-bundle-plan:test
 pnpm phase0:sherpa-candidate-measured-closeout:test
 pnpm phase0:sherpa-candidate-materializer:test
+pnpm phase0:sherpa-candidate-conformance:test
 pnpm phase0:ledgers:test
 pnpm phase0:ledgers:validate
 pnpm phase0:provider:test
@@ -93,7 +95,9 @@ The WP-0.4.2 artifact validator generates an ignored bundle under `target/wp-0.4
 
 Historical contract-fixture candidate manifests remain schema `1.0`. Candidate-input manifests use schema `1.1`, and every license record preserves both its review scope and upstream review-source status. Internal-evaluation review accepts only `accepted-for-internal-evaluation` or conservative `unlicensed` source states and cannot authorize accepted distribution; the generic distribution scope uses the normalized `pending|accepted|rejected` review states and retains the independent approved-license digest gate. The descriptor's `model_license_id` binds the model artifact only: the project-generated aggregate model manifest may use another resolved license record, while every artifact still requires a unique role/path/ID and a sealed digest/license join. These fields record review inputs; they do not create license text or grant redistribution rights.
 
-Release candidate-host provenance reports the executable digest and its canonical decimal `executableSizeBytes` from the already collected file metadata; the CLI renders the same value as `executable_size_bytes`. This remains build provenance only, not model execution, performance, or quality evidence.
+Release `meetingrelay-sherpa-candidate-host.exe` provenance reports the executable digest and its canonical decimal `executableSizeBytes` from the already collected file metadata; the CLI renders the same value as `executable_size_bytes`. That binary remains provenance-only and must not import the sherpa runtime.
+
+The separate Release `meetingrelay-sherpa-candidate-execution-host.exe` is the executable material used by candidate-input plans. The Node conformance runner preflights the locked executable, schema, model, tokens, source runtime inventory, all four runtime DLLs staged beside the executable, asset lock, package lock, and WAV; launches the host with a bounded timeout/output and a `PATH` restricted to the executable directory plus System32; validates its canonical record against independently recomputed executable/schema digests; and repeats the input and staged-DLL checks after exit. The host and CI probe independently bind the actually loaded sherpa/ONNX module paths and hashes to those locked executable-directory files. Inside the host, the native candidate still negotiates `InProcess` through `DirectWorkerSession`; the outer child process only contains and supervises crashes and is not model-worker IPC or a sidecar. The record proves one real locked inference plus the enumerated lifecycle, flow-control, stable-failure, loaded-runtime identity, and Rust-panic checks, while fixing `formal_claims=none`, `production_evidence=false`, and resource/performance/quality as unmeasured. It contains only a transcript digest and byte count, not transcript text, paths, timings, run IDs, ranking, selection, default, publishability, or production conclusions. Native access violations and process abort isolation remain untested.
 
 The candidate-input materializer requires a non-zero contract digest supplied independently from the plan; it never promotes the plan's `proposedContractSha256` into trust. On a same-volume Windows local filesystem, destination publication uses a fixed UTF-16LE encoded, non-interactive system-PowerShell command whose only state-changing operation is `.NET Directory.Move`; the underlying native directory move is one namespace-atomic no-replace operation, so a regular file, file link, junction, directory link, empty directory, or nonempty directory raced into the destination is preserved rather than overwritten. The process uses the exact `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, disables shell lookup and profiles, supplies source/destination through a sanitized process environment, and requires an exact success token with empty stderr.
 

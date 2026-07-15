@@ -26,5 +26,12 @@ required-features = ["native-sherpa"]
 test = false
 bench = false
 
+[[bin]]
+name = "meetingrelay-sherpa-candidate-execution-host"
+path = "src/bin/meetingrelay_sherpa_candidate_execution_host.rs"
+required-features = ["native-sherpa"]
+test = false
+bench = false
+
 [lints]
 workspace = true

@@ -94,10 +94,61 @@ result, and replaying the same flush does not invoke the backend again. It makes
 no transcript accuracy,
 language-detection, quality, latency, or throughput claim.
 
-For CI-only loaded-module inspection, set both
+## Release candidate conformance host
+
+`meetingrelay-sherpa-candidate-host.exe` remains a provenance-only binary and
+must not import sherpa or ONNX Runtime DLLs. The distinct
+`meetingrelay-sherpa-candidate-execution-host.exe` is the Release executable
+material for candidate-input plans. It runs the locked backend through a
+`DirectWorkerSession`; the semantic transport is always `InProcess`. The Node
+runner's child-process boundary only supervises timeout, abnormal exit, stderr,
+and bounded output. It is not model-worker IPC or a sidecar.
+
+After materializing the sealed assets and staging the Release DLLs, run the
+actual host through the validating supervisor:
+
+```powershell
+cargo build --release --offline --locked `
+  -p meetingrelay-model-worker-sherpa-native `
+  --features native-sherpa `
+  --bin meetingrelay-sherpa-candidate-execution-host
+./tools/sherpa-native/stage-runtime.ps1 `
+  -LibDir $env:SHERPA_ONNX_LIB_DIR `
+  -Configuration Release
+node ./tools/sherpa-native/validate-candidate-conformance.mjs `
+  ./target/release/meetingrelay-sherpa-candidate-execution-host.exe `
+  ./tools/sherpa-native/candidate-schema-registry.json `
+  $env:MEETINGRELAY_SHERPA_MODEL `
+  $env:MEETINGRELAY_SHERPA_TOKENS `
+  $env:SHERPA_ONNX_LIB_DIR `
+  $env:MEETINGRELAY_SHERPA_LOCK `
+  ./Cargo.lock `
+  $env:MEETINGRELAY_SHERPA_WAV
+```
+
+The host executes one real locked inference and assertive handshake, prepare,
+audio/gap, final replay, cancellation, restart replay, heartbeat/progress,
+bounded-credit, stable-failure, provenance, and Rust-panic-containment lanes.
+Before it may emit the record, it verifies the four locked runtime DLLs staged
+beside its exact executable and binds the loaded `sherpa-onnx-c-api.dll` and
+`onnxruntime.dll` module paths, sizes, and hashes to those executable-directory
+files. The Node supervisor independently verifies the staged DLL identities
+before and after execution and restricts the child `PATH` to the executable
+directory plus `%SystemRoot%\System32`. CI additionally observes the live
+process modules through the hold hook below; the three checks protect separate
+parts of the Windows loader boundary.
+Its canonical record contains the final transcript digest and UTF-8 byte count,
+never the transcript text, paths, timings, or run IDs. The authority remains
+`formal_claims=none` and `production_evidence=false`; resource/performance,
+onsite quality, native access-violation handling, and process-abort isolation
+remain explicitly unmeasured or untested.
+
+For CI-only loaded-module inspection, both the native smoke and the Release
+execution host support the pair
 `MEETINGRELAY_SHERPA_MODULE_PROBE_READY_FILE` and
 `MEETINGRELAY_SHERPA_MODULE_PROBE_HOLD_MS`. After successful `Prepare`, the
 smoke writes its decimal PID (without a newline) to the ready file and pauses
-for 1–15000 ms. This lets an external PowerShell probe verify the loaded sherpa
-and ONNX Runtime module paths and hashes. If the ready-file variable is absent,
-the probe path has zero effect.
+for 1--15000 ms. This lets an external PowerShell probe verify the loaded sherpa
+and ONNX Runtime module paths and hashes. The execution host uses the same hook
+before conformance execution. Joint absence has zero effect; partial or
+malformed probe configuration fails closed without emitting a record.
