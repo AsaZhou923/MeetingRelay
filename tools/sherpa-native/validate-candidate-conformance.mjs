@@ -285,6 +285,7 @@ export function validateNativeCandidateConformanceRecord({
   return {
     executableSha256,
     finalTranscriptSha256: record.execution.final_transcript_sha256,
+    finalTranscriptUtf8Bytes: record.execution.final_transcript_utf8_bytes,
     schemaRegistrySha256,
     workerId: record.worker_manifest.worker_id,
   };

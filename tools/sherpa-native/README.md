@@ -60,3 +60,28 @@ The runtime inventory's canonical compact JSON digest is `0682618f660a2a9f2278d9
 Its SHA-256 is `0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e`. `audit-pe-dependencies.ps1` verifies the exact import sets of the four runtime DLLs with `dumpbin`, confines smoke imports to locked runtime or explicit Windows system allowlists, and rechecks the staged DLL identities.
 
 The sealed current SenseVoice license identity is `LicenseRef-FunASR-Model-1.1-Internal-Evaluation`. Legal/Product review is accepted only for internal evaluation; distribution status remains `pending`. This lock authorizes internal Phase 0 functional evaluation only. It does not authorize model redistribution or any quality/performance claim.
+
+## Native exact-match quality smoke
+
+`candidate-quality-smoke-reference.json` seals the upstream-documented `zh.wav` identity and transcript reference without carrying the WAV bytes. The audio fixture remains a read-in-place local-cache input: its redistribution status is `unresolved`, and it must not be committed, uploaded, or distributed. The runner rejects any fixture other than the exact 178,988-byte mono PCM S16LE, 16 kHz, 5.592-second WAV identified by SHA-256 `b77f1794fe374a0ba1ee1dc458bfaf9349496cbbfc32780c50ba3c5a7ad8e373`.
+
+The smoke launches the existing locked Release candidate host in two fresh processes. Both conformance records must report one real backend execution and the exact canonical transcript identity: 38 UTF-8 bytes with SHA-256 `3dcf3d55f672e2d610a031580f924b47ddf147ff3d93f007b8386f9bef8cac58`. The byte length plus digest rejects BOM, newline, content, and normalization drift while keeping transcript content out of process output. Evidence is written through a create-new, sync, reread, strict-validate, hard-link-no-replace sequence.
+
+This is an internal, upstream-documented single-fixture smoke reference, not independently licensed gold data and not a parameter-identical reproduction of the upstream example (MeetingRelay locks `language=zh`, while the cited upstream default is automatic language selection). Its evidence therefore fixes `quality_gate_status=not-assessed`, `formal_claims=none`, and `production_evidence=false`; it cannot establish product quality, performance, resource use, candidate selection/default, or parent work-package closeout.
+
+```powershell
+pnpm phase0:sherpa-candidate-quality-smoke:test
+
+$evidencePath = [IO.Path]::GetFullPath('target/sherpa-native/native-candidate-quality-smoke-evidence.json')
+pnpm phase0:sherpa-candidate-quality-smoke:run `
+  $evidencePath `
+  target/release/meetingrelay-sherpa-candidate-execution-host.exe `
+  tools/sherpa-native/candidate-schema-registry.json `
+  $env:MEETINGRELAY_SHERPA_MODEL `
+  $env:MEETINGRELAY_SHERPA_TOKENS `
+  $env:SHERPA_ONNX_LIB_DIR `
+  tools/sherpa-native/assets.lock.json `
+  Cargo.lock `
+  $env:MEETINGRELAY_SHERPA_WAV
+pnpm phase0:sherpa-candidate-quality-smoke:validate $evidencePath
+```

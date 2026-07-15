@@ -125,6 +125,7 @@ test("canonical native candidate conformance is a non-production supporting reco
   assert.deepEqual(result, {
     executableSha256: sha256(input.executableBytes),
     finalTranscriptSha256: input.record.execution.final_transcript_sha256,
+    finalTranscriptUtf8Bytes: input.record.execution.final_transcript_utf8_bytes,
     schemaRegistrySha256: sha256(input.schemaRegistryBytes),
     workerId: "meetingrelay-sherpa-native-candidate-host-v1",
   });

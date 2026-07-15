@@ -47,10 +47,11 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'tools/sherpa-native/assets.lock.json', 'tools/sherpa-native/assets.lock.sha256') }}
+            target/debug
+            target/release
+          key: ${{ runner.os }}-rust-no-model-assets-v1-1.95.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'tools/sherpa-native/assets.lock.json', 'tools/sherpa-native/assets.lock.sha256') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.95.0-
+            ${{ runner.os }}-rust-no-model-assets-v1-1.95.0-
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -106,6 +107,10 @@ jobs:
 
       - name: Test WP-0.4 native candidate conformance contract
         run: pnpm phase0:sherpa-candidate-conformance:test
+        timeout-minutes: 5
+
+      - name: Test WP-0.4 native exact-match quality-smoke evidence contract
+        run: pnpm phase0:sherpa-candidate-quality-smoke:test
         timeout-minutes: 5
 
       - name: Test WP-0.4 native fatal-process evidence contract
@@ -594,6 +599,87 @@ jobs:
             throw "actual locked-assets Release candidate conformance marker is missing or duplicated"
           }
         timeout-minutes: 10
+
+      - name: Run actual sealed-reference native exact-match quality smoke
+        shell: pwsh
+        run: |
+          $schemaRegistry = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-schema-registry.json'))
+          $packageLock = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock'))
+          $evidencePath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/sherpa-native/native-candidate-quality-smoke-evidence.json'))
+          if (Test-Path -LiteralPath $evidencePath) {
+            throw "refusing to replace an existing native candidate quality-smoke evidence file"
+          }
+          $output = @(& pnpm phase0:sherpa-candidate-quality-smoke:run `
+            $evidencePath `
+            $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE `
+            $schemaRegistry `
+            $env:MEETINGRELAY_SHERPA_MODEL `
+            $env:MEETINGRELAY_SHERPA_TOKENS `
+            $env:SHERPA_ONNX_LIB_DIR `
+            $env:MEETINGRELAY_SHERPA_LOCK `
+            $packageLock `
+            $env:MEETINGRELAY_SHERPA_WAV)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "actual native candidate quality-smoke evidence run failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^candidate-native-quality-smoke-evidence=verified evidence_sha256=[0-9a-f]{64} locked_input_snapshot_sha256=[0-9a-f]{64} runs=2 quality_gate_status=not-assessed redistribution_status=unresolved formal_claims=none production_evidence=false$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "actual native candidate quality-smoke evidence marker is missing or duplicated"
+          }
+
+          $validation = @(& pnpm phase0:sherpa-candidate-quality-smoke:validate $evidencePath)
+          $validation | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "persisted native candidate quality-smoke evidence failed strict validation" }
+          $validationMarker = @($validation | Where-Object {
+            [string]$_ -match '^candidate-native-quality-smoke-evidence-file=verified evidence_sha256=[0-9a-f]{64} locked_input_snapshot_sha256=[0-9a-f]{64} runs=2 quality_gate_status=not-assessed redistribution_status=unresolved formal_claims=none production_evidence=false$'
+          })
+          if ($validationMarker.Count -ne 1) {
+            throw "persisted native candidate quality-smoke validation marker is missing or duplicated"
+          }
+          if (@(git status --porcelain=v1 -- Cargo.lock).Count -ne 0) {
+            throw "native quality-smoke evidence changed Cargo.lock"
+          }
+        timeout-minutes: 15
+
+      - name: Clean native quality-smoke evidence state
+        if: always()
+        shell: pwsh
+        run: |
+          $repositoryTargetRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target'))
+          $targetPrefix = $repositoryTargetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          $evidencePath = [IO.Path]::GetFullPath((Join-Path $repositoryTargetRoot 'sherpa-native/native-candidate-quality-smoke-evidence.json'))
+          $evidenceParent = Split-Path -Parent $evidencePath
+          $stagingCandidates = @(
+            Get-ChildItem -LiteralPath $evidenceParent -Force -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -cmatch '^\.native-candidate-quality-smoke-evidence\.json\.[0-9a-f]{32}\.staging$' } |
+              ForEach-Object { [IO.Path]::GetFullPath($_.FullName) }
+          )
+          foreach ($candidate in @($evidencePath) + $stagingCandidates) {
+            if (-not $candidate.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "native quality-smoke cleanup target escaped the repository target directory"
+            }
+            $current = $candidate
+            while ($true) {
+              if (Test-Path -LiteralPath $current) {
+                $attributes = [IO.File]::GetAttributes($current)
+                if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                  throw "native quality-smoke cleanup path contains a reparse point: $current"
+                }
+              }
+              if ($current.Equals($repositoryTargetRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+              $parent = [IO.Directory]::GetParent($current)
+              if ($null -eq $parent) { throw "native quality-smoke cleanup path did not reach the repository target root" }
+              $current = $parent.FullName
+            }
+            if (Test-Path -LiteralPath $candidate) {
+              Remove-Item -LiteralPath $candidate -Force
+            }
+            if (Test-Path -LiteralPath $candidate) {
+              throw "native quality-smoke cleanup left state behind: $candidate"
+            }
+          }
+        timeout-minutes: 5
 
       - name: Build exact Release candidate fault-host executable
         shell: pwsh
