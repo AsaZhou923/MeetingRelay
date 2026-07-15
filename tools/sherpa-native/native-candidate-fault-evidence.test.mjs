@@ -748,6 +748,34 @@ test("fault fixtures and evidence tooling are statically excluded from shipping 
   assert.equal(Object.hasOwn(tauri.bundle, "resources"), false);
 });
 
+test("CI forwards fault-evidence arguments without a literal pnpm sentinel", async () => {
+  const workflow = await readFile(
+    path.resolve(HERE, "../../.github/workflows/ci.yml"),
+    "utf8",
+  );
+  const lines = workflow.split(/\r?\n/u).map((line) => line.trim());
+  assert.equal(
+    lines.includes(
+      "$output = @(& pnpm phase0:sherpa-candidate-fault-evidence:run `",
+    ),
+    true,
+  );
+  assert.equal(
+    lines.includes(
+      "$validation = @(& pnpm phase0:sherpa-candidate-fault-evidence:validate $evidencePath)",
+    ),
+    true,
+  );
+  assert.equal(
+    workflow.includes("phase0:sherpa-candidate-fault-evidence:run --"),
+    false,
+  );
+  assert.equal(
+    workflow.includes("phase0:sherpa-candidate-fault-evidence:validate --"),
+    false,
+  );
+});
+
 test("read-only CLI validates an existing record and emits the exact non-authority marker", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-fault-cli-"));
   t.after(() => rm(root, { force: true, recursive: true }));

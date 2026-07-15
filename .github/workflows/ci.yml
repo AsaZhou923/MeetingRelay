@@ -749,7 +749,7 @@ jobs:
           if (Test-Path -LiteralPath $evidencePath) {
             throw "refusing to replace an existing native candidate fault-evidence file"
           }
-          $output = @(& pnpm phase0:sherpa-candidate-fault-evidence:run -- `
+          $output = @(& pnpm phase0:sherpa-candidate-fault-evidence:run `
             $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_FAULT_HOST_EXE `
             $env:MEETINGRELAY_NATIVE_FATAL_BOUNDARY_FIXTURE_EXE `
             $evidencePath `
@@ -770,7 +770,7 @@ jobs:
             throw "actual native candidate fault-evidence marker is missing or duplicated"
           }
 
-          $validation = @(& pnpm phase0:sherpa-candidate-fault-evidence:validate -- $evidencePath)
+          $validation = @(& pnpm phase0:sherpa-candidate-fault-evidence:validate $evidencePath)
           $validation | Write-Output
           if ($LASTEXITCODE -ne 0) { throw "persisted native candidate fault evidence failed strict validation" }
           $validationMarker = @($validation | Where-Object {
