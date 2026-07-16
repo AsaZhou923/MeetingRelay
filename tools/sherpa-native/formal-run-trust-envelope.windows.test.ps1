@@ -209,6 +209,7 @@ try {
     Set-ExactControlledAcl -Path $controlledRoot
     $inventoryPath = Join-Path $controlledRoot "inventory.bin"
     [IO.File]::WriteAllBytes($inventoryPath, [byte[]](1, 3, 3, 7))
+    Set-ExactControlledAcl -Path $inventoryPath
     $retentionExpires = [DateTimeOffset]::UtcNow.AddDays(30).ToUnixTimeSeconds()
     $retentionMarkerPath = Join-Path $controlledRoot ".meetingrelay-retention-v1"
     [IO.File]::WriteAllText(
@@ -216,6 +217,7 @@ try {
         ([string]$retentionExpires) + "`n",
         [Text.UTF8Encoding]::new($false)
     )
+    Set-ExactControlledAcl -Path $retentionMarkerPath
     $attestResult = Invoke-Attestor -Argument @("attest", $controlledRoot)
     if ($attestResult.ExitCode -ne 0 -or $attestResult.Stderr.Length -ne 0) {
         $stdoutBytes = [Text.Encoding]::UTF8.GetByteCount($attestResult.Stdout)
@@ -292,11 +294,13 @@ try {
     New-Item -ItemType Directory -Path $overRetentionRoot | Out-Null
     Set-ExactControlledAcl -Path $overRetentionRoot
     $overRetentionExpires = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + (30 * 24 * 60 * 60) + 60
+    $overRetentionMarkerPath = Join-Path $overRetentionRoot ".meetingrelay-retention-v1"
     [IO.File]::WriteAllText(
-        (Join-Path $overRetentionRoot ".meetingrelay-retention-v1"),
+        $overRetentionMarkerPath,
         ([string]$overRetentionExpires) + "`n",
         [Text.UTF8Encoding]::new($false)
     )
+    Set-ExactControlledAcl -Path $overRetentionMarkerPath
     Assert-FailedWithoutOutput -Result (Invoke-Attestor -Argument @("attest", $overRetentionRoot)) -Label "30-day-plus-one-minute retention"
 
     $overInventoryRoot = Join-Path $testRoot "over-inventory"
