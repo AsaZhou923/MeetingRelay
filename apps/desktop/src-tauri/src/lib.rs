@@ -1,6 +1,8 @@
 use meetingrelay_benchmark_contract::{CONTRACT_VERSION, Observation};
 use serde::Serialize;
 
+mod mvp;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapProbe {
@@ -29,7 +31,15 @@ fn bootstrap_probe() -> BootstrapProbe {
 }
 
 fn with_bootstrap_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
-    builder.invoke_handler(tauri::generate_handler![bootstrap_probe])
+    builder
+        .manage(mvp::MvpService::default())
+        .invoke_handler(tauri::generate_handler![
+            bootstrap_probe,
+            mvp::mvp_preflight,
+            mvp::mvp_start,
+            mvp::mvp_stop,
+            mvp::mvp_snapshot
+        ])
 }
 
 pub fn run() {
@@ -96,5 +106,70 @@ mod tests {
                 panic!("bootstrap probe returned a raw IPC body")
             }
         }
+    }
+
+    #[test]
+    fn mvp_snapshot_round_trips_through_tauri_ipc() {
+        let app = with_bootstrap_handler(tauri::test::mock_builder())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock Tauri app");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("failed to build mock webview window");
+
+        let response = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "mvp_snapshot".to_owned(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost"
+                    .parse()
+                    .expect("mock invoke URL must be valid"),
+                body: tauri::ipc::InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+            },
+        )
+        .expect("MVP snapshot IPC request failed");
+
+        let tauri::ipc::InvokeResponseBody::Json(body) = response else {
+            panic!("MVP snapshot returned a raw IPC body");
+        };
+        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.v1""#));
+        assert!(body.contains(r#""lifecycle":"booting""#));
+        assert!(body.contains(r#""localOnly":true,"memoryOnly":true"#));
+    }
+
+    #[test]
+    fn mvp_start_ipc_rejects_missing_consent_before_capture() {
+        let app = with_bootstrap_handler(tauri::test::mock_builder())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock Tauri app");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("failed to build mock webview window");
+
+        let error = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "mvp_start".to_owned(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost"
+                    .parse()
+                    .expect("mock invoke URL must be valid"),
+                body: tauri::ipc::InvokeBody::Json(
+                    r#"{"consentAccepted":false}"#
+                        .parse()
+                        .expect("MVP start body must be valid JSON"),
+                ),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+            },
+        )
+        .expect_err("missing consent must be rejected");
+
+        assert!(error.to_string().contains("CONSENT_REQUIRED"));
     }
 }

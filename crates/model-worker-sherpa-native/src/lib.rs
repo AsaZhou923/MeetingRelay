@@ -30,6 +30,7 @@ mod candidate_execution;
 mod candidate_fault;
 #[cfg(feature = "native-quality-sample")]
 mod candidate_quality_sample;
+mod realtime;
 mod worker_provenance;
 
 pub use candidate_builder_input::{
@@ -50,6 +51,10 @@ pub use candidate_fault::{NATIVE_CANDIDATE_FAULT_CHECKPOINT_KIND, NativeCandidat
 pub use candidate_quality_sample::{
     NativeCandidateQualitySampleError, NativeCandidateQualitySampleIdentity,
     NativeCandidateQualitySampleInput, run_locked_native_candidate_quality_sample,
+};
+pub use realtime::{
+    LOCKED_REALTIME_MAX_PCM16_BYTES, LOCKED_REALTIME_SAMPLE_RATE_HZ, LockedSherpaRealtime,
+    LockedSherpaRealtimeError, LockedSherpaRealtimePaths,
 };
 pub use worker_provenance::{
     LOCKED_SCHEMA_REGISTRY_BYTES, LOCKED_WORKER_ID, MAX_SCHEMA_REGISTRY_BYTES,
@@ -422,6 +427,8 @@ struct SealedModelAssets {
 enum VerificationMode {
     #[cfg(feature = "native-sherpa")]
     LockedProduction,
+    #[cfg(feature = "native-sherpa")]
+    LocalMvp,
     #[cfg(test)]
     StructuralTest,
 }
@@ -445,6 +452,19 @@ impl SherpaNativeBackend {
                 sealed_model_assets: None,
             })
         }
+    }
+
+    #[cfg(feature = "native-sherpa")]
+    fn new_local_mvp(config: SherpaNativeConfig) -> Result<Self, SherpaConfigError> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            port: default_inference_port(),
+            assets_verified: false,
+            initialized: false,
+            verification: VerificationMode::LocalMvp,
+            sealed_model_assets: None,
+        })
     }
 
     #[cfg(feature = "native-quality-sample")]
@@ -518,7 +538,10 @@ impl SherpaNativeBackend {
             return Ok(());
         }
         #[cfg(feature = "native-sherpa")]
-        if matches!(self.verification, VerificationMode::LockedProduction) {
+        if matches!(
+            self.verification,
+            VerificationMode::LockedProduction | VerificationMode::LocalMvp
+        ) {
             resolve_production_model_paths(&mut self.config)?;
         }
         let sealed_model_assets = verify_configured_assets(&self.config, self.verification)?;
@@ -702,6 +725,11 @@ fn verify_configured_assets(
     match verification {
         #[cfg(feature = "native-sherpa")]
         VerificationMode::LockedProduction => {
+            verify_locked_runtime(&config.runtime_lib_dir)?;
+            open_and_verify_model_assets(config).map(Some)
+        }
+        #[cfg(feature = "native-sherpa")]
+        VerificationMode::LocalMvp => {
             verify_locked_runtime(&config.runtime_lib_dir)?;
             open_and_verify_model_assets(config).map(Some)
         }
@@ -1154,6 +1182,16 @@ mod tests {
         (backend, calls)
     }
 
+    fn realtime_paths(assets: &TestAssets) -> LockedSherpaRealtimePaths {
+        LockedSherpaRealtimePaths {
+            model_path: assets.model.clone(),
+            tokens_path: assets.tokens.clone(),
+            runtime_lib_dir: assets.runtime_lib_dir.clone(),
+            asset_lock_path: assets.asset_lock.clone(),
+            package_lock_path: assets.package_lock.clone(),
+        }
+    }
+
     #[test]
     fn canonical_s16_hash_and_conversion_are_little_endian() {
         let assets = TestAssets::new();
@@ -1334,6 +1372,97 @@ mod tests {
         let calls = calls.lock().expect("calls lock");
         assert_eq!(calls.initialize, 1);
         assert_eq!(calls.recognize, 2);
+    }
+
+    #[test]
+    fn realtime_locked_config_is_the_exact_zh_cpu_candidate() {
+        let assets = TestAssets::new();
+        let config = realtime::locked_zh_cpu_config(&realtime_paths(&assets))
+            .expect("locked realtime config");
+
+        assert_eq!(config.descriptor, locked_engine_descriptor());
+        assert_eq!(config.normalized_language.as_str(), "zh");
+        assert_eq!(config.execution_provider, ExecutionProvider::Cpu);
+        assert_eq!(config.num_threads, 1);
+        assert!(config.use_itn);
+        assert_eq!(config.max_input_bytes, LOCKED_REALTIME_MAX_PCM16_BYTES);
+        assert_eq!(
+            config.expected_tokens_sha256,
+            locked_digest(LOCKED_TOKENS_SHA256_HEX)
+        );
+        assert_eq!(config.validate_locked_candidate(), Ok(()));
+    }
+
+    #[test]
+    fn realtime_prepares_once_and_reuses_the_backend_for_repeated_segments() {
+        let assets = TestAssets::new();
+        let (backend, calls) = backend(config(&assets), false, FakeRecognition::Text("recognized"));
+        let mut realtime =
+            LockedSherpaRealtime::from_test_backend(backend).expect("prepare realtime backend");
+
+        let first = realtime
+            .transcribe_mono_16khz_pcm16(Arc::from([1_i16, -2]))
+            .expect("first segment");
+        let second = realtime
+            .transcribe_mono_16khz_pcm16(Arc::from([3_i16, -4, 5]))
+            .expect("second segment");
+
+        assert_eq!(first.original_transcript.as_str(), "recognized");
+        assert_eq!(second.original_transcript.as_str(), "recognized");
+        let calls = calls.lock().expect("calls lock");
+        assert_eq!(calls.initialize, 1);
+        assert_eq!(calls.recognize, 2);
+        assert_eq!(
+            calls.observed_samples,
+            vec![3.0 / 32_768.0, -4.0 / 32_768.0, 5.0 / 32_768.0]
+        );
+    }
+
+    #[test]
+    fn realtime_rejects_empty_and_oversized_segments_before_inference() {
+        let assets = TestAssets::new();
+        let mut bounded = config(&assets);
+        bounded.max_input_bytes = 3;
+        bounded.descriptor.parameter_sha256 = bounded.parameter_sha256();
+        let (backend, calls) = backend(bounded, false, FakeRecognition::Text("unused"));
+        let mut realtime = LockedSherpaRealtime::from_test_backend(backend)
+            .expect("prepare bounded realtime backend");
+
+        assert_eq!(
+            realtime
+                .transcribe_mono_16khz_pcm16(Arc::<[i16]>::from([]))
+                .map(|_| ()),
+            Err(LockedSherpaRealtimeError::EmptySegment)
+        );
+        assert_eq!(
+            realtime
+                .transcribe_mono_16khz_pcm16(Arc::from([1_i16, 2]))
+                .map(|_| ()),
+            Err(LockedSherpaRealtimeError::SegmentTooLarge)
+        );
+
+        let calls = calls.lock().expect("calls lock");
+        assert_eq!(calls.initialize, 1);
+        assert_eq!(calls.recognize, 0);
+    }
+
+    #[test]
+    fn realtime_rejects_relative_paths_with_a_stable_path_free_code() {
+        let relative = PathBuf::from("relative");
+        let paths = LockedSherpaRealtimePaths {
+            model_path: relative.join("model.int8.onnx"),
+            tokens_path: relative.join("tokens.txt"),
+            runtime_lib_dir: relative.join("runtime"),
+            asset_lock_path: relative.join("assets.lock.json"),
+            package_lock_path: relative.join("Cargo.lock"),
+        };
+
+        let error = LockedSherpaRealtime::prepare(paths)
+            .map(|_| ())
+            .expect_err("relative paths must fail before native construction");
+        assert_eq!(error, LockedSherpaRealtimeError::InvalidAssetPaths);
+        assert_eq!(error.code(), "SHERPA_REALTIME_INVALID_ASSET_PATHS");
+        assert_eq!(error.to_string(), error.code());
     }
 
     #[test]

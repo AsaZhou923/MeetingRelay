@@ -19,6 +19,10 @@ meetingrelay-benchmark-contract = { path = "../../../crates/benchmark-contract" 
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "=2.11.2", default-features = false, features = ["wry", "compression"] }
 
+[target.'cfg(windows)'.dependencies]
+cpal = { version = "=0.17.3", default-features = false }
+meetingrelay-model-worker-sherpa-native = { path = "../../../crates/model-worker-sherpa-native", features = ["native-sherpa"] }
+
 [dev-dependencies]
 tauri = { version = "=2.11.2", default-features = false, features = ["wry", "compression", "test"] }
 

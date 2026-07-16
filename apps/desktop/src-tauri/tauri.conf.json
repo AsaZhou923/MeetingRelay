@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MeetingRelay Phase 0",
+  "productName": "MeetingRelay",
   "version": "0.0.1",
   "identifier": "com.meetingrelay.phase0",
   "build": {
@@ -13,9 +13,11 @@
     "windows": [
       {
         "label": "main",
-        "title": "MeetingRelay Phase 0",
-        "width": 960,
-        "height": 640,
+        "title": "MeetingRelay · 本地实时转写",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 720,
+        "minHeight": 620,
         "resizable": true
       }
     ],

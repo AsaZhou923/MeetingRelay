@@ -65,9 +65,11 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_NET_OFFLINE=true' -Encoding utf8
         timeout-minutes: 10
 
-      - name: Test desktop bootstrap contract
-        run: pnpm --dir apps/desktop test
-        timeout-minutes: 5
+      - name: Validate desktop frontend MVP contract, types, and production bundle
+        run: |
+          pnpm --dir apps/desktop test
+          pnpm desktop:build
+        timeout-minutes: 10
 
       - name: Test and validate Phase 0 fixtures
         run: |
@@ -263,7 +265,7 @@ jobs:
         run: cargo fmt --all -- --check
         timeout-minutes: 5
 
-      - name: Lint Rust workspace
+      - name: Lint Rust workspace including desktop MVP and sherpa wrapper
         run: cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings
         timeout-minutes: 15
 
@@ -273,11 +275,11 @@ jobs:
           cargo test -p meetingrelay-model-worker-sherpa-native --all-targets --no-default-features --offline --locked
         timeout-minutes: 10
 
-      - name: Check Rust workspace
+      - name: Check Rust workspace including desktop MVP and sherpa wrapper
         run: cargo check --workspace --all-targets --all-features --offline --locked
         timeout-minutes: 15
 
-      - name: Test Rust workspace
+      - name: Test Rust workspace including desktop MVP and sherpa wrapper
         run: cargo test --workspace --all-targets --all-features --offline --locked
         timeout-minutes: 15
 
@@ -1256,14 +1258,33 @@ jobs:
         run: pnpm phase0:sherpa-candidate-materializer:test
         timeout-minutes: 5
 
-      - name: Typecheck desktop frontend
-        run: pnpm desktop:typecheck
-        timeout-minutes: 10
+      - name: Build and stage release desktop MVP shell
+        shell: pwsh
+        run: |
+          pnpm --dir apps/desktop run tauri:build:ci
+          if ($LASTEXITCODE -ne 0) { throw "release desktop MVP build failed" }
 
-      - name: Build desktop frontend
-        run: pnpm desktop:build
-        timeout-minutes: 10
+          $desktopExecutable = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/release/meetingrelay-desktop.exe'))
+          if (-not (Test-Path -LiteralPath $desktopExecutable -PathType Leaf)) {
+            throw "release desktop MVP executable is missing: $desktopExecutable"
+          }
 
-      - name: Build release desktop shell
-        run: pnpm --dir apps/desktop run tauri:build:ci
+          & ./tools/sherpa-native/stage-runtime.ps1 `
+            -LibDir $env:SHERPA_ONNX_LIB_DIR `
+            -Configuration Release
+          if ($LASTEXITCODE -ne 0) { throw "release desktop MVP runtime staging failed" }
+
+          foreach ($dll in @(
+            'onnxruntime.dll',
+            'onnxruntime_providers_shared.dll',
+            'sherpa-onnx-c-api.dll',
+            'sherpa-onnx-cxx-api.dll'
+          )) {
+            $stagedDll = Join-Path (Split-Path -Parent $desktopExecutable) $dll
+            if (-not (Test-Path -LiteralPath $stagedDll -PathType Leaf)) {
+              throw "release desktop MVP runtime DLL is missing: $stagedDll"
+            }
+          }
+
+          Write-Output "DESKTOP_MVP_RELEASE_STAGING=PASS executable=$desktopExecutable"
         timeout-minutes: 20
