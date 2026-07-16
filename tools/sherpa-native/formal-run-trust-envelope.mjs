@@ -708,11 +708,14 @@ async function publishReadiness(outputPath, bytes, operations) {
   let parentBefore;
   try {
     const canonicalParent = await realpath(parentPath);
-    if (path.resolve(canonicalParent).toLowerCase() !== path.resolve(parentPath).toLowerCase()) {
-      fail("FORMAL_TRUST_READINESS_PUBLICATION");
-    }
     parentBefore = await lstat(parentPath, { bigint: true });
-    if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink()) {
+    const canonicalParentBefore = await lstat(canonicalParent, { bigint: true });
+    if (
+      !parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
+      !canonicalParentBefore.isDirectory() || canonicalParentBefore.isSymbolicLink() ||
+      parentBefore.dev !== canonicalParentBefore.dev ||
+      parentBefore.ino !== canonicalParentBefore.ino
+    ) {
       fail("FORMAL_TRUST_READINESS_PUBLICATION");
     }
     let current = parentPath;
@@ -750,10 +753,13 @@ async function publishReadiness(outputPath, bytes, operations) {
     after = stable.stat;
     const parentAfter = await lstat(parentPath, { bigint: true });
     const canonicalParentAfter = await realpath(parentPath);
+    const canonicalParentAfterStat = await lstat(canonicalParentAfter, { bigint: true });
     if (
       !parentAfter.isDirectory() || parentAfter.isSymbolicLink() ||
+      !canonicalParentAfterStat.isDirectory() || canonicalParentAfterStat.isSymbolicLink() ||
       parentAfter.dev !== parentBefore.dev || parentAfter.ino !== parentBefore.ino ||
-      path.resolve(canonicalParentAfter).toLowerCase() !== path.resolve(parentPath).toLowerCase()
+      parentAfter.dev !== canonicalParentAfterStat.dev ||
+      parentAfter.ino !== canonicalParentAfterStat.ino
     ) {
       fail("FORMAL_TRUST_READINESS_POSTFLIGHT");
     }
