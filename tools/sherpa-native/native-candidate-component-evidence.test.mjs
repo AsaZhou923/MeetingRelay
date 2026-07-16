@@ -124,14 +124,17 @@ function sampleIdentitySha(sample) {
 
 function hostRecord(sample, index, drift = {}) {
   const execute = String(1_000_000 + index);
+  const finalTranscript = `${sample.language}-private-hypothesis-${index}`;
+  const finalTranscriptBytes = Buffer.from(finalTranscript, "utf8");
   return {
     authority: { formal_claims: "none", production_evidence: false },
     candidate: candidate(sample.language),
     execution: {
       backend_execute_calls: 1,
       execute_elapsed_ns: execute,
-      final_transcript_sha256: `${index + 2}`.repeat(64),
-      final_transcript_utf8_bytes: String(10 + index),
+      final_transcript: finalTranscript,
+      final_transcript_sha256: sha256(finalTranscriptBytes),
+      final_transcript_utf8_bytes: String(finalTranscriptBytes.length),
       fresh_process_per_sample: true,
       prepare_elapsed_ns: String(500_000 + index),
     },
@@ -190,9 +193,12 @@ async function tempOutput(t) {
 }
 
 async function expectCode(operation, code) {
-  await assert.rejects(operation, (error) =>
-    error instanceof NativeCandidateComponentEvidenceError && error.code === code
-  );
+  let captured;
+  await assert.rejects(operation, (error) => {
+    captured = error;
+    return error instanceof NativeCandidateComponentEvidenceError && error.code === code;
+  });
+  return captured;
 }
 
 test("supervisor preserves manifest order, exact 13 argv, and one backend call per sample", async (t) => {
@@ -201,6 +207,7 @@ test("supervisor preserves manifest order, exact 13 argv, and one backend call p
   const calls = [];
   let corpusLoads = 0;
   let joinLoads = 0;
+  const privateTranscripts = [];
   const result = await __runNativeCandidateComponentEvidenceForTest(input(output), {
     candidateJoinLoader: async () => { joinLoads += 1; return join(); },
     corpusLoader: async () => { corpusLoads += 1; return expectedCorpus; },
@@ -208,6 +215,7 @@ test("supervisor preserves manifest order, exact 13 argv, and one backend call p
       calls.push({ argv, executablePath, sampleId: sample.sampleId });
       return Buffer.from(encodeCanonicalJsonLine(hostRecord(sample, calls.length)), "utf8");
     },
+    privateTranscriptConsumer: async (entry) => { privateTranscripts.push(entry); },
   });
   assert.equal(result.evidenceSha256, sha256(await readFile(output)));
   assert.deepEqual(calls.map((call) => call.sampleId), ["sample-en", "sample-ja", "sample-zh"]);
@@ -233,6 +241,23 @@ test("supervisor preserves manifest order, exact 13 argv, and one backend call p
   assert.equal(corpusLoads, 4);
   assert.equal(joinLoads, 4);
   assert.equal(result.record.results.length, 3);
+  assert.deepEqual(
+    privateTranscripts.map(({ attempt, finalTranscript, sampleId, sequence }) => ({ attempt, finalTranscript, sampleId, sequence })),
+    expectedCorpus.samples.map((sample, index) => ({
+      attempt: 1,
+      finalTranscript: `${sample.language}-private-hypothesis-${index + 1}`,
+      sampleId: sample.sampleId,
+      sequence: index + 1,
+    })),
+  );
+  const persistedText = (await readFile(output)).toString("utf8");
+  for (const sample of expectedCorpus.samples) {
+    assert.equal(persistedText.includes(sample.referenceText), false);
+  }
+  for (const { finalTranscript } of privateTranscripts) {
+    assert.equal(persistedText.includes(finalTranscript), false);
+  }
+  assert.equal(result.record.results.some((entry) => Object.hasOwn(entry, "final_transcript")), false);
   assert.deepEqual(result.record.results.map(({ attempt, sequence }) => ({ attempt, sequence })), [
     { attempt: 1, sequence: 1 },
     { attempt: 1, sequence: 2 },
@@ -287,6 +312,12 @@ test("host record validator joins sample, candidate, host, integer elapsed and e
     ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.backend_execute_calls = 2; }],
     ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.execute_elapsed_ns = "01"; }],
     ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.execute_elapsed_ns = "18446744073709551616"; }],
+    ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.final_transcript = null; }],
+    ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.final_transcript += "\0private"; }],
+    ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.final_transcript = "x".repeat(16_385); }],
+    ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.final_transcript = "\ud800"; }],
+    ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.final_transcript_sha256 = "f".repeat(64); }],
+    ["COMPONENT_HOST_EXECUTION", (record) => { record.execution.final_transcript_utf8_bytes = "0"; }],
     ["COMPONENT_HOST_SAMPLE_JOIN", (record) => { record.sample.language = record.sample.language === "en" ? "zh" : "en"; }],
     ["COMPONENT_HOST_SAMPLE_JOIN", (record) => { record.sample.sample_identity_sha256 = "f".repeat(64); }],
     ["COMPONENT_HOST_RTF", (record) => { record.rtf.denominator_audio_ns = "1"; }],
@@ -307,6 +338,25 @@ test("host record validator joins sample, candidate, host, integer elapsed and e
     assert.equal(calls, 1, code);
     await assert.rejects(readFile(output), { code: "ENOENT" });
   }
+});
+
+test("private transcript consumer failure is text-free and prevents evidence publication", async (t) => {
+  const { output } = await tempOutput(t);
+  const sample = corpus().samples[0];
+  const secret = "do-not-echo-private-hypothesis";
+  const record = hostRecord(sample, 1);
+  record.execution.final_transcript = secret;
+  record.execution.final_transcript_sha256 = sha256(Buffer.from(secret, "utf8"));
+  record.execution.final_transcript_utf8_bytes = String(Buffer.byteLength(secret, "utf8"));
+  const error = await expectCode(__runNativeCandidateComponentEvidenceForTest(input(output), {
+    candidateJoinLoader: async () => join(),
+    corpusLoader: async () => ({ ...corpus(), samples: [sample], publicProjection: { ...corpus().publicProjection, sample_count: 1 } }),
+    privateTranscriptConsumer: async () => { throw new Error(secret); },
+    sampleRunner: async () => Buffer.from(encodeCanonicalJsonLine(record), "utf8"),
+  }), "COMPONENT_PRIVATE_TRANSCRIPT_CONSUMER");
+  assert.equal(error.cause, undefined);
+  assert.equal(String(error).includes(secret), false);
+  await assert.rejects(readFile(output), { code: "ENOENT" });
 });
 
 test("injected corpora cannot exceed the Rust host 64 MiB WAV boundary", async (t) => {
@@ -462,7 +512,7 @@ test("strict evidence validator prevents every authority promotion", () => {
     kind: "meetingrelay-native-candidate-component-evidence-v1",
     limitations: [
       "synthetic-contract-foundation-does-not-assess-model-quality",
-      "native-hypothesis-content-not-collected-or-scored",
+      "component-evidence-excludes-hypothesis-content-and-scores",
       "candidate-source-and-hardware-artifacts-not-directly-materialized",
       "resource-sampling-unavailable",
       "publication-retains-auditable-create-new-staging-residue",
@@ -691,15 +741,18 @@ test("schema, package, CI, and README expose test+validate only with synthetic c
   assert.equal(decimalPattern.test("18446744073709551615"), true);
   assert.equal(decimalPattern.test("18446744073709551616"), false);
   assert.equal(decimalPattern.test("99999999999999999999"), false);
-  assert.equal(packageJson.scripts["phase0:sherpa-quality-foundation:test"], "node --test tools/sherpa-native/quality-corpus.test.mjs tools/sherpa-native/asr-error-rate.test.mjs tools/sherpa-native/controlled-hypothesis-ledger.test.mjs tools/sherpa-native/native-candidate-component-evidence.test.mjs");
+  assert.equal(packageJson.scripts["phase0:sherpa-quality-foundation:test"], "node --test tools/sherpa-native/quality-corpus.test.mjs tools/sherpa-native/asr-error-rate.test.mjs tools/sherpa-native/controlled-hypothesis-ledger.test.mjs tools/sherpa-native/native-candidate-component-evidence.test.mjs tools/sherpa-native/asr-quality-run-policy.test.mjs tools/sherpa-native/native-candidate-quality-runner.test.mjs");
   assert.equal(packageJson.scripts["phase0:sherpa-quality-foundation:validate"], "node tools/sherpa-native/native-candidate-component-evidence.mjs --validate");
+  assert.equal(packageJson.scripts["phase0:sherpa-quality-evidence:validate"], "node tools/sherpa-native/native-candidate-quality-runner.mjs --validate");
   assert.equal(packageJson.scripts["phase0:sherpa-quality-foundation:run"], undefined);
-  assert.match(workflow, /Test WP-0\.4 rights-aware quality foundation \(synthetic contract only\)/u);
+  assert.match(workflow, /Test WP-0\.4 quality foundation and controlled descriptive runner \(synthetic mechanics only\)/u);
   assert.match(workflow, /pnpm phase0:sherpa-quality-foundation:test/u);
   assert.equal(workflow.includes("phase0:sherpa-quality-foundation:run"), false);
   assert.match(readme, /rights-aware multi-utterance corpus/iu);
   assert.match(readme, /controlled-hypothesis-ledger\.mjs/u);
-  assert.match(readme, /not published as an independently sealed file/u);
+  assert.match(readme, /independent seal binds the exact private-ledger digest/u);
+  assert.match(readme, /privateTranscriptConsumer/u);
+  assert.match(readme, /scorer-mechanics-exercised/u);
   assert.match(readme, /validation_date/u);
   assert.match(readme, /formal_claims=none/u);
   assert.match(readme, /synthetic non-speech/u);

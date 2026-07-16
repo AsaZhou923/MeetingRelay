@@ -1,0 +1,367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meetingrelay.local/schemas/meetingrelay-native-candidate-quality-evidence-v1.schema.json",
+  "title": "MeetingRelay descriptive native candidate quality evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "aggregate",
+    "authority",
+    "candidate_identity",
+    "component_evidence",
+    "corpus_identity",
+    "hardware_identity",
+    "kind",
+    "ledger_identity",
+    "measurement_status",
+    "quality_gate_status",
+    "run_policy_identity",
+    "schema_version",
+    "scorer_identity",
+    "scores",
+    "source_identity"
+  ],
+  "properties": {
+    "aggregate": { "$ref": "#/$defs/aggregate" },
+    "authority": { "$ref": "#/$defs/publicAuthority" },
+    "candidate_identity": { "$ref": "#/$defs/candidateIdentity" },
+    "component_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_count", "sha256"],
+      "properties": {
+        "sample_count": { "$ref": "#/$defs/sampleCount" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "corpus_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256", "sample_count", "slice_count", "snapshot_sha256", "validation_date"],
+      "properties": {
+        "manifest_sha256": { "$ref": "#/$defs/digest" },
+        "sample_count": { "$ref": "#/$defs/sampleCount" },
+        "slice_count": { "$ref": "#/$defs/sampleCount" },
+        "snapshot_sha256": { "$ref": "#/$defs/digest" },
+        "validation_date": { "$ref": "#/$defs/date" }
+      }
+    },
+    "hardware_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_sha256", "hw_ref_id", "operator_facts_sha256"],
+      "properties": {
+        "evidence_sha256": { "$ref": "#/$defs/digest" },
+        "hw_ref_id": { "$ref": "#/$defs/identifier" },
+        "operator_facts_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "kind": { "const": "meetingrelay-native-candidate-quality-evidence-v1" },
+    "ledger_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_identity_sha256", "entry_count", "projection_sha256", "seal_sha256", "sha256"],
+      "properties": {
+        "candidate_identity_sha256": { "$ref": "#/$defs/digest" },
+        "entry_count": { "$ref": "#/$defs/sampleCount" },
+        "projection_sha256": { "$ref": "#/$defs/digest" },
+        "seal_sha256": { "$ref": "#/$defs/digest" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "measurement_status": { "const": "scorer-mechanics-exercised" },
+    "quality_gate_status": { "const": "not-assessed" },
+    "run_policy_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coverage_scope", "exclusion_policy", "max_attempts", "sha256"],
+      "properties": {
+        "coverage_scope": { "const": "synthetic-mechanics-only" },
+        "exclusion_policy": { "const": "none" },
+        "max_attempts": { "const": 1 },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "schema_version": { "const": "1.0" },
+    "scorer_identity": { "$ref": "#/$defs/scorerProfile" },
+    "scores": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/score" }
+    },
+    "source_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "evidence_sha256"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/commit" },
+        "evidence_sha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+    },
+    "date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "scorerIdentifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "sampleCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "canonicalDecimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "descriptiveAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formal_claims", "production_evidence"],
+      "properties": {
+        "formal_claims": { "const": "none" },
+        "production_evidence": { "const": false }
+      }
+    },
+    "publicAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formal_claims", "production_evidence", "public_distribution"],
+      "properties": {
+        "formal_claims": { "const": "none" },
+        "production_evidence": { "const": false },
+        "public_distribution": { "const": false }
+      }
+    },
+    "scorerProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_sha256"],
+      "properties": {
+        "profile_id": { "const": "meetingrelay-asr-scorer-profile-v1" },
+        "profile_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "candidateIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_lock_sha256",
+        "baseline_execution_host_sha256",
+        "candidate_id",
+        "candidate_manifest_sha256",
+        "config_sha256",
+        "contract_manifest_sha256",
+        "execution_host_sha256",
+        "measured_evidence_sha256",
+        "model_sha256",
+        "package_lock_sha256",
+        "runtime_bundle_sha256",
+        "schema_registry_sha256",
+        "tokens_sha256"
+      ],
+      "properties": {
+        "asset_lock_sha256": { "$ref": "#/$defs/digest" },
+        "baseline_execution_host_sha256": { "$ref": "#/$defs/digest" },
+        "candidate_id": { "const": "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu" },
+        "candidate_manifest_sha256": { "$ref": "#/$defs/digest" },
+        "config_sha256": { "$ref": "#/$defs/digest" },
+        "contract_manifest_sha256": { "$ref": "#/$defs/digest" },
+        "execution_host_sha256": { "$ref": "#/$defs/digest" },
+        "measured_evidence_sha256": { "$ref": "#/$defs/digest" },
+        "model_sha256": { "$ref": "#/$defs/digest" },
+        "package_lock_sha256": { "$ref": "#/$defs/digest" },
+        "runtime_bundle_sha256": { "$ref": "#/$defs/digest" },
+        "schema_registry_sha256": { "$ref": "#/$defs/digest" },
+        "tokens_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "errorRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["denominator", "numerator", "status"],
+      "properties": {
+        "denominator": { "$ref": "#/$defs/canonicalDecimal" },
+        "numerator": { "$ref": "#/$defs/canonicalDecimal" },
+        "status": { "enum": ["measured", "zero-reference-correct", "zero-reference-hallucination"] }
+      }
+    },
+    "errors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deletions", "insertions", "substitutions", "total"],
+      "properties": {
+        "deletions": { "type": "integer", "minimum": 0, "maximum": 8192 },
+        "insertions": { "type": "integer", "minimum": 0, "maximum": 8192 },
+        "substitutions": { "type": "integer", "minimum": 0, "maximum": 8192 },
+        "total": { "type": "integer", "minimum": 0, "maximum": 8192 }
+      }
+    },
+    "score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assessment_status",
+        "authority",
+        "errorRate",
+        "errors",
+        "hypothesisUnitCount",
+        "language",
+        "metric",
+        "referenceUnitCount",
+        "sampleId",
+        "scenario",
+        "scorerProfile",
+        "silentHallucination",
+        "tier"
+      ],
+      "properties": {
+        "assessment_status": { "const": "descriptive-only" },
+        "authority": { "$ref": "#/$defs/descriptiveAuthority" },
+        "errorRate": { "$ref": "#/$defs/errorRate" },
+        "errors": { "$ref": "#/$defs/errors" },
+        "hypothesisUnitCount": { "type": "integer", "minimum": 0, "maximum": 4096 },
+        "language": { "enum": ["en", "ja", "zh"] },
+        "metric": { "enum": ["cer", "wer"] },
+        "referenceUnitCount": { "type": "integer", "minimum": 0, "maximum": 4096 },
+        "sampleId": { "$ref": "#/$defs/identifier" },
+        "scenario": { "$ref": "#/$defs/scorerIdentifier" },
+        "scorerProfile": { "$ref": "#/$defs/scorerProfile" },
+        "silentHallucination": { "type": "boolean" },
+        "tier": { "const": "tier-1" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "language": { "const": "en" } }, "required": ["language"] },
+          "then": { "properties": { "metric": { "const": "wer" } } },
+          "else": { "properties": { "metric": { "const": "cer" } } }
+        }
+      ]
+    },
+    "aggregateRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["denominator", "numerator", "status"],
+      "properties": {
+        "denominator": { "$ref": "#/$defs/canonicalDecimal" },
+        "numerator": { "$ref": "#/$defs/canonicalDecimal" },
+        "status": { "enum": ["measured", "not-comparable"] }
+      }
+    },
+    "errorSums": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deletions", "hypothesis_units", "insertions", "reference_units", "substitutions", "total"],
+      "properties": {
+        "deletions": { "type": "integer", "minimum": 0, "maximum": 81920000 },
+        "hypothesis_units": { "type": "integer", "minimum": 0, "maximum": 81920000 },
+        "insertions": { "type": "integer", "minimum": 0, "maximum": 81920000 },
+        "reference_units": { "type": "integer", "minimum": 0, "maximum": 81920000 },
+        "substitutions": { "type": "integer", "minimum": 0, "maximum": 81920000 },
+        "total": { "type": "integer", "minimum": 0, "maximum": 81920000 }
+      }
+    },
+    "rateRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maximum", "minimum"],
+      "properties": {
+        "maximum": { "$ref": "#/$defs/aggregateRate" },
+        "minimum": { "$ref": "#/$defs/aggregateRate" }
+      }
+    },
+    "languageSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comparable_sample_count",
+        "error_sums",
+        "key",
+        "macro_error_rate",
+        "sample_count",
+        "utterance_error_rate_range",
+        "zero_reference_correct",
+        "zero_reference_hallucinations"
+      ],
+      "properties": {
+        "comparable_sample_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "error_sums": { "$ref": "#/$defs/errorSums" },
+        "key": { "enum": ["en", "ja", "zh"] },
+        "macro_error_rate": { "$ref": "#/$defs/aggregateRate" },
+        "sample_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "utterance_error_rate_range": { "$ref": "#/$defs/rateRange" },
+        "zero_reference_correct": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "zero_reference_hallucinations": { "type": "integer", "minimum": 0, "maximum": 10000 }
+      }
+    },
+    "languageScenarioSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comparable_sample_count",
+        "error_sums",
+        "key",
+        "language",
+        "macro_error_rate",
+        "sample_count",
+        "scenario",
+        "utterance_error_rate_range",
+        "zero_reference_correct",
+        "zero_reference_hallucinations"
+      ],
+      "properties": {
+        "comparable_sample_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "error_sums": { "$ref": "#/$defs/errorSums" },
+        "key": { "type": "string", "minLength": 4, "maxLength": 257 },
+        "language": { "enum": ["en", "ja", "zh"] },
+        "macro_error_rate": { "$ref": "#/$defs/aggregateRate" },
+        "sample_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "scenario": { "$ref": "#/$defs/scorerIdentifier" },
+        "utterance_error_rate_range": { "$ref": "#/$defs/rateRange" },
+        "zero_reference_correct": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "zero_reference_hallucinations": { "type": "integer", "minimum": 0, "maximum": 10000 }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assessment_status", "authority", "by_language", "by_language_scenario", "sample_count", "scorer_profile"],
+      "properties": {
+        "assessment_status": { "const": "descriptive-only" },
+        "authority": { "$ref": "#/$defs/descriptiveAuthority" },
+        "by_language": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/languageSummary" }
+        },
+        "by_language_scenario": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/languageScenarioSummary" }
+        },
+        "sample_count": { "$ref": "#/$defs/sampleCount" },
+        "scorer_profile": { "$ref": "#/$defs/scorerProfile" }
+      }
+    }
+  }
+}

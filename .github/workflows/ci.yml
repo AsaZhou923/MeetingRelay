@@ -109,7 +109,7 @@ jobs:
         run: pnpm phase0:sherpa-candidate-measured-evidence:test
         timeout-minutes: 5
 
-      - name: Test WP-0.4 rights-aware quality foundation (synthetic contract only)
+      - name: Test WP-0.4 quality foundation and controlled descriptive runner (synthetic mechanics only)
         run: pnpm phase0:sherpa-quality-foundation:test
         timeout-minutes: 5
 
@@ -469,7 +469,7 @@ jobs:
           }
         timeout-minutes: 10
 
-      - name: Build exact Release candidate execution-host executable
+      - name: Build exact Release candidate execution and quality-host executables
         shell: pwsh
         run: |
           $metadata = & cargo metadata --format-version 1 --no-deps --offline --locked | ConvertFrom-Json
@@ -490,7 +490,7 @@ jobs:
             throw "candidate execution host requires the x86_64-pc-windows-msvc Rust host triple"
           }
 
-          $cargoArguments = @(
+          $executionCargoArguments = @(
             'build', '--release',
             '-p', 'meetingrelay-model-worker-sherpa-native',
             '--features', 'native-sherpa',
@@ -499,49 +499,77 @@ jobs:
             '--offline',
             '--locked'
           )
-          $messages = @(& cargo @cargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
+          $executionMessages = @(& cargo @executionCargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
           if ($LASTEXITCODE -ne 0) { throw "cargo failed to build the candidate execution host" }
-          $executables = @($messages |
-            Where-Object {
-              $_.reason -eq 'compiler-artifact' -and
-              [string]$_.package_id -eq $packageId -and
-              $_.target.name -eq 'meetingrelay-sherpa-candidate-execution-host' -and
-              @($_.target.kind).Count -eq 1 -and
-              [string]$_.target.kind[0] -eq 'bin' -and
-              -not [bool]$_.target.test -and
-              -not [bool]$_.profile.test -and
-              -not [bool]$_.profile.debug_assertions -and
-              [string]$_.profile.opt_level -ne '0' -and
-              -not [string]::IsNullOrWhiteSpace([string]$_.executable)
-            } |
-            ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
-            Sort-Object -Unique)
-          if ($executables.Count -ne 1) {
-            throw "Expected exactly one Cargo-reported candidate execution host, got $($executables.Count)"
-          }
-          $releaseExecutable = $executables[0]
+          $qualityCargoArguments = @(
+            'build', '--release',
+            '-p', 'meetingrelay-model-worker-sherpa-native',
+            '--features', 'native-quality-sample',
+            '--bin', 'meetingrelay-sherpa-candidate-quality-host',
+            '--message-format=json',
+            '--offline',
+            '--locked'
+          )
+          $qualityMessages = @(& cargo @qualityCargoArguments | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($LASTEXITCODE -ne 0) { throw "cargo failed to build the candidate quality host" }
           $targetPrefix = $targetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-          if (-not $releaseExecutable.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Cargo-reported candidate execution host is outside the repository target directory"
-          }
-          if ((Split-Path -Leaf $releaseExecutable) -cne 'meetingrelay-sherpa-candidate-execution-host.exe' -or
-              (Split-Path -Leaf (Split-Path -Parent $releaseExecutable)) -cne 'release' -or
-              [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $releaseExecutable))) -ne $targetRoot) {
-            throw "Cargo-reported candidate execution host has an unexpected target or profile path"
-          }
-          $current = $releaseExecutable
-          while ($null -ne $current) {
-            $attributes = [IO.File]::GetAttributes($current)
-            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-              throw "Cargo-reported candidate execution host path contains a reparse point"
+          function Select-ReleaseHostExecutable {
+            param(
+              [Parameter(Mandatory = $true)][object[]]$CompilerMessages,
+              [Parameter(Mandatory = $true)][string]$TargetName,
+              [Parameter(Mandatory = $true)][string]$FileName
+            )
+            $executables = @($CompilerMessages |
+              Where-Object {
+                $_.reason -eq 'compiler-artifact' -and
+                [string]$_.package_id -eq $packageId -and
+                $_.target.name -eq $TargetName -and
+                @($_.target.kind).Count -eq 1 -and
+                [string]$_.target.kind[0] -eq 'bin' -and
+                -not [bool]$_.target.test -and
+                -not [bool]$_.profile.test -and
+                -not [bool]$_.profile.debug_assertions -and
+                [string]$_.profile.opt_level -ne '0' -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.executable)
+              } |
+              ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
+              Sort-Object -Unique)
+            if ($executables.Count -ne 1) {
+              throw "Expected exactly one Cargo-reported $TargetName executable, got $($executables.Count)"
             }
-            $parent = [IO.Directory]::GetParent($current)
-            $current = if ($null -eq $parent) { $null } else { $parent.FullName }
+            $releaseExecutable = $executables[0]
+            if (-not $releaseExecutable.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Cargo-reported $TargetName executable is outside the repository target directory"
+            }
+            if ((Split-Path -Leaf $releaseExecutable) -cne $FileName -or
+                (Split-Path -Leaf (Split-Path -Parent $releaseExecutable)) -cne 'release' -or
+                [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $releaseExecutable))) -ne $targetRoot) {
+              throw "Cargo-reported $TargetName executable has an unexpected target or profile path"
+            }
+            $current = $releaseExecutable
+            while ($null -ne $current) {
+              $attributes = [IO.File]::GetAttributes($current)
+              if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Cargo-reported $TargetName executable path contains a reparse point"
+              }
+              $parent = [IO.Directory]::GetParent($current)
+              $current = if ($null -eq $parent) { $null } else { $parent.FullName }
+            }
+            if (-not (Test-Path -LiteralPath $releaseExecutable -PathType Leaf)) {
+              throw "Cargo-reported $TargetName executable does not exist"
+            }
+            return $releaseExecutable
           }
-          if (-not (Test-Path -LiteralPath $releaseExecutable -PathType Leaf)) {
-            throw "Cargo-reported candidate execution host does not exist"
-          }
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE=$releaseExecutable" -Encoding utf8
+          $executionHost = Select-ReleaseHostExecutable `
+            -CompilerMessages $executionMessages `
+            -TargetName 'meetingrelay-sherpa-candidate-execution-host' `
+            -FileName 'meetingrelay-sherpa-candidate-execution-host.exe'
+          $qualityHost = Select-ReleaseHostExecutable `
+            -CompilerMessages $qualityMessages `
+            -TargetName 'meetingrelay-sherpa-candidate-quality-host' `
+            -FileName 'meetingrelay-sherpa-candidate-quality-host.exe'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE=$executionHost" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_QUALITY_HOST_EXE=$qualityHost" -Encoding utf8
         timeout-minutes: 20
 
       - name: Audit Release candidate execution-host PE dependencies
@@ -606,6 +634,108 @@ jobs:
           if ($marker.Count -ne 1) {
             throw "actual locked-assets Release candidate conformance marker is missing or duplicated"
           }
+        timeout-minutes: 10
+
+      - name: Exercise actual Release quality-host private plaintext pipe
+        shell: pwsh
+        run: |
+          $schemaRegistry = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-schema-registry.json'))
+          $packageLock = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'Cargo.lock'))
+          $referenceManifestPath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/candidate-quality-smoke-reference.json'))
+          $referenceManifest = Get-Content -Raw -LiteralPath $referenceManifestPath -Encoding utf8 | ConvertFrom-Json
+          $wavBytes = [IO.File]::ReadAllBytes($env:MEETINGRELAY_SHERPA_WAV)
+          if ($wavBytes.LongLength -ne [long]$referenceManifest.audio.file_bytes -or
+              $wavBytes.Length -lt 44 -or
+              [Text.Encoding]::ASCII.GetString($wavBytes, 0, 4) -cne 'RIFF' -or
+              [Text.Encoding]::ASCII.GetString($wavBytes, 8, 4) -cne 'WAVE' -or
+              [Text.Encoding]::ASCII.GetString($wavBytes, 36, 4) -cne 'data') {
+            throw 'sealed quality-host WAV framing validation failed'
+          }
+          $dataBytes = [BitConverter]::ToUInt32($wavBytes, 40)
+          if ($dataBytes -ne $wavBytes.Length - 44) {
+            throw 'sealed quality-host WAV payload length validation failed'
+          }
+          $pcmBytes = [byte[]]::new($dataBytes)
+          [Array]::Copy($wavBytes, 44, $pcmBytes, 0, $dataBytes)
+          $wavSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($wavBytes)).ToLowerInvariant()
+          $pcmSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($pcmBytes)).ToLowerInvariant()
+          $qualityHostSha256 = (Get-FileHash -LiteralPath $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_QUALITY_HOST_EXE -Algorithm SHA256).Hash.ToLowerInvariant()
+          $schemaRegistrySha256 = (Get-FileHash -LiteralPath $schemaRegistry -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($wavSha256 -cne [string]$referenceManifest.audio.sha256) {
+            throw 'sealed quality-host WAV digest validation failed'
+          }
+
+          $startInfo = [Diagnostics.ProcessStartInfo]::new()
+          $startInfo.FileName = $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_QUALITY_HOST_EXE
+          $startInfo.UseShellExecute = $false
+          $startInfo.CreateNoWindow = $true
+          $startInfo.RedirectStandardOutput = $true
+          $startInfo.RedirectStandardError = $true
+          $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+          $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false, $true)
+          foreach ($argument in @(
+            $schemaRegistry,
+            $env:MEETINGRELAY_SHERPA_MODEL,
+            $env:MEETINGRELAY_SHERPA_TOKENS,
+            $env:SHERPA_ONNX_LIB_DIR,
+            $env:MEETINGRELAY_SHERPA_LOCK,
+            $packageLock,
+            'sealed-zh-quality-smoke',
+            'zh',
+            $env:MEETINGRELAY_SHERPA_WAV,
+            [string]$wavBytes.LongLength,
+            $wavSha256,
+            $pcmSha256,
+            [string]$referenceManifest.transcript.sha256
+          )) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+          }
+          $process = [Diagnostics.Process]::new()
+          $process.StartInfo = $startInfo
+          if (-not $process.Start()) {
+            throw 'quality-host process did not start'
+          }
+          $privateStdout = $process.StandardOutput.ReadToEnd()
+          $privateStderr = $process.StandardError.ReadToEnd()
+          $process.WaitForExit()
+          if ($process.ExitCode -ne 0 -or $privateStderr.Length -ne 0) {
+            throw 'quality-host private-pipe execution failed'
+          }
+          if (-not $privateStdout.EndsWith("`n", [StringComparison]::Ordinal) -or
+              $privateStdout.Contains("`r") -or
+              $privateStdout.IndexOf("`n", [StringComparison]::Ordinal) -ne $privateStdout.Length - 1) {
+            throw 'quality-host private-pipe framing failed'
+          }
+          try {
+            $record = $privateStdout.Substring(0, $privateStdout.Length - 1) | ConvertFrom-Json -ErrorAction Stop
+          } catch {
+            throw 'quality-host private-pipe JSON validation failed'
+          }
+          $transcriptBytes = [Text.Encoding]::UTF8.GetBytes([string]$record.execution.final_transcript)
+          $transcriptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($transcriptBytes)).ToLowerInvariant()
+          if ([string]$record.kind -cne 'meetingrelay-native-candidate-quality-sample-v1' -or
+              [string]$record.schema_version -cne '1.0' -or
+              [string]$record.authority.formal_claims -cne 'none' -or
+              [bool]$record.authority.production_evidence -ne $false -or
+              [string]$record.candidate.candidate_id -cne 'sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu' -or
+              [bool]$record.execution.fresh_process_per_sample -ne $true -or
+              [string]$record.host.executable_sha256 -cne $qualityHostSha256 -or
+              [string]$record.host.schema_registry_sha256 -cne $schemaRegistrySha256 -or
+              [string]$record.sample.sample_id -cne 'sealed-zh-quality-smoke' -or
+              [string]$record.sample.language -cne 'zh' -or
+              [string]$record.sample.wav_sha256 -cne $wavSha256 -or
+              [string]$record.sample.pcm_sha256 -cne $pcmSha256 -or
+              [string]$record.sample.reference_sha256 -cne [string]$referenceManifest.transcript.sha256 -or
+              [int]$record.execution.backend_execute_calls -ne 1 -or
+              [string]$record.execution.final_transcript_utf8_bytes -cne [string]$transcriptBytes.LongLength -or
+              [string]$record.execution.final_transcript_sha256 -cne $transcriptSha256) {
+            throw 'quality-host private-pipe identity validation failed'
+          }
+          $privateStdout = $null
+          $privateStderr = $null
+          $record = $null
+          $transcriptBytes = $null
+          Write-Output "CANDIDATE_QUALITY_PRIVATE_PIPE=PASS executable_sha256=$qualityHostSha256 transcript_sha256=$transcriptSha256 formal_claims=none production_evidence=false"
         timeout-minutes: 10
 
       - name: Run actual sealed-reference native exact-match quality smoke

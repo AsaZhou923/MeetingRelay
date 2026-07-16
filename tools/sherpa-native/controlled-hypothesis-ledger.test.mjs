@@ -18,10 +18,15 @@ import test from "node:test";
 
 import {
   buildControlledHypothesisLedger,
+  buildControlledHypothesisLedgerSeal,
   projectControlledHypothesisLedgerTextFree,
   publishControlledHypothesisLedger,
+  publishControlledHypothesisLedgerSeal,
   readControlledHypothesisLedger,
+  readControlledHypothesisLedgerSeal,
   validateControlledHypothesisLedgerRecord,
+  validateControlledHypothesisLedgerSealBinding,
+  validateControlledHypothesisLedgerSealRecord,
 } from "./controlled-hypothesis-ledger.mjs";
 
 function sha256(value) {
@@ -232,6 +237,231 @@ test("text-free controlled-derived projection contains only digests, joins, coun
     assert.equal(publicText.includes(forbidden), false, forbidden);
   }
   assert.deepEqual(Object.keys(projected.projection).sort(), ["entries", "entry_count", "joins", "ledger_sha256"]);
+});
+
+test("independent seal canonically binds the exact private ledger and text-free projection", async (t) => {
+  const root = await temporaryDirectory(t);
+  await mkdir(path.join(root, "runs"));
+  const ledger = fixture("sealed");
+  const seal = buildControlledHypothesisLedgerSeal(ledger.bytes);
+  const projection = projectControlledHypothesisLedgerTextFree(ledger.bytes);
+
+  assert.equal(seal.bytes.at(-1), 0x0a);
+  assert.equal(seal.bytes.includes(0x0d), false);
+  assert.equal(seal.ledgerSha256, ledger.ledgerSha256);
+  assert.equal(seal.projectionSha256, sha256(projection.bytes));
+  assert.deepEqual(seal.projectionBytes, projection.bytes);
+  assert.deepEqual(seal.record.authority, {
+    formal_claims: "none",
+    privacy_class: "controlled-derived",
+    public_distribution: false,
+  });
+  assert.deepEqual(seal.record.private_ledger, {
+    entry_count: 3,
+    kind: "meetingrelay-controlled-hypothesis-ledger-v1",
+    schema_version: "1.0",
+    sha256: ledger.ledgerSha256,
+    size_bytes: String(ledger.bytes.length),
+  });
+  assert.deepEqual(seal.record.text_free_projection, {
+    entry_count: 3,
+    sha256: sha256(projection.bytes),
+    size_bytes: String(projection.bytes.length),
+  });
+  assert.deepEqual(validateControlledHypothesisLedgerSealRecord(seal.bytes).record, seal.record);
+  assert.equal(
+    validateControlledHypothesisLedgerSealBinding(seal.bytes, ledger.bytes).sealSha256,
+    seal.sealSha256,
+  );
+
+  const ledgerRelativePath = path.join("runs", "private-ledger.jsonl");
+  const sealRelativePath = path.join("runs", "private-ledger.seal.json");
+  await publishControlledHypothesisLedger(root, ledgerRelativePath, ledger.bytes);
+  await assert.rejects(
+    publishControlledHypothesisLedgerSeal(
+      root,
+      ledgerRelativePath,
+      ledgerRelativePath,
+      seal.bytes,
+    ),
+    { code: "LEDGER_SEAL_PATH" },
+  );
+  const output = await publishControlledHypothesisLedgerSeal(
+    root,
+    sealRelativePath,
+    ledgerRelativePath,
+    seal.bytes,
+  );
+  assert.equal(output, path.join(root, sealRelativePath));
+  const persisted = await readControlledHypothesisLedgerSeal(
+    root,
+    sealRelativePath,
+    ledgerRelativePath,
+  );
+  assert.equal(persisted.sealSha256, seal.sealSha256);
+  assert.equal(persisted.ledgerSha256, ledger.ledgerSha256);
+  assert.equal(ledger.record.entries[1].final_transcript, "");
+
+  const sealText = seal.bytes.toString("utf8");
+  for (const forbidden of [
+    ...ledger.record.entries.map((value) => value.final_transcript).filter(Boolean),
+    root,
+    ledgerRelativePath,
+    sealRelativePath,
+    "final_transcript",
+    "reference",
+    "controlled_root",
+    "quality",
+    "pass",
+    "production",
+  ]) {
+    assert.equal(sealText.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
+  }
+  const sealStaging = (await readdir(path.join(root, "runs")))
+    .filter((name) => /^\.private-ledger\.seal\.json\.[0-9a-f]{32}\.staging$/u.test(name));
+  assert.equal(sealStaging.length, 1);
+  assert.deepEqual(await readFile(path.join(root, "runs", sealStaging[0])), seal.bytes);
+});
+
+test("seal canonical form, identity, digest, size, count, projection, and ledger binding fail closed", () => {
+  const ledger = fixture("seal-validation");
+  const seal = buildControlledHypothesisLedgerSeal(ledger.bytes);
+  const cases = [];
+  const mutate = (name, callback) => {
+    const record = structuredClone(seal.record);
+    callback(record);
+    cases.push([name, Buffer.from(`${JSON.stringify(record)}\n`, "utf8")]);
+  };
+
+  cases.push(["pretty seal", Buffer.from(`${JSON.stringify(seal.record, null, 2)}\n`, "utf8")]);
+  mutate("wrong ledger kind", (record) => { record.private_ledger.kind = "wrong-ledger-kind"; });
+  mutate("wrong ledger schema", (record) => { record.private_ledger.schema_version = "2.0"; });
+  mutate("zero ledger digest", (record) => { record.private_ledger.sha256 = "0".repeat(64); });
+  mutate("zero projection digest", (record) => { record.text_free_projection.sha256 = "0".repeat(64); });
+  mutate("noncanonical ledger size", (record) => { record.private_ledger.size_bytes = "01"; });
+  mutate("mismatched counts", (record) => { record.text_free_projection.entry_count = 2; });
+  mutate("claim field", (record) => { record.quality_status = "passed"; });
+
+  for (const [name, bytes] of cases) {
+    assert.throws(() => validateControlledHypothesisLedgerSealRecord(bytes), undefined, name);
+  }
+
+  const bindingMutations = [
+    ["wrong ledger digest", (record) => { record.private_ledger.sha256 = sha256("wrong-ledger"); }],
+    ["wrong ledger size", (record) => { record.private_ledger.size_bytes = String(ledger.bytes.length + 1); }],
+    ["wrong ledger count", (record) => {
+      record.private_ledger.entry_count = 2;
+      record.text_free_projection.entry_count = 2;
+    }],
+    ["wrong projection digest", (record) => { record.text_free_projection.sha256 = sha256("wrong-projection"); }],
+    ["wrong projection size", (record) => { record.text_free_projection.size_bytes = "1"; }],
+  ];
+  for (const [name, callback] of bindingMutations) {
+    const record = structuredClone(seal.record);
+    callback(record);
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+    validateControlledHypothesisLedgerSealRecord(bytes);
+    assert.throws(
+      () => validateControlledHypothesisLedgerSealBinding(bytes, ledger.bytes),
+      { code: "LEDGER_SEAL_BINDING" },
+      name,
+    );
+  }
+
+  assert.throws(
+    () => validateControlledHypothesisLedgerSealBinding(seal.bytes, fixture("different-ledger").bytes),
+    { code: "LEDGER_SEAL_BINDING" },
+  );
+  const tamperedSeal = Buffer.from(seal.bytes);
+  tamperedSeal[0] = 0x5b;
+  assert.throws(() => validateControlledHypothesisLedgerSealRecord(tamperedSeal));
+});
+
+test("seal publication is atomic no-replace, race-safe, and retains all audit staging", async (t) => {
+  const root = await temporaryDirectory(t);
+  const ledger = fixture("seal-race");
+  const seal = buildControlledHypothesisLedgerSeal(ledger.bytes);
+  await publishControlledHypothesisLedger(root, "ledger.jsonl", ledger.bytes);
+  await publishControlledHypothesisLedgerSeal(root, "ledger.seal.json", "ledger.jsonl", seal.bytes);
+
+  const competitorBefore = await readFile(path.join(root, "ledger.seal.json"));
+  await assert.rejects(
+    publishControlledHypothesisLedgerSeal(root, "ledger.seal.json", "ledger.jsonl", seal.bytes),
+    /LEDGER_PUBLICATION/u,
+  );
+  assert.deepEqual(await readFile(path.join(root, "ledger.seal.json")), competitorBefore);
+
+  const raceResults = await Promise.allSettled([
+    publishControlledHypothesisLedgerSeal(root, "race.seal.json", "ledger.jsonl", seal.bytes),
+    publishControlledHypothesisLedgerSeal(root, "race.seal.json", "ledger.jsonl", seal.bytes),
+  ]);
+  assert.equal(raceResults.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(raceResults.filter((result) => result.status === "rejected").length, 1);
+  assert.deepEqual(await readFile(path.join(root, "race.seal.json")), seal.bytes);
+  const raceResidues = (await readdir(root))
+    .filter((name) => /^\.race\.seal\.json\.[0-9a-f]{32}\.staging$/u.test(name));
+  assert.equal(raceResidues.length, 2);
+  for (const residue of raceResidues) {
+    assert.deepEqual(await readFile(path.join(root, residue)), seal.bytes);
+  }
+});
+
+test("seal publication and reads reject seal or referenced-ledger replacement without deletion", async (t) => {
+  const root = await temporaryDirectory(t);
+  const ledger = fixture("seal-owned");
+  const otherLedger = fixture("seal-other");
+  const seal = buildControlledHypothesisLedgerSeal(ledger.bytes);
+  const competitorSeal = buildControlledHypothesisLedgerSeal(otherLedger.bytes);
+  const ledgerPath = path.join(root, "ledger.jsonl");
+  const sealPath = path.join(root, "replace.seal.json");
+  await publishControlledHypothesisLedger(root, "ledger.jsonl", ledger.bytes);
+
+  await assert.rejects(publishControlledHypothesisLedgerSeal(
+    root,
+    "replace.seal.json",
+    "ledger.jsonl",
+    seal.bytes,
+    {
+      linkFile: async (stagingPath, targetPath) => {
+        await link(stagingPath, targetPath);
+        await rm(targetPath);
+        await writeFile(targetPath, competitorSeal.bytes, { flag: "wx" });
+      },
+    },
+  ), /LEDGER_PUBLICATION/u);
+  assert.deepEqual(await readFile(sealPath), competitorSeal.bytes);
+  const replacementResidue = (await readdir(root))
+    .find((name) => /^\.replace\.seal\.json\.[0-9a-f]{32}\.staging$/u.test(name));
+  assert.equal(typeof replacementResidue, "string");
+  assert.deepEqual(await readFile(path.join(root, replacementResidue)), seal.bytes);
+  await assert.rejects(
+    readControlledHypothesisLedgerSeal(root, "replace.seal.json", "ledger.jsonl"),
+    /LEDGER_SEAL_BINDING/u,
+  );
+
+  await assert.rejects(publishControlledHypothesisLedgerSeal(
+    root,
+    "ledger-change.seal.json",
+    "ledger.jsonl",
+    seal.bytes,
+    {
+      linkFile: async (stagingPath, targetPath) => {
+        await link(stagingPath, targetPath);
+        await rm(ledgerPath);
+        await writeFile(ledgerPath, otherLedger.bytes, { flag: "wx" });
+      },
+    },
+  ), /LEDGER_SEAL_LEDGER_CHANGED/u);
+  assert.deepEqual(await readFile(ledgerPath), otherLedger.bytes);
+  assert.deepEqual(await readFile(path.join(root, "ledger-change.seal.json")), seal.bytes);
+  const ledgerChangeResidue = (await readdir(root))
+    .find((name) => /^\.ledger-change\.seal\.json\.[0-9a-f]{32}\.staging$/u.test(name));
+  assert.equal(typeof ledgerChangeResidue, "string");
+
+  await assert.rejects(
+    readControlledHypothesisLedgerSeal(root, "ledger-change.seal.json", "ledger.jsonl"),
+    /LEDGER_SEAL_BINDING/u,
+  );
 });
 
 test("atomic create-new publication is readable, never overwrites, and retains auditable staging", async (t) => {

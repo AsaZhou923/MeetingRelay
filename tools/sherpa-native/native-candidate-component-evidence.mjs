@@ -27,12 +27,13 @@ const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 const MAX_WAV_BYTES = 64 * 1024 * 1024;
 const MAX_EXECUTION_HOST_BYTES = 64 * 1024 * 1024;
 const MAX_SCHEMA_REGISTRY_BYTES = 4 * 1024 * 1024;
+const MAX_TRANSCRIPT_UTF8_BYTES = 16_384;
 const MAX_PCM_SAMPLE_COUNT = (MAX_WAV_BYTES - 44) / 2;
 const MAX_CORPUS_MATERIAL_BYTES = 512n * 1024n * 1024n;
 const MAX_CORPUS_SAMPLES = 1_000;
 const LIMITATIONS = Object.freeze([
   "synthetic-contract-foundation-does-not-assess-model-quality",
-  "native-hypothesis-content-not-collected-or-scored",
+  "component-evidence-excludes-hypothesis-content-and-scores",
   "candidate-source-and-hardware-artifacts-not-directly-materialized",
   "resource-sampling-unavailable",
   "publication-retains-auditable-create-new-staging-residue",
@@ -65,7 +66,7 @@ const HOST_ROOT_KEYS = Object.freeze([
 ]);
 const HOST_EXECUTION_KEYS = Object.freeze([
   "backend_execute_calls", "execute_elapsed_ns", "final_transcript_sha256",
-  "final_transcript_utf8_bytes", "fresh_process_per_sample", "prepare_elapsed_ns",
+  "final_transcript", "final_transcript_utf8_bytes", "fresh_process_per_sample", "prepare_elapsed_ns",
 ]);
 const HOST_RESOURCE_KEYS = Object.freeze([
   "cpu_time_ns", "gpu_time_ns", "peak_ram_bytes", "peak_vram_bytes", "reason", "status",
@@ -91,6 +92,11 @@ const RUN_INPUT_KEYS = Object.freeze([
   "assetLockPath", "corpusInput", "executablePath", "modelPath", "outputEvidencePath",
   "packageLockPath", "runtimeLibDir", "schemaRegistryPath", "tokensPath",
 ]);
+
+export const nativeCandidateComponentEvidenceIdentity = Object.freeze({
+  candidateId: CANDIDATE_ID,
+  parameterSha256ByLanguage: PARAMETER_SHA256_BY_LANGUAGE,
+});
 
 export class NativeCandidateComponentEvidenceError extends Error {
   constructor(code, options = {}) {
@@ -284,9 +290,25 @@ function validateHostRecord(bytes, sample, expectedCandidate) {
   exactKeys(record.execution, HOST_EXECUTION_KEYS, "COMPONENT_HOST_EXECUTION");
   const executeElapsed = decimalBigInt(record.execution.execute_elapsed_ns, "COMPONENT_HOST_EXECUTION");
   decimalBigInt(record.execution.prepare_elapsed_ns, "COMPONENT_HOST_EXECUTION");
-  decimalBigInt(record.execution.final_transcript_utf8_bytes, "COMPONENT_HOST_EXECUTION");
+  const transcript = record.execution.final_transcript;
+  if (typeof transcript !== "string" || transcript.includes("\0")) fail("COMPONENT_HOST_EXECUTION");
+  const transcriptBytes = Buffer.from(transcript, "utf8");
+  if (
+    transcriptBytes.length > MAX_TRANSCRIPT_UTF8_BYTES ||
+    transcriptBytes.toString("utf8") !== transcript
+  ) {
+    fail("COMPONENT_HOST_EXECUTION");
+  }
+  const transcriptUtf8Bytes = decimalBigInt(record.execution.final_transcript_utf8_bytes, "COMPONENT_HOST_EXECUTION");
   assertDigest(record.execution.final_transcript_sha256, "COMPONENT_HOST_EXECUTION");
-  if (record.execution.backend_execute_calls !== 1 || record.execution.fresh_process_per_sample !== true) fail("COMPONENT_HOST_EXECUTION");
+  if (
+    transcriptUtf8Bytes !== BigInt(transcriptBytes.length) ||
+    record.execution.final_transcript_sha256 !== sha256(transcriptBytes) ||
+    record.execution.backend_execute_calls !== 1 ||
+    record.execution.fresh_process_per_sample !== true
+  ) {
+    fail("COMPONENT_HOST_EXECUTION");
+  }
   const hostIdentity = validateHostIdentity(record.host, "COMPONENT_HOST_IDENTITY_JOIN");
   if (!isDeepStrictEqual(hostIdentity, expectedCandidate.executionHost)) fail("COMPONENT_HOST_IDENTITY_JOIN");
   exactKeys(record.resources, HOST_RESOURCE_KEYS, "COMPONENT_HOST_RESOURCES");
@@ -318,7 +340,7 @@ function validateHostRecord(bytes, sample, expectedCandidate) {
     fail("COMPONENT_HOST_SAMPLE_JOIN");
   }
   if (record.kind !== HOST_KIND || record.schema_version !== VERSION) fail("COMPONENT_HOST_FIELDS");
-  return { record, recordSha256: sha256(bytes) };
+  return { finalTranscript: transcript, record, recordSha256: sha256(bytes) };
 }
 
 function validateAssessment(value) {
@@ -725,9 +747,16 @@ async function runCore(input, dependencies) {
   const runInput = validateRunInput(input);
   const corpusLoader = dependencies.corpusLoader ?? materializeQualityCorpus;
   const candidateJoinLoader = dependencies.candidateJoinLoader;
+  const privateTranscriptConsumer = dependencies.privateTranscriptConsumer;
   const sampleRunner = dependencies.sampleRunner ?? (({ argv, executablePath }) => invokeHost(executablePath, argv));
   const publishEvidence = dependencies.publishEvidence ?? publishNativeCandidateComponentEvidence;
-  if (typeof corpusLoader !== "function" || typeof candidateJoinLoader !== "function" || typeof sampleRunner !== "function" || typeof publishEvidence !== "function") fail("COMPONENT_RUN_DEPENDENCY");
+  if (
+    typeof corpusLoader !== "function" || typeof candidateJoinLoader !== "function" ||
+    typeof sampleRunner !== "function" || typeof publishEvidence !== "function" ||
+    !(privateTranscriptConsumer === undefined || typeof privateTranscriptConsumer === "function")
+  ) {
+    fail("COMPONENT_RUN_DEPENDENCY");
+  }
   await assertNewOutputPath(runInput.outputEvidencePath);
   const corpus = validateMaterializedCorpus(await corpusLoader(runInput.corpusInput));
   const candidateJoin = validateCandidateJoin(await candidateJoinLoader(runInput));
@@ -768,6 +797,29 @@ async function runCore(input, dependencies) {
     ]);
     if (!isDeepStrictEqual(postCorpus.comparable, corpus.comparable)) fail("COMPONENT_CORPUS_POSTFLIGHT");
     if (!isDeepStrictEqual(postJoin, candidateJoin)) fail("COMPONENT_CANDIDATE_POSTFLIGHT");
+    const sequence = results.length + 1;
+    if (privateTranscriptConsumer !== undefined) {
+      try {
+        await privateTranscriptConsumer(Object.freeze({
+          attempt: 1,
+          componentRecordSha256: host.recordSha256,
+          finalTranscript: host.finalTranscript,
+          finalTranscriptSha256: host.record.execution.final_transcript_sha256,
+          finalTranscriptUtf8Bytes: host.record.execution.final_transcript_utf8_bytes,
+          language: sample.language,
+          sampleId: sample.sampleId,
+          sampleIdentitySha256: host.record.sample.sample_identity_sha256,
+          scenario: sample.scenario,
+          sequence,
+          split: sample.split,
+          tier: sample.tier,
+        }));
+      } catch {
+        // The consumer owns private plaintext and may include it in its thrown
+        // value. Never retain that value as an error cause.
+        fail("COMPONENT_PRIVATE_TRANSCRIPT_CONSUMER");
+      }
+    }
     results.push({
       attempt: 1,
       candidate_parameter_sha256: host.record.candidate.parameter_sha256,
@@ -782,7 +834,7 @@ async function runCore(input, dependencies) {
       sample_id: sample.sampleId,
       sample_identity_sha256: host.record.sample.sample_identity_sha256,
       scenario: sample.scenario,
-      sequence: results.length + 1,
+      sequence,
       split: sample.split,
       tier: sample.tier,
     });
@@ -824,8 +876,11 @@ async function runCore(input, dependencies) {
   return { evidenceSha256: persisted.evidenceSha256, record: persisted.record };
 }
 
-export async function runNativeCandidateComponentEvidence(input, { candidateJoinLoader }) {
-  return runCore(input, { candidateJoinLoader });
+export async function runNativeCandidateComponentEvidence(
+  input,
+  { candidateJoinLoader, privateTranscriptConsumer },
+) {
+  return runCore(input, { candidateJoinLoader, privateTranscriptConsumer });
 }
 
 export async function __runNativeCandidateComponentEvidenceForTest(input, dependencies) {

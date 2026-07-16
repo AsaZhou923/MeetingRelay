@@ -4,6 +4,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 const KIND = "meetingrelay-controlled-hypothesis-ledger-v1";
+const SEAL_KIND = "meetingrelay-controlled-hypothesis-ledger-seal-v1";
 const SCHEMA_VERSION = "1.0";
 const AUTHORITY = Object.freeze({
   formal_claims: "none",
@@ -12,6 +13,16 @@ const AUTHORITY = Object.freeze({
   public_distribution: false,
 });
 const ROOT_KEYS = Object.freeze(["authority", "entries", "joins", "kind", "schema_version"]);
+const SEAL_AUTHORITY = Object.freeze({
+  formal_claims: "none",
+  privacy_class: "controlled-derived",
+  public_distribution: false,
+});
+const SEAL_ROOT_KEYS = Object.freeze([
+  "authority", "kind", "private_ledger", "schema_version", "text_free_projection",
+]);
+const SEAL_LEDGER_KEYS = Object.freeze(["entry_count", "kind", "schema_version", "sha256", "size_bytes"]);
+const SEAL_PROJECTION_KEYS = Object.freeze(["entry_count", "sha256", "size_bytes"]);
 const JOIN_KEYS = Object.freeze([
   "candidate_identity_sha256",
   "corpus_manifest_sha256",
@@ -293,6 +304,140 @@ export function projectControlledHypothesisLedgerTextFree(bytes) {
   return { bytes: Buffer.from(encodeCanonicalJsonLine(projection), "utf8"), projection };
 }
 
+function validateSealCount(value, code) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_ENTRIES) fail(code);
+}
+
+function validateSealSize(value, code) {
+  if (
+    typeof value !== "string" ||
+    value.length > String(MAX_RECORD_BYTES).length ||
+    !DECIMAL.test(value)
+  ) {
+    fail(code);
+  }
+  const parsed = BigInt(value);
+  if (parsed < 1n || parsed > BigInt(MAX_RECORD_BYTES)) fail(code);
+}
+
+function validateSealRecordObject(record) {
+  exactKeys(record, SEAL_ROOT_KEYS, "LEDGER_SEAL_FIELDS");
+  exactKeys(record.authority, Object.keys(SEAL_AUTHORITY), "LEDGER_SEAL_AUTHORITY");
+  if (!isDeepStrictEqual(record.authority, SEAL_AUTHORITY)) fail("LEDGER_SEAL_AUTHORITY");
+  if (record.kind !== SEAL_KIND || record.schema_version !== SCHEMA_VERSION) fail("LEDGER_SEAL_SCOPE");
+
+  exactKeys(record.private_ledger, SEAL_LEDGER_KEYS, "LEDGER_SEAL_LEDGER_IDENTITY");
+  if (
+    record.private_ledger.kind !== KIND ||
+    record.private_ledger.schema_version !== SCHEMA_VERSION
+  ) {
+    fail("LEDGER_SEAL_LEDGER_IDENTITY");
+  }
+  assertDigest(record.private_ledger.sha256, "LEDGER_SEAL_LEDGER_IDENTITY");
+  validateSealCount(record.private_ledger.entry_count, "LEDGER_SEAL_LEDGER_IDENTITY");
+  validateSealSize(record.private_ledger.size_bytes, "LEDGER_SEAL_LEDGER_IDENTITY");
+
+  exactKeys(record.text_free_projection, SEAL_PROJECTION_KEYS, "LEDGER_SEAL_PROJECTION");
+  assertDigest(record.text_free_projection.sha256, "LEDGER_SEAL_PROJECTION");
+  validateSealCount(record.text_free_projection.entry_count, "LEDGER_SEAL_PROJECTION");
+  validateSealSize(record.text_free_projection.size_bytes, "LEDGER_SEAL_PROJECTION");
+  if (record.text_free_projection.entry_count !== record.private_ledger.entry_count) {
+    fail("LEDGER_SEAL_PROJECTION");
+  }
+}
+
+function parseCanonicalSealRecord(bytes) {
+  if (
+    !Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > MAX_RECORD_BYTES ||
+    bytes.at(-1) !== 0x0a || bytes.subarray(0, -1).includes(0x0a) || bytes.includes(0x0d)
+  ) {
+    fail("LEDGER_SEAL_CANONICAL_JSON");
+  }
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes)) fail("LEDGER_SEAL_CANONICAL_JSON");
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch {
+    fail("LEDGER_SEAL_CANONICAL_JSON");
+  }
+  if (encodeCanonicalJsonLine(record) !== text) fail("LEDGER_SEAL_CANONICAL_JSON");
+  validateSealRecordObject(record);
+  return record;
+}
+
+export function validateControlledHypothesisLedgerSealRecord(bytes) {
+  const record = parseCanonicalSealRecord(bytes);
+  return { record, sealSha256: sha256(bytes) };
+}
+
+function expectedSealIdentity(ledgerBytes) {
+  const privateLedgerBytes = Buffer.isBuffer(ledgerBytes) ? Buffer.from(ledgerBytes) : ledgerBytes;
+  const ledger = validateControlledHypothesisLedgerRecord(privateLedgerBytes);
+  const projected = projectControlledHypothesisLedgerTextFree(privateLedgerBytes);
+  return {
+    ledger,
+    privateLedgerBytes,
+    projected,
+    private_ledger: {
+      entry_count: ledger.record.entries.length,
+      kind: KIND,
+      schema_version: SCHEMA_VERSION,
+      sha256: ledger.ledgerSha256,
+      size_bytes: String(privateLedgerBytes.length),
+    },
+    text_free_projection: {
+      entry_count: projected.projection.entry_count,
+      sha256: sha256(projected.bytes),
+      size_bytes: String(projected.bytes.length),
+    },
+  };
+}
+
+function validateSealBindingRecord(record, ledgerBytes) {
+  const expected = expectedSealIdentity(ledgerBytes);
+  if (
+    !isDeepStrictEqual(record.private_ledger, expected.private_ledger) ||
+    !isDeepStrictEqual(record.text_free_projection, expected.text_free_projection)
+  ) {
+    fail("LEDGER_SEAL_BINDING");
+  }
+  return expected;
+}
+
+export function validateControlledHypothesisLedgerSealBinding(sealBytes, ledgerBytes) {
+  const seal = validateControlledHypothesisLedgerSealRecord(sealBytes);
+  const expected = validateSealBindingRecord(seal.record, ledgerBytes);
+  return {
+    ledgerSha256: expected.ledger.ledgerSha256,
+    projectionSha256: expected.text_free_projection.sha256,
+    record: seal.record,
+    sealSha256: seal.sealSha256,
+  };
+}
+
+export function buildControlledHypothesisLedgerSeal(ledgerBytes) {
+  const expected = expectedSealIdentity(ledgerBytes);
+  const record = {
+    authority: { ...SEAL_AUTHORITY },
+    kind: SEAL_KIND,
+    private_ledger: expected.private_ledger,
+    schema_version: SCHEMA_VERSION,
+    text_free_projection: expected.text_free_projection,
+  };
+  validateSealRecordObject(record);
+  const bytes = Buffer.from(encodeCanonicalJsonLine(record), "utf8");
+  const validated = validateControlledHypothesisLedgerSealBinding(bytes, expected.privateLedgerBytes);
+  return {
+    bytes,
+    ledgerSha256: validated.ledgerSha256,
+    projectionBytes: expected.projected.bytes,
+    projectionSha256: validated.projectionSha256,
+    record: validated.record,
+    sealSha256: validated.sealSha256,
+  };
+}
+
 function sameIdentity(left, right) {
   const usable = (value) =>
     value !== null && typeof value === "object" &&
@@ -487,24 +632,40 @@ async function readStableFile(filePath, code, operations = {}) {
   return { bytes: firstBytes, stat: afterPath };
 }
 
-export async function readControlledHypothesisLedger(controlledRoot, relativePath, operations = {}) {
+async function readControlledRecordMaterial(
+  controlledRoot,
+  relativePath,
+  validateRecord,
+  operations = {},
+) {
   const snapshot = await inspectControlledLocation(controlledRoot, relativePath, "file", operations);
   const stable = await readStableFile(snapshot.target, "LEDGER_INPUT", operations);
-  const validated = validateControlledHypothesisLedgerRecord(stable.bytes);
+  const validated = validateRecord(stable.bytes);
   await assertLocationIdentity(snapshot, "file", operations);
   const after = await (operations.lstatImpl ?? lstat)(snapshot.target, { bigint: true }).catch(() => fail("LEDGER_INPUT"));
   if (!sameStableFile(stable.stat, after)) fail("LEDGER_INPUT");
-  return validated;
+  return { bytes: stable.bytes, stat: after, target: snapshot.target, validated };
 }
 
-export async function publishControlledHypothesisLedger(
+export async function readControlledHypothesisLedger(controlledRoot, relativePath, operations = {}) {
+  const material = await readControlledRecordMaterial(
+    controlledRoot,
+    relativePath,
+    validateControlledHypothesisLedgerRecord,
+    operations,
+  );
+  return material.validated;
+}
+
+async function publishControlledRecord(
   controlledRoot,
   relativePath,
   bytes,
+  validateRecord,
   operations = {},
 ) {
   const expectedBytes = Buffer.isBuffer(bytes) ? Buffer.from(bytes) : bytes;
-  validateControlledHypothesisLedgerRecord(expectedBytes);
+  validateRecord(expectedBytes);
   const snapshot = await inspectControlledLocation(controlledRoot, relativePath, "new", operations);
   const suffix = (operations.randomSuffix ?? (() => randomBytes(16).toString("hex")))();
   if (typeof suffix !== "string" || !/^[0-9a-f]{32}$/u.test(suffix)) fail("LEDGER_PUBLICATION");
@@ -536,7 +697,7 @@ export async function publishControlledHypothesisLedger(
     ) {
       fail("LEDGER_PUBLICATION");
     }
-    validateControlledHypothesisLedgerRecord(stagedBytes);
+    validateRecord(stagedBytes);
     await assertLocationIdentity(snapshot, "new", operations);
     await linkFile(stagingPath, snapshot.target);
     const linkedTarget = await lstatImpl(snapshot.target, { bigint: true });
@@ -556,7 +717,7 @@ export async function publishControlledHypothesisLedger(
     ) {
       fail("LEDGER_PUBLICATION");
     }
-    validateControlledHypothesisLedgerRecord(persistedBytes);
+    validateRecord(persistedBytes);
     const current = await inspectControlledLocation(controlledRoot, relativePath, "file", operations);
     const finalTarget = await lstatImpl(snapshot.target, { bigint: true });
     if (
@@ -580,4 +741,105 @@ export async function publishControlledHypothesisLedger(
   }
   if (failure || !completed) fail("LEDGER_PUBLICATION");
   return snapshot.target;
+}
+
+export async function publishControlledHypothesisLedger(
+  controlledRoot,
+  relativePath,
+  bytes,
+  operations = {},
+) {
+  return publishControlledRecord(
+    controlledRoot,
+    relativePath,
+    bytes,
+    validateControlledHypothesisLedgerRecord,
+    operations,
+  );
+}
+
+function assertDistinctControlledTargets(controlledRoot, sealRelativePath, ledgerRelativePath) {
+  const sealLocation = validateControlledLocation(controlledRoot, sealRelativePath);
+  const ledgerLocation = validateControlledLocation(controlledRoot, ledgerRelativePath);
+  const targetKey = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+  if (targetKey(sealLocation.target) === targetKey(ledgerLocation.target)) fail("LEDGER_SEAL_PATH");
+}
+
+function assertSameLedgerMaterial(before, after) {
+  if (!sameStableFile(before.stat, after.stat) || !before.bytes.equals(after.bytes)) {
+    fail("LEDGER_SEAL_LEDGER_CHANGED");
+  }
+}
+
+export async function readControlledHypothesisLedgerSeal(
+  controlledRoot,
+  sealRelativePath,
+  ledgerRelativePath,
+  operations = {},
+) {
+  assertDistinctControlledTargets(controlledRoot, sealRelativePath, ledgerRelativePath);
+  const ledgerBefore = await readControlledRecordMaterial(
+    controlledRoot,
+    ledgerRelativePath,
+    validateControlledHypothesisLedgerRecord,
+    operations,
+  );
+  const seal = await readControlledRecordMaterial(
+    controlledRoot,
+    sealRelativePath,
+    validateControlledHypothesisLedgerSealRecord,
+    operations,
+  );
+  const binding = validateControlledHypothesisLedgerSealBinding(seal.bytes, ledgerBefore.bytes);
+  const ledgerAfter = await readControlledRecordMaterial(
+    controlledRoot,
+    ledgerRelativePath,
+    validateControlledHypothesisLedgerRecord,
+    operations,
+  );
+  assertSameLedgerMaterial(ledgerBefore, ledgerAfter);
+  return binding;
+}
+
+export async function publishControlledHypothesisLedgerSeal(
+  controlledRoot,
+  sealRelativePath,
+  ledgerRelativePath,
+  bytes,
+  operations = {},
+) {
+  assertDistinctControlledTargets(controlledRoot, sealRelativePath, ledgerRelativePath);
+  const expectedBytes = Buffer.isBuffer(bytes) ? Buffer.from(bytes) : bytes;
+  const ledgerBefore = await readControlledRecordMaterial(
+    controlledRoot,
+    ledgerRelativePath,
+    validateControlledHypothesisLedgerRecord,
+    operations,
+  );
+  validateControlledHypothesisLedgerSealBinding(expectedBytes, ledgerBefore.bytes);
+  const target = await publishControlledRecord(
+    controlledRoot,
+    sealRelativePath,
+    expectedBytes,
+    validateControlledHypothesisLedgerSealRecord,
+    operations,
+  );
+  const [sealAfter, ledgerAfter] = await Promise.all([
+    readControlledRecordMaterial(
+      controlledRoot,
+      sealRelativePath,
+      validateControlledHypothesisLedgerSealRecord,
+      operations,
+    ),
+    readControlledRecordMaterial(
+      controlledRoot,
+      ledgerRelativePath,
+      validateControlledHypothesisLedgerRecord,
+      operations,
+    ),
+  ]);
+  assertSameLedgerMaterial(ledgerBefore, ledgerAfter);
+  if (!sealAfter.bytes.equals(expectedBytes)) fail("LEDGER_SEAL_PUBLICATION");
+  validateControlledHypothesisLedgerSealBinding(sealAfter.bytes, ledgerAfter.bytes);
+  return target;
 }

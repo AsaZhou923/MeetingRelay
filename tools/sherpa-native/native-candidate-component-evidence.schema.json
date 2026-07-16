@@ -48,7 +48,7 @@
       "maxItems": 8,
       "prefixItems": [
         { "const": "synthetic-contract-foundation-does-not-assess-model-quality" },
-        { "const": "native-hypothesis-content-not-collected-or-scored" },
+        { "const": "component-evidence-excludes-hypothesis-content-and-scores" },
         { "const": "candidate-source-and-hardware-artifacts-not-directly-materialized" },
         { "const": "resource-sampling-unavailable" },
         { "const": "publication-retains-auditable-create-new-staging-residue" },

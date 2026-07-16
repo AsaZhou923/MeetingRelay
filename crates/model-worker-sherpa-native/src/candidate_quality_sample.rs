@@ -30,7 +30,8 @@ const PCM_BYTES_PER_SAMPLE: u64 = 2;
 const NANOS_PER_SAMPLE: u64 = 62_500;
 const MIN_WAV_BYTES: u64 = 44;
 const MAX_WAV_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECORD_BYTES: usize = 4_096;
+const MAX_TRANSCRIPT_UTF8_BYTES: usize = 16_384;
+const MAX_RECORD_BYTES: usize = 4_096 + (MAX_TRANSCRIPT_UTF8_BYTES * 6);
 const RESOURCE_UNAVAILABLE_REASON: &str = "SHERPA_QUALITY_RESOURCE_SAMPLING_UNAVAILABLE";
 static QUALITY_SAMPLE_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -131,8 +132,9 @@ impl std::error::Error for NativeCandidateQualitySampleError {}
 ///
 /// Sample bytes and every caller-supplied identity field are verified before
 /// native construction, preparation, or execution. The returned canonical
-/// line contains only stable identifiers, hashes, counts, integer timings,
-/// null resource observations, and fixed status codes.
+/// line is a private pipe record containing the original transcript alongside
+/// stable identifiers, hashes, counts, integer timings, null resource
+/// observations, and fixed status codes.
 pub fn run_locked_native_candidate_quality_sample(
     input: NativeCandidateQualitySampleInput,
 ) -> Result<Vec<u8>, NativeCandidateQualitySampleError> {
@@ -226,18 +228,42 @@ impl CandidateQualityBackend for NativeQualityBackend {
             .inner
             .recognize_quality_sample_text(&[chunk])
             .map_err(|_| NativeCandidateQualitySampleError::Execution)?;
-        let transcript = text.as_bytes();
-        Ok(QualityTranscriptIdentity {
-            sha256: Sha256Digest::from_bytes(Sha256::digest(transcript).into()),
-            utf8_bytes: transcript.len(),
-        })
+        Ok(QualityTranscriptIdentity::from_text(text))
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct QualityTranscriptIdentity {
+    final_transcript: String,
     sha256: Sha256Digest,
     utf8_bytes: usize,
+}
+
+impl QualityTranscriptIdentity {
+    fn from_text(final_transcript: String) -> Self {
+        let transcript = final_transcript.as_bytes();
+        Self {
+            sha256: Sha256Digest::from_bytes(Sha256::digest(transcript).into()),
+            utf8_bytes: transcript.len(),
+            final_transcript,
+        }
+    }
+
+    fn validate(&self) -> Result<&str, NativeCandidateQualitySampleError> {
+        let transcript = self.final_transcript.as_bytes();
+        let text = std::str::from_utf8(transcript)
+            .map_err(|_| NativeCandidateQualitySampleError::Observation)?;
+        let actual_sha256 = Sha256Digest::from_bytes(Sha256::digest(transcript).into());
+        if transcript.contains(&0)
+            || transcript.len() > MAX_TRANSCRIPT_UTF8_BYTES
+            || self.utf8_bytes != transcript.len()
+            || self.sha256 != actual_sha256
+            || self.sha256.is_zero()
+        {
+            return Err(NativeCandidateQualitySampleError::Observation);
+        }
+        Ok(text)
+    }
 }
 
 struct VerifiedQualityWav {
@@ -286,10 +312,6 @@ where
     let execute_elapsed_ns = u64::try_from(execute_started.elapsed().as_nanos())
         .map_err(|_| NativeCandidateQualitySampleError::Observation)?;
     backend.validate_runtime_identity()?;
-    if transcript.sha256.is_zero() {
-        return Err(NativeCandidateQualitySampleError::Observation);
-    }
-
     encode_record(
         &input.sample,
         &manifest,
@@ -537,7 +559,8 @@ fn encode_record(
     parameter_sha256: Sha256Digest,
     measurement: QualityMeasurement,
 ) -> Result<Vec<u8>, NativeCandidateQualitySampleError> {
-    let mut output = String::with_capacity(2_048);
+    let transcript = measurement.transcript.validate()?;
+    let mut output = String::with_capacity(2_048 + transcript.len());
     output.push_str("{\"authority\":{\"formal_claims\":\"none\",\"production_evidence\":false},");
     write!(
         &mut output,
@@ -561,7 +584,16 @@ fn encode_record(
         &mut output,
         concat!(
             "\"execution\":{{\"backend_execute_calls\":1,\"execute_elapsed_ns\":\"{}\",",
-            "\"final_transcript_sha256\":\"{}\",\"final_transcript_utf8_bytes\":\"{}\",",
+            "\"final_transcript\":"
+        ),
+        measurement.execute_elapsed_ns,
+    )
+    .map_err(|_| NativeCandidateQualitySampleError::Observation)?;
+    write_canonical_json_string(&mut output, transcript)?;
+    write!(
+        &mut output,
+        concat!(
+            ",\"final_transcript_sha256\":\"{}\",\"final_transcript_utf8_bytes\":\"{}\",",
             "\"fresh_process_per_sample\":true,\"prepare_elapsed_ns\":\"{}\"}},",
             "\"host\":{{\"executable_sha256\":\"{}\",",
             "\"schema_registry_sha256\":\"{}\"}},",
@@ -571,7 +603,6 @@ fn encode_record(
             "\"reason\":\"{}\",\"status\":\"unavailable\"}},",
             "\"rtf\":{{\"denominator_audio_ns\":\"{}\",\"numerator_execute_ns\":\"{}\"}},"
         ),
-        measurement.execute_elapsed_ns,
         measurement.transcript.sha256.to_lower_hex(),
         measurement.transcript.utf8_bytes,
         measurement.prepare_elapsed_ns,
@@ -609,6 +640,29 @@ fn encode_record(
         return Err(NativeCandidateQualitySampleError::Observation);
     }
     Ok(output.into_bytes())
+}
+
+fn write_canonical_json_string(
+    output: &mut String,
+    value: &str,
+) -> Result<(), NativeCandidateQualitySampleError> {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\t' => output.push_str("\\t"),
+            '\n' => output.push_str("\\n"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\r' => output.push_str("\\r"),
+            '\u{00}'..='\u{1f}' => write!(output, "\\u{:04x}", u32::from(character))
+                .map_err(|_| NativeCandidateQualitySampleError::Observation)?,
+            _ => output.push(character),
+        }
+    }
+    output.push('"');
+    Ok(())
 }
 
 fn locked_digest(value: &str) -> Result<Sha256Digest, NativeCandidateQualitySampleError> {
@@ -733,7 +787,7 @@ mod tests {
     const F: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
     #[test]
-    fn valid_sample_prepares_once_executes_once_and_emits_no_sensitive_text() {
+    fn valid_sample_prepares_once_executes_once_and_emits_private_transcript_record() {
         let fixture = Fixture::new("valid");
         let prepare_calls = Arc::new(AtomicUsize::new(0));
         let execute_calls = Arc::new(AtomicUsize::new(0));
@@ -763,9 +817,9 @@ mod tests {
         assert!(json.contains("\"reference_sha256\":\"eeeeeeee"));
         assert!(json.contains("\"cpu_time_ns\":null"));
         assert!(json.contains("\"reason\":\"SHERPA_QUALITY_RESOURCE_SAMPLING_UNAVAILABLE\""));
+        assert!(json.contains("\"final_transcript\":\"fixture transcript must remain secret\""));
         for forbidden in [
             fixture.root.to_string_lossy().as_ref(),
-            "fixture transcript must remain secret",
             "\"path\"",
             "\"transcript\"",
         ] {
@@ -909,10 +963,92 @@ mod tests {
         })
         .expect("empty hypothesis remains a valid measurement");
         let json = String::from_utf8(record).expect("record is UTF-8");
+        assert!(json.contains("\"final_transcript\":\"\""));
         assert!(json.contains(
             "\"final_transcript_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""
         ));
         assert!(json.contains("\"final_transcript_utf8_bytes\":\"0\""));
+    }
+
+    #[test]
+    fn cjk_and_escaped_characters_are_preserved_in_canonical_json() {
+        let fixture = Fixture::new("cjk-escaped");
+        let transcript = "日本語 中文 \"quoted\" \\path\nnext\t\u{01}".to_owned();
+        let expected_sha256 =
+            Sha256Digest::from_bytes(Sha256::digest(transcript.as_bytes()).into());
+        let expected_utf8_bytes = transcript.len();
+        let record =
+            run_with_transcript(&fixture, QualityTranscriptIdentity::from_text(transcript))
+                .expect("valid multilingual transcript succeeds");
+        let json = String::from_utf8(record).expect("record is UTF-8");
+
+        assert!(json.contains(
+            "\"final_transcript\":\"日本語 中文 \\\"quoted\\\" \\\\path\\nnext\\t\\u0001\""
+        ));
+        assert!(json.contains(&format!(
+            "\"final_transcript_sha256\":\"{}\"",
+            expected_sha256.to_lower_hex()
+        )));
+        assert!(json.contains(&format!(
+            "\"final_transcript_utf8_bytes\":\"{expected_utf8_bytes}\""
+        )));
+        assert_eq!(json.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn transcript_at_exact_utf8_limit_is_accepted() {
+        let fixture = Fixture::new("transcript-exact-limit");
+        let transcript = "a".repeat(MAX_TRANSCRIPT_UTF8_BYTES);
+        let record =
+            run_with_transcript(&fixture, QualityTranscriptIdentity::from_text(transcript))
+                .expect("exact 16 KiB transcript succeeds");
+        let json = String::from_utf8(record).expect("record is UTF-8");
+
+        assert!(json.contains("\"final_transcript_utf8_bytes\":\"16384\""));
+        assert!(json.len() > MAX_TRANSCRIPT_UTF8_BYTES);
+    }
+
+    #[test]
+    fn nul_and_over_limit_transcripts_fail_with_text_free_error() {
+        for (label, transcript) in [
+            ("transcript-nul", "secret\0sentinel".to_owned()),
+            (
+                "transcript-over-limit",
+                "s".repeat(MAX_TRANSCRIPT_UTF8_BYTES + 1),
+            ),
+        ] {
+            let fixture = Fixture::new(label);
+            let error =
+                run_with_transcript(&fixture, QualityTranscriptIdentity::from_text(transcript))
+                    .expect_err("invalid transcript must not emit a record");
+
+            assert_eq!(error, NativeCandidateQualitySampleError::Observation);
+            assert_eq!(error.to_string(), "SHERPA_QUALITY_OBSERVATION");
+            assert!(!error.to_string().contains("secret"));
+            assert!(!format!("{error:?}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn transcript_digest_and_count_must_match_original_bytes() {
+        let count_fixture = Fixture::new("transcript-count-mismatch");
+        let mut count_mismatch = QualityTranscriptIdentity::from_text("count sentinel".to_owned());
+        count_mismatch.utf8_bytes += 1;
+        let count_error = run_with_transcript(&count_fixture, count_mismatch)
+            .expect_err("count mismatch must not emit a record");
+
+        let digest_fixture = Fixture::new("transcript-digest-mismatch");
+        let mut digest_mismatch =
+            QualityTranscriptIdentity::from_text("digest sentinel".to_owned());
+        digest_mismatch.sha256 = digest(F);
+        let digest_error = run_with_transcript(&digest_fixture, digest_mismatch)
+            .expect_err("digest mismatch must not emit a record");
+
+        for error in [count_error, digest_error] {
+            assert_eq!(error, NativeCandidateQualitySampleError::Observation);
+            assert_eq!(error.to_string(), "SHERPA_QUALITY_OBSERVATION");
+            assert!(!error.to_string().contains("sentinel"));
+        }
     }
 
     #[test]
@@ -939,10 +1075,7 @@ mod tests {
             QualityMeasurement {
                 execute_elapsed_ns: 13,
                 prepare_elapsed_ns: 11,
-                transcript: QualityTranscriptIdentity {
-                    sha256: digest(F),
-                    utf8_bytes: 7,
-                },
+                transcript: QualityTranscriptIdentity::from_text("fixture".to_owned()),
             },
         )
         .expect("encode canonical record");
@@ -959,7 +1092,8 @@ mod tests {
                 "\"runtime_bundle_sha256\":\"0682618f660a2a9f2278d99decb77624253aadde60e8199a9b07813b8d843317\",",
                 "\"tokens_sha256\":\"f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc\"},",
                 "\"execution\":{\"backend_execute_calls\":1,\"execute_elapsed_ns\":\"13\",",
-                "\"final_transcript_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",",
+                "\"final_transcript\":\"fixture\",",
+                "\"final_transcript_sha256\":\"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d\",",
                 "\"final_transcript_utf8_bytes\":\"7\",\"fresh_process_per_sample\":true,",
                 "\"prepare_elapsed_ns\":\"11\"},",
                 "\"host\":{\"executable_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",",
@@ -1023,11 +1157,33 @@ mod tests {
             _pcm_sha256: Sha256Digest,
         ) -> Result<QualityTranscriptIdentity, NativeCandidateQualitySampleError> {
             self.execute_calls.fetch_add(1, Ordering::Relaxed);
-            let bytes = b"fixture transcript must remain secret";
-            Ok(QualityTranscriptIdentity {
-                sha256: Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
-                utf8_bytes: bytes.len(),
-            })
+            Ok(QualityTranscriptIdentity::from_text(
+                "fixture transcript must remain secret".to_owned(),
+            ))
+        }
+    }
+
+    struct TranscriptBackend {
+        transcript: Option<QualityTranscriptIdentity>,
+    }
+
+    impl CandidateQualityBackend for TranscriptBackend {
+        fn prepare(&mut self) -> Result<(), NativeCandidateQualitySampleError> {
+            Ok(())
+        }
+
+        fn validate_runtime_identity(&self) -> Result<(), NativeCandidateQualitySampleError> {
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            _samples: &[i16],
+            _pcm_sha256: Sha256Digest,
+        ) -> Result<QualityTranscriptIdentity, NativeCandidateQualitySampleError> {
+            self.transcript
+                .take()
+                .ok_or(NativeCandidateQualitySampleError::Execution)
         }
     }
 
@@ -1047,10 +1203,7 @@ mod tests {
             _samples: &[i16],
             _pcm_sha256: Sha256Digest,
         ) -> Result<QualityTranscriptIdentity, NativeCandidateQualitySampleError> {
-            Ok(QualityTranscriptIdentity {
-                sha256: Sha256Digest::from_bytes(Sha256::digest([]).into()),
-                utf8_bytes: 0,
-            })
+            Ok(QualityTranscriptIdentity::from_text(String::new()))
         }
     }
 
@@ -1082,11 +1235,9 @@ mod tests {
             _pcm_sha256: Sha256Digest,
         ) -> Result<QualityTranscriptIdentity, NativeCandidateQualitySampleError> {
             self.execute_calls.fetch_add(1, Ordering::Relaxed);
-            let bytes = b"must not produce an evidence record after runtime drift";
-            Ok(QualityTranscriptIdentity {
-                sha256: Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
-                utf8_bytes: bytes.len(),
-            })
+            Ok(QualityTranscriptIdentity::from_text(
+                "must not produce an evidence record after runtime drift".to_owned(),
+            ))
         }
     }
 
@@ -1176,6 +1327,17 @@ mod tests {
 
     fn digest(value: &str) -> Sha256Digest {
         Sha256Digest::from_lower_hex(value).expect("fixture digest is valid")
+    }
+
+    fn run_with_transcript(
+        fixture: &Fixture,
+        transcript: QualityTranscriptIdentity,
+    ) -> Result<Vec<u8>, NativeCandidateQualitySampleError> {
+        run_quality_sample_with_backend_factory(fixture.input(), |_| {
+            Ok(Box::new(TranscriptBackend {
+                transcript: Some(transcript),
+            }))
+        })
     }
 
     fn unique_test_directory(label: &str) -> PathBuf {
