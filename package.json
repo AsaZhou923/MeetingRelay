@@ -31,6 +31,7 @@
     "phase0:sherpa-quality-foundation:test": "node --test tools/sherpa-native/quality-corpus.test.mjs tools/sherpa-native/asr-error-rate.test.mjs tools/sherpa-native/controlled-hypothesis-ledger.test.mjs tools/sherpa-native/native-candidate-component-evidence.test.mjs tools/sherpa-native/asr-quality-run-policy.test.mjs tools/sherpa-native/native-candidate-quality-runner.test.mjs",
     "phase0:sherpa-quality-foundation:validate": "node tools/sherpa-native/native-candidate-component-evidence.mjs --validate",
     "phase0:sherpa-quality-evidence:validate": "node tools/sherpa-native/native-candidate-quality-runner.mjs --validate",
+    "phase0:sherpa-fleurs-gold-source:test": "node --test tools/sherpa-native/fleurs-gold-source.test.mjs",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",
     "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",

@@ -113,6 +113,10 @@ jobs:
         run: pnpm phase0:sherpa-quality-foundation:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 FLEURS frozen-source contract (offline metadata only)
+        run: pnpm phase0:sherpa-fleurs-gold-source:test
+        timeout-minutes: 5
+
       - name: Test WP-0.4 native candidate conformance contract
         run: pnpm phase0:sherpa-candidate-conformance:test
         timeout-minutes: 5
