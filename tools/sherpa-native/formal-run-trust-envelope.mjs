@@ -700,36 +700,42 @@ export function validateFormalRunReadinessEnvelopeBytes(bytes, options) {
   return { bytes, record, sha256: sha256(bytes) };
 }
 
-async function publishReadiness(outputPath, bytes, operations) {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 1 || typeof outputPath !== "string" || !path.isAbsolute(outputPath)) {
-    fail("FORMAL_TRUST_READINESS_PUBLICATION");
-  }
-  const parentPath = path.dirname(outputPath);
-  let parentBefore;
+async function assertDirectDirectoryAncestorChain(directory, code) {
+  const chain = [];
   try {
-    const canonicalParent = await realpath(parentPath);
-    parentBefore = await lstat(parentPath, { bigint: true });
-    const canonicalParentBefore = await lstat(canonicalParent, { bigint: true });
-    if (
-      !parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
-      !canonicalParentBefore.isDirectory() || canonicalParentBefore.isSymbolicLink() ||
-      parentBefore.dev !== canonicalParentBefore.dev ||
-      parentBefore.ino !== canonicalParentBefore.ino
-    ) {
-      fail("FORMAL_TRUST_READINESS_PUBLICATION");
-    }
-    let current = parentPath;
+    let current = directory;
     while (true) {
       const currentStat = await lstat(current, { bigint: true });
-      if (currentStat.isSymbolicLink()) fail("FORMAL_TRUST_READINESS_PUBLICATION");
+      const canonicalCurrent = await realpath(current);
+      const canonicalStat = await lstat(canonicalCurrent, { bigint: true });
+      if (
+        !currentStat.isDirectory() || currentStat.isSymbolicLink() ||
+        !canonicalStat.isDirectory() || canonicalStat.isSymbolicLink() ||
+        currentStat.dev !== canonicalStat.dev || currentStat.ino !== canonicalStat.ino
+      ) {
+        fail(code);
+      }
+      chain.push(currentStat);
       const parent = path.dirname(current);
       if (parent === current) break;
       current = parent;
     }
   } catch (error) {
     if (error instanceof FormalRunTrustEnvelopeError) throw error;
-    fail("FORMAL_TRUST_READINESS_PUBLICATION", { cause: error });
+    fail(code, { cause: error });
   }
+  return chain;
+}
+
+async function publishReadiness(outputPath, bytes, operations) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 1 || typeof outputPath !== "string" || !path.isAbsolute(outputPath)) {
+    fail("FORMAL_TRUST_READINESS_PUBLICATION");
+  }
+  const parentPath = path.dirname(outputPath);
+  const parentChainBefore = await assertDirectDirectoryAncestorChain(
+    parentPath,
+    "FORMAL_TRUST_READINESS_PUBLICATION",
+  );
   let handle;
   let createdStat;
   try {
@@ -751,15 +757,15 @@ async function publishReadiness(outputPath, bytes, operations) {
     const stable = await readStableRegularFile(outputPath, "FORMAL_TRUST_READINESS_POSTFLIGHT");
     persisted = stable.bytes;
     after = stable.stat;
-    const parentAfter = await lstat(parentPath, { bigint: true });
-    const canonicalParentAfter = await realpath(parentPath);
-    const canonicalParentAfterStat = await lstat(canonicalParentAfter, { bigint: true });
+    const parentChainAfter = await assertDirectDirectoryAncestorChain(
+      parentPath,
+      "FORMAL_TRUST_READINESS_POSTFLIGHT",
+    );
     if (
-      !parentAfter.isDirectory() || parentAfter.isSymbolicLink() ||
-      !canonicalParentAfterStat.isDirectory() || canonicalParentAfterStat.isSymbolicLink() ||
-      parentAfter.dev !== parentBefore.dev || parentAfter.ino !== parentBefore.ino ||
-      parentAfter.dev !== canonicalParentAfterStat.dev ||
-      parentAfter.ino !== canonicalParentAfterStat.ino
+      parentChainAfter.length !== parentChainBefore.length ||
+      parentChainAfter.some((current, index) =>
+        current.dev !== parentChainBefore[index].dev ||
+        current.ino !== parentChainBefore[index].ino)
     ) {
       fail("FORMAL_TRUST_READINESS_POSTFLIGHT");
     }

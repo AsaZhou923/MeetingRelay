@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -1092,6 +1095,36 @@ subjectTest("readiness publication detects post-create replacement without unlin
     "FORMAL_TRUST_READINESS_POSTFLIGHT",
   );
   assert.deepEqual(await readFile(target), competitor);
+});
+
+subjectTest("readiness publication rejects an identity-preserving post-create ancestor junction", async (t) => {
+  if (process.platform !== "win32") return;
+  const root = await temporaryDirectory(t);
+  const ancestor = path.join(root, "ancestor");
+  const parent = path.join(ancestor, "evidence");
+  const movedAncestor = `${root}-moved-ancestor`;
+  t.after(() => rm(movedAncestor, { force: true, recursive: true }));
+  await mkdir(parent, { recursive: true });
+  const target = path.join(parent, "readiness.json");
+  const expected = canonical({ authority: AUTHORITY, kind: "fixture" });
+  await expectCode(
+    () => api("__publishFormalRunReadinessEnvelopeForTest")(
+      target,
+      expected,
+      {
+        afterCreateNew: async () => {
+          await rename(ancestor, movedAncestor);
+          await symlink(movedAncestor, ancestor, "junction");
+        },
+      },
+    ),
+    "FORMAL_TRUST_READINESS_POSTFLIGHT",
+  );
+  assert.deepEqual(
+    await readFile(path.join(movedAncestor, "evidence", "readiness.json")),
+    expected,
+  );
+  await rm(ancestor, { force: true, recursive: true });
 });
 
 subjectTest("readiness assessment invokes attestation dependencies but no audio or model runner", async () => {
