@@ -218,7 +218,9 @@ try {
     )
     $attestResult = Invoke-Attestor -Argument @("attest", $controlledRoot)
     if ($attestResult.ExitCode -ne 0 -or $attestResult.Stderr.Length -ne 0) {
-        throw "Exact controlled root did not attest successfully"
+        $stdoutBytes = [Text.Encoding]::UTF8.GetByteCount($attestResult.Stdout)
+        $stderrBytes = [Text.Encoding]::UTF8.GetByteCount($attestResult.Stderr)
+        throw "Exact controlled root did not attest successfully (exit=$($attestResult.ExitCode), stdout_bytes=$stdoutBytes, stderr_bytes=$stderrBytes)"
     }
     $attestation = ConvertFrom-ReceiptLine -Line $attestResult.Stdout -ExpectedMarker "CONTROLLED_ROOT_ATTESTATION=PASS"
     $expectedAttestationFields = @(
