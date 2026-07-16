@@ -354,13 +354,22 @@ async function assertDirectPathChain(inputPath, missingCode, field) {
   let current = resolved;
   while (true) {
     let metadata;
+    let actualMetadata;
     let actual;
     try {
-      [metadata, actual] = await Promise.all([lstat(current), realpath(current)]);
+      [metadata, actual] = await Promise.all([
+        lstat(current, { bigint: true }),
+        realpath(current),
+      ]);
+      actualMetadata = await lstat(actual, { bigint: true });
     } catch {
       fail(missingCode, "required candidate path is missing", field);
     }
-    if (metadata.isSymbolicLink() || pathKey(actual) !== pathKey(current)) {
+    if (
+      metadata.isSymbolicLink() ||
+      metadata.dev !== actualMetadata.dev ||
+      metadata.ino !== actualMetadata.ino
+    ) {
       fail("LOCK_PATH", "candidate path cannot cross a reparse point", field);
     }
     const parent = path.dirname(current);
