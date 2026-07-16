@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { encodeCanonicalJsonLine } from "../phase0-harness/canonical-json.mjs";
 import {
   CandidateConformanceValidationError,
   extractCandidateHostRecord,
   sanitizeCandidateHostEnvironment,
+  runReleaseNativeCandidateConformance,
   validateNativeCandidateConformanceRecord,
   validateStagedRuntimeClosure,
 } from "./validate-candidate-conformance.mjs";
+import { DEFAULT_LOCK_PATH } from "./validate-lock.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -129,6 +134,37 @@ test("canonical native candidate conformance is a non-production supporting reco
     schemaRegistrySha256: sha256(input.schemaRegistryBytes),
     workerId: "meetingrelay-sherpa-native-candidate-host-v1",
   });
+});
+
+test("release conformance accepts the sealed candidate lock layout before validating later joins", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-conf-lock-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const lockDirectory = path.join(root, "assets");
+  const licenseDirectory = path.join(root, "licenses");
+  await Promise.all([mkdir(lockDirectory), mkdir(licenseDirectory)]);
+  const lockPath = path.join(lockDirectory, "assets.lock.json");
+  await copyFile(DEFAULT_LOCK_PATH, lockPath);
+  for (const name of [
+    "apache-2.0-sherpa-onnx.txt",
+    "funasr-model-license-1.1.txt",
+    "mit-onnxruntime-1.27.0.txt",
+  ]) {
+    await copyFile(path.join(HERE, "licenses", name), path.join(licenseDirectory, name));
+  }
+
+  await expectCode(
+    () => runReleaseNativeCandidateConformance({ assetLockPath: lockPath }),
+    "CONF_ASSET_LOCK_JOIN",
+  );
+  await expectCode(
+    () =>
+      runReleaseNativeCandidateConformance({
+        assetLicenseRoot: root,
+        assetLockPath: lockPath,
+        schemaRegistryPath: path.join(root, "missing-schema.json"),
+      }),
+    "CONF_SCHEMA_JOIN",
+  );
 });
 
 test("conformance authority cannot be promoted to formal or production evidence", async () => {

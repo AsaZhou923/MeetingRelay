@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 import { encodeCanonicalJsonLine } from "../phase0-harness/canonical-json.mjs";
-import { validateLockFile } from "./validate-lock.mjs";
+import { validateCandidateLockFile, validateLockFile } from "./validate-lock.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(HERE, "../..");
@@ -476,7 +476,16 @@ async function validateInputs(
 ) {
   let locked;
   try {
-    locked = await validateLockFile(input.assetLockPath);
+    // Source-tree callers retain sidecar, historical-license, and Cargo-gate checks.
+    // A sealed candidate bundle must opt in with its explicit external license root.
+    locked =
+      input.assetLicenseRoot === undefined
+        ? await validateLockFile(input.assetLockPath)
+        : await validateCandidateLockFile({
+            expectedLockSha256: descriptor.model_manifest_sha256,
+            licenseRoot: input.assetLicenseRoot,
+            lockPath: input.assetLockPath,
+          });
   } catch {
     fail("CONF_ASSET_LOCK_JOIN");
   }

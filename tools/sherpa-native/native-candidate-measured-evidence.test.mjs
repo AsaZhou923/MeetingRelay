@@ -483,6 +483,7 @@ async function createFixture(t) {
     assert.equal(input.tokensPath, path.join(outputBundleRoot, ...tokens.path.split("/")));
     assert.equal(input.runtimeLibDir, path.join(outputBundleRoot, "assets", "runtime", "lib"));
     assert.equal(input.assetLockPath, path.join(outputBundleRoot, ...assetLock.path.split("/")));
+    assert.equal(input.assetLicenseRoot, outputBundleRoot);
     assert.equal(
       input.packageLockPath,
       path.join(outputBundleRoot, ...packageLock.path.split("/")),

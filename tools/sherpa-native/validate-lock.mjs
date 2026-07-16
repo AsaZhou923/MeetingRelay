@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, open, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -315,6 +315,144 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function parseCanonicalLock(bytes, absoluteLock) {
+  let lock;
+  try {
+    lock = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    fail("LOCK_JSON", error instanceof Error ? error.message : "invalid JSON", absoluteLock);
+  }
+  const canonical = `${JSON.stringify(lock, null, 2)}\n`;
+  if (!bytes.equals(Buffer.from(canonical, "utf8"))) {
+    fail("LOCK_CANONICAL_JSON", "lock JSON must use canonical two-space formatting and LF", absoluteLock);
+  }
+  validateLockObject(lock);
+  return lock;
+}
+
+function pathKey(value) {
+  const normalized = path.normalize(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function sameFileSnapshot(left, right) {
+  return (
+    typeof left?.dev === "bigint" &&
+    typeof left?.ino === "bigint" &&
+    left.dev > 0n &&
+    left.ino > 0n &&
+    left.dev === right?.dev &&
+    left.ino === right?.ino &&
+    left.size === right?.size &&
+    left.mtimeNs === right?.mtimeNs &&
+    left.ctimeNs === right?.ctimeNs
+  );
+}
+
+async function assertDirectPathChain(inputPath, missingCode, field) {
+  const resolved = path.resolve(inputPath);
+  let current = resolved;
+  while (true) {
+    let metadata;
+    let actual;
+    try {
+      [metadata, actual] = await Promise.all([lstat(current), realpath(current)]);
+    } catch {
+      fail(missingCode, "required candidate path is missing", field);
+    }
+    if (metadata.isSymbolicLink() || pathKey(actual) !== pathKey(current)) {
+      fail("LOCK_PATH", "candidate path cannot cross a reparse point", field);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return resolved;
+}
+
+async function rereadHandleBytes(handle, expectedLength, field) {
+  const bytes = Buffer.allocUnsafe(expectedLength);
+  let offset = 0;
+  while (offset < expectedLength) {
+    const { bytesRead } = await handle.read(bytes, offset, expectedLength - offset, offset);
+    if (bytesRead === 0) fail("LOCK_PATH", "candidate file changed while reading", field);
+    offset += bytesRead;
+  }
+  const trailing = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(trailing, 0, 1, expectedLength);
+  if (bytesRead !== 0) fail("LOCK_PATH", "candidate file changed while reading", field);
+  return bytes;
+}
+
+async function readDirectRegularFile(inputPath, missingCode, field) {
+  const resolved = await assertDirectPathChain(inputPath, missingCode, field);
+  const resolvedBefore = await realpath(resolved).catch(() => {
+    fail(missingCode, "required candidate file is missing", field);
+  });
+  const handle = await open(resolved, "r").catch(() => {
+    fail(missingCode, "required candidate file cannot be opened", field);
+  });
+  let failure;
+  try {
+    const [beforePath, beforeHandle] = await Promise.all([
+      lstat(resolved, { bigint: true }),
+      handle.stat({ bigint: true }),
+    ]);
+    if (
+      !beforePath.isFile() ||
+      beforePath.isSymbolicLink() ||
+      !beforeHandle.isFile() ||
+      !sameFileSnapshot(beforePath, beforeHandle)
+    ) {
+      fail("LOCK_PATH", "candidate input must be one direct regular file", field);
+    }
+    const bytes = await handle.readFile();
+    const [afterPath, afterHandle, resolvedAfter, verificationBytes] = await Promise.all([
+      lstat(resolved, { bigint: true }).catch(() => null),
+      handle.stat({ bigint: true }),
+      realpath(resolved).catch(() => null),
+      rereadHandleBytes(handle, bytes.length, field),
+    ]);
+    await assertDirectPathChain(resolved, missingCode, field);
+    if (
+      afterPath === null ||
+      resolvedAfter === null ||
+      !sameFileSnapshot(beforeHandle, afterHandle) ||
+      !sameFileSnapshot(beforeHandle, afterPath) ||
+      pathKey(resolvedAfter) !== pathKey(resolvedBefore) ||
+      BigInt(bytes.length) !== beforeHandle.size ||
+      !verificationBytes.equals(bytes)
+    ) {
+      fail("LOCK_PATH", "candidate file changed while reading", field);
+    }
+    return bytes;
+  } catch (error) {
+    failure = error;
+    throw error;
+  } finally {
+    try {
+      await handle.close();
+    } catch (error) {
+      if (failure === undefined) {
+        fail("LOCK_PATH", "candidate file handle did not close cleanly", field);
+      }
+    }
+  }
+}
+
+async function validateSnapshotFile(root, record) {
+  const relative = record.snapshot_path;
+  const target = path.resolve(root, relative);
+  const boundary = path.relative(root, target);
+  if (boundary.startsWith("..") || path.isAbsolute(boundary)) {
+    fail("LOCK_PATH", "license snapshot escapes license root", relative);
+  }
+  const snapshot = await readDirectRegularFile(target, "LOCK_LICENSE_FILE", relative);
+  if (snapshot.length !== record.size_bytes || sha256(snapshot) !== record.sha256) {
+    fail("LOCK_LICENSE_FILE", "license snapshot bytes differ", relative);
+  }
+}
+
 export function validateCargoOfflineGate(contents) {
   if (contents !== CARGO_OFFLINE_GATE) {
     fail(
@@ -335,17 +473,7 @@ export async function validateLockFile(lockPath = DEFAULT_LOCK_PATH) {
   if (match === null || match[1] !== sha256(bytes)) {
     fail("LOCK_FILE_DIGEST", "lock file differs from its committed digest", checksumPath);
   }
-  let lock;
-  try {
-    lock = JSON.parse(bytes.toString("utf8"));
-  } catch (error) {
-    fail("LOCK_JSON", error instanceof Error ? error.message : "invalid JSON", absoluteLock);
-  }
-  const canonical = `${JSON.stringify(lock, null, 2)}\n`;
-  if (!bytes.equals(Buffer.from(canonical, "utf8"))) {
-    fail("LOCK_CANONICAL_JSON", "lock JSON must use canonical two-space formatting and LF", absoluteLock);
-  }
-  validateLockObject(lock);
+  const lock = parseCanonicalLock(bytes, absoluteLock);
   for (const [relative, [size, expectedHash]] of SNAPSHOTS) {
     const target = path.resolve(lockDirectory, relative);
     if (path.relative(lockDirectory, target).startsWith("..")) {
@@ -361,6 +489,49 @@ export async function validateLockFile(lockPath = DEFAULT_LOCK_PATH) {
     validateCargoOfflineGate(cargoConfig);
   }
   return { lock, lockPath: absoluteLock, lockSha256: sha256(bytes) };
+}
+
+export async function validateCandidateLockFile(input) {
+  exactKeys(input, ["expectedLockSha256", "licenseRoot", "lockPath"], "candidateLock");
+  digest(input.expectedLockSha256, "candidateLock.expectedLockSha256");
+  if (input.expectedLockSha256 === "0".repeat(64)) {
+    fail("LOCK_DIGEST", "expected a nonzero external digest", "candidateLock.expectedLockSha256");
+  }
+  if (typeof input.licenseRoot !== "string" || input.licenseRoot.length === 0) {
+    fail("LOCK_PATH", "expected an explicit license root", "candidateLock.licenseRoot");
+  }
+  if (typeof input.lockPath !== "string" || input.lockPath.length === 0) {
+    fail("LOCK_PATH", "expected an explicit lock path", "candidateLock.lockPath");
+  }
+
+  const absoluteLock = path.resolve(input.lockPath);
+  const licenseRoot = await assertDirectPathChain(
+    input.licenseRoot,
+    "LOCK_PATH",
+    "candidateLock.licenseRoot",
+  );
+  const licenseRootStatus = await lstat(licenseRoot);
+  if (!licenseRootStatus.isDirectory() || licenseRootStatus.isSymbolicLink()) {
+    fail("LOCK_PATH", "license root must be one direct directory", "candidateLock.licenseRoot");
+  }
+  const bytes = await readDirectRegularFile(
+    absoluteLock,
+    "LOCK_FILE_DIGEST",
+    "candidateLock.lockPath",
+  );
+  const lockSha256 = sha256(bytes);
+  if (lockSha256 !== input.expectedLockSha256) {
+    fail("LOCK_FILE_DIGEST", "candidate lock differs from its external digest", absoluteLock);
+  }
+  const lock = parseCanonicalLock(bytes, absoluteLock);
+  for (const record of [
+    lock.runtime.license,
+    lock.runtime.onnxruntime_license,
+    lock.model.current_license_snapshot,
+  ]) {
+    await validateSnapshotFile(licenseRoot, record);
+  }
+  return { lock, lockPath: absoluteLock, lockSha256 };
 }
 
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;

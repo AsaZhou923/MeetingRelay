@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import { encodeCanonicalJsonLine } from "../phase0-harness/canonical-json.mjs";
 import {
   DEFAULT_LOCK_PATH,
   LockValidationError,
+  validateCandidateLockFile,
   validateCargoOfflineGate,
   validateLockFile,
   validateLockObject,
@@ -61,6 +62,124 @@ async function stagedLock() {
 test("the committed sherpa native lock and license snapshots validate", async () => {
   const result = await validateLockFile();
   assert.equal(result.lockSha256, "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181");
+});
+
+test("candidate lock validates from a sealed bundle without the source sidecar or historical licenses", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-candidate-lock-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const lockDirectory = path.join(root, "assets");
+  const licenseDirectory = path.join(root, "licenses");
+  await Promise.all([
+    mkdir(lockDirectory),
+    mkdir(licenseDirectory),
+  ]);
+  const lockPath = path.join(lockDirectory, "assets.lock.json");
+  await copyFile(DEFAULT_LOCK_PATH, lockPath);
+  for (const name of [
+    "apache-2.0-sherpa-onnx.txt",
+    "funasr-model-license-1.1.txt",
+    "mit-onnxruntime-1.27.0.txt",
+  ]) {
+    await copyFile(path.join(HERE, "licenses", name), path.join(licenseDirectory, name));
+  }
+
+  const result = await validateCandidateLockFile({
+    expectedLockSha256: "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181",
+    licenseRoot: root,
+    lockPath,
+  });
+  assert.equal(result.lockPath, lockPath);
+  assert.equal(result.lockSha256, "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181");
+
+  const apachePath = path.join(licenseDirectory, "apache-2.0-sherpa-onnx.txt");
+  const tampered = await readFile(apachePath);
+  tampered[0] ^= 0xff;
+  await writeFile(apachePath, tampered);
+  await assert.rejects(
+    validateCandidateLockFile({
+      expectedLockSha256: result.lockSha256,
+      licenseRoot: root,
+      lockPath,
+    }),
+    (error) => error instanceof LockValidationError && error.code === "LOCK_LICENSE_FILE",
+  );
+});
+
+test("candidate lock requires each current bundle license snapshot", async (t) => {
+  const names = [
+    "apache-2.0-sherpa-onnx.txt",
+    "funasr-model-license-1.1.txt",
+    "mit-onnxruntime-1.27.0.txt",
+  ];
+  for (const missing of names) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-candidate-lock-"));
+    t.after(() => rm(root, { force: true, recursive: true }));
+    const lockDirectory = path.join(root, "assets");
+    const licenseDirectory = path.join(root, "licenses");
+    await Promise.all([mkdir(lockDirectory), mkdir(licenseDirectory)]);
+    const lockPath = path.join(lockDirectory, "assets.lock.json");
+    await copyFile(DEFAULT_LOCK_PATH, lockPath);
+    for (const name of names.filter((candidate) => candidate !== missing)) {
+      await copyFile(path.join(HERE, "licenses", name), path.join(licenseDirectory, name));
+    }
+
+    await assert.rejects(
+      validateCandidateLockFile({
+        expectedLockSha256: "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181",
+        licenseRoot: root,
+        lockPath,
+      }),
+      (error) => error instanceof LockValidationError && error.code === "LOCK_LICENSE_FILE",
+      `expected the missing ${missing} snapshot to fail`,
+    );
+  }
+});
+
+test("candidate lock is joined to its explicit external digest", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-candidate-lock-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const lockPath = path.join(root, "assets.lock.json");
+  await copyFile(DEFAULT_LOCK_PATH, lockPath);
+
+  await assert.rejects(
+    validateCandidateLockFile({
+      expectedLockSha256: "f".repeat(64),
+      licenseRoot: root,
+      lockPath,
+    }),
+    (error) => error instanceof LockValidationError && error.code === "LOCK_FILE_DIGEST",
+  );
+});
+
+test("candidate lock rejects a license root that crosses a reparse point", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-candidate-lock-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const lockDirectory = path.join(root, "assets");
+  await mkdir(lockDirectory);
+  const lockPath = path.join(lockDirectory, "assets.lock.json");
+  await copyFile(DEFAULT_LOCK_PATH, lockPath);
+  try {
+    await symlink(
+      path.join(HERE, "licenses"),
+      path.join(root, "licenses"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      t.skip("host cannot create the optional reparse-point fixture");
+      return;
+    }
+    throw error;
+  }
+
+  await assert.rejects(
+    validateCandidateLockFile({
+      expectedLockSha256: "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181",
+      licenseRoot: root,
+      lockPath,
+    }),
+    (error) => error instanceof LockValidationError && error.code === "LOCK_PATH",
+  );
 });
 
 test("Rust sherpa builder input is canonical and joined to locked source material", async () => {

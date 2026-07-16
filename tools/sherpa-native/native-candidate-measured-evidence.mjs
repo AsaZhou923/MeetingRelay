@@ -761,6 +761,7 @@ function inspectCandidateContractStage(
   return {
     assetLock,
     conformanceInput: {
+      assetLicenseRoot: bundleRoot,
       assetLockPath: resolveBundlePath(bundleRoot, assetLock.path, "MEASURED_EVIDENCE_LOCK_JOIN"),
       executablePath: executionHostPath,
       modelPath: resolveBundlePath(bundleRoot, model.path, "MEASURED_EVIDENCE_MODEL_JOIN"),
