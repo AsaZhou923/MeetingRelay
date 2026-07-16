@@ -28,6 +28,8 @@ mod candidate_builder_input;
 mod candidate_execution;
 #[cfg(feature = "native-fault-fixture")]
 mod candidate_fault;
+#[cfg(feature = "native-quality-sample")]
+mod candidate_quality_sample;
 mod worker_provenance;
 
 pub use candidate_builder_input::{
@@ -44,6 +46,11 @@ pub use candidate_execution::{
 pub use candidate_fault::run_locked_native_candidate_fault;
 #[cfg(feature = "native-fault-fixture")]
 pub use candidate_fault::{NATIVE_CANDIDATE_FAULT_CHECKPOINT_KIND, NativeCandidateFaultMode};
+#[cfg(feature = "native-quality-sample")]
+pub use candidate_quality_sample::{
+    NativeCandidateQualitySampleError, NativeCandidateQualitySampleIdentity,
+    NativeCandidateQualitySampleInput, run_locked_native_candidate_quality_sample,
+};
 pub use worker_provenance::{
     LOCKED_SCHEMA_REGISTRY_BYTES, LOCKED_WORKER_ID, MAX_SCHEMA_REGISTRY_BYTES,
     WorkerProvenanceError, locked_schema_registry_sha256, locked_worker_manifest,
@@ -317,6 +324,33 @@ impl SherpaNativeConfig {
         }
         Ok(())
     }
+
+    #[cfg(feature = "native-quality-sample")]
+    fn validate_locked_quality_candidate(&self) -> Result<(), SherpaConfigError> {
+        self.validate()?;
+        let locked_descriptor = locked_engine_descriptor();
+        let mut base_descriptor = self.descriptor.clone();
+        base_descriptor.parameter_sha256 = locked_descriptor.parameter_sha256;
+        base_descriptor.languages = locked_descriptor.languages.clone();
+        if base_descriptor != locked_descriptor
+            || self.expected_model_sha256 != locked_descriptor.model_sha256
+            || self.expected_tokens_sha256 != locked_digest(LOCKED_TOKENS_SHA256_HEX)
+            || self.expected_runtime_sha256 != locked_descriptor.runtime_sha256
+            || self.expected_asset_lock_sha256 != locked_descriptor.model_manifest_sha256
+            || self.expected_package_lock_sha256 != locked_descriptor.package_lock_sha256
+            || !matches!(self.normalized_language.as_str(), "zh" | "ja" | "en")
+            || self.descriptor.languages.len() != 1
+            || self.descriptor.languages[0] != self.normalized_language
+            || self.num_threads != 1
+            || !self.use_itn
+            || self.max_input_bytes != 64 * 1024 * 1024
+            || !self.model_path.is_absolute()
+            || !self.tokens_path.is_absolute()
+        {
+            return Err(SherpaConfigError::LockedCandidateConflict);
+        }
+        Ok(())
+    }
 }
 
 /// Configuration error that does not expose local asset paths.
@@ -413,16 +447,21 @@ impl SherpaNativeBackend {
         }
     }
 
+    #[cfg(feature = "native-quality-sample")]
+    fn new_quality_sample(config: SherpaNativeConfig) -> Result<Self, SherpaConfigError> {
+        config.validate_locked_quality_candidate()?;
+        Ok(Self {
+            config,
+            port: default_inference_port(),
+            assets_verified: false,
+            initialized: false,
+            verification: VerificationMode::LockedProduction,
+            sealed_model_assets: None,
+        })
+    }
+
     fn process(&mut self, chunks: &[AudioChunk]) -> Result<TranscriptResult, AdapterFailure> {
-        if !self.initialized {
-            return Err(AdapterFailure::NotPrepared);
-        }
-        let samples = canonical_samples(chunks, self.config.max_input_bytes)?;
-        let text = self
-            .port
-            .recognize(&samples)
-            .map_err(|_| AdapterFailure::ResultUnavailable)?
-            .ok_or(AdapterFailure::ResultUnavailable)?;
+        let text = self.recognize_text(chunks)?;
         if text.trim().is_empty() {
             return Err(AdapterFailure::EmptyResult);
         }
@@ -437,6 +476,25 @@ impl SherpaNativeBackend {
             confidence: None,
             provenance: TranscriptProvenance::from_descriptor(&self.config.descriptor),
         })
+    }
+
+    fn recognize_text(&mut self, chunks: &[AudioChunk]) -> Result<String, AdapterFailure> {
+        if !self.initialized {
+            return Err(AdapterFailure::NotPrepared);
+        }
+        let samples = canonical_samples(chunks, self.config.max_input_bytes)?;
+        self.port
+            .recognize(&samples)
+            .map_err(|_| AdapterFailure::ResultUnavailable)?
+            .ok_or(AdapterFailure::ResultUnavailable)
+    }
+
+    #[cfg(feature = "native-quality-sample")]
+    fn recognize_quality_sample_text(
+        &mut self,
+        chunks: &[AudioChunk],
+    ) -> Result<String, AdapterFailure> {
+        self.recognize_text(chunks)
     }
 
     #[cfg(test)]

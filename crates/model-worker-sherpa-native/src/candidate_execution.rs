@@ -884,7 +884,7 @@ fn conformance_limits() -> WorkerLimits {
     }
 }
 
-fn validate_loaded_runtime_identity(
+pub(crate) fn validate_loaded_runtime_identity(
     executable_path: &Path,
 ) -> Result<(), NativeCandidateExecutionError> {
     let executable_directory = executable_path

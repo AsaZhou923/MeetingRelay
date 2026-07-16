@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meetingrelay.invalid/schemas/controlled-hypothesis-ledger-v1.schema.json",
+  "title": "MeetingRelay controlled hypothesis ledger v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authority",
+    "entries",
+    "joins",
+    "kind",
+    "schema_version"
+  ],
+  "properties": {
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "formal_claims",
+        "privacy_class",
+        "production_evidence",
+        "public_distribution"
+      ],
+      "properties": {
+        "formal_claims": {
+          "const": "none"
+        },
+        "privacy_class": {
+          "const": "controlled"
+        },
+        "production_evidence": {
+          "const": false
+        },
+        "public_distribution": {
+          "const": false
+        }
+      }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt",
+          "component_record_sha256",
+          "final_transcript",
+          "final_transcript_sha256",
+          "final_transcript_utf8_bytes",
+          "language",
+          "sample_id",
+          "sample_identity_sha256",
+          "scenario",
+          "sequence",
+          "split",
+          "tier"
+        ],
+        "properties": {
+          "attempt": {
+            "const": 1
+          },
+          "component_record_sha256": {
+            "$ref": "#/$defs/nonzeroSha256"
+          },
+          "final_transcript": {
+            "type": "string",
+            "maxLength": 16384,
+            "pattern": "^[^\\u0000]*$",
+            "description": "Structural ceiling only. The authoritative runtime validator additionally enforces at most 16384 strict UTF-8 bytes, rejects unpaired surrogates, and verifies the declared byte count and SHA-256."
+          },
+          "final_transcript_sha256": {
+            "$ref": "#/$defs/nonzeroSha256"
+          },
+          "final_transcript_utf8_bytes": {
+            "$ref": "#/$defs/canonicalDecimal"
+          },
+          "language": {
+            "enum": [
+              "en",
+              "ja",
+              "zh"
+            ]
+          },
+          "sample_id": {
+            "$ref": "#/$defs/identifier"
+          },
+          "sample_identity_sha256": {
+            "$ref": "#/$defs/nonzeroSha256"
+          },
+          "scenario": {
+            "$ref": "#/$defs/identifier"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          },
+          "split": {
+            "enum": [
+              "blind",
+              "calibration",
+              "dev"
+            ]
+          },
+          "tier": {
+            "const": "tier-1"
+          }
+        }
+      }
+    },
+    "joins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_identity_sha256",
+        "corpus_manifest_sha256",
+        "corpus_snapshot_sha256",
+        "execution_host_sha256",
+        "hardware_evidence_sha256",
+        "scorer_manifest_sha256",
+        "scorer_profile_sha256",
+        "source_commit",
+        "source_evidence_sha256"
+      ],
+      "properties": {
+        "candidate_identity_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "corpus_manifest_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "corpus_snapshot_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "execution_host_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "hardware_evidence_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "scorer_manifest_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "scorer_profile_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        },
+        "source_commit": {
+          "$ref": "#/$defs/nonzeroCommit"
+        },
+        "source_evidence_sha256": {
+          "$ref": "#/$defs/nonzeroSha256"
+        }
+      }
+    },
+    "kind": {
+      "const": "meetingrelay-controlled-hypothesis-ledger-v1"
+    },
+    "schema_version": {
+      "const": "1.0"
+    }
+  },
+  "$defs": {
+    "canonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "nonzeroCommit": {
+      "type": "string",
+      "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+    },
+    "nonzeroSha256": {
+      "type": "string",
+      "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+    }
+  }
+}
