@@ -172,3 +172,24 @@ pnpm phase0:sherpa-fleurs-gold-source:test
 ```
 
 There is intentionally no `phase0:sherpa-quality-foundation:run` script. An authorized caller must invoke the one-argument programmatic runner with all external trust anchors and controlled output locations. Even a successful run under the committed policy establishes only scorer mechanics; lawful independent-gold data, frozen thresholds, approvals, and written distribution authority remain separate prerequisites for any real quality or product decision.
+
+## Formal-run trust envelope
+
+`formal-run-trust-policy.json` is the externally pinned WP-0.4.3n policy (SHA-256 `2bc5219213567d9b8bebb5bbd3e52eba8d5c21a26533a7ec8042fa6505a6e160`, 1151 bytes). It requires a local fixed NTFS volume; an operator-owned protected root DACL whose only full-control principals are the operator token user, LOCAL_SYSTEM, and BUILTIN\Administrators; the same effective ACL closure on every descendant; no reparse tag; at most 4096 inventory entries; and a finite retention window no longer than 2,592,000 seconds (30 days). A readiness record is live only before its exact expiry.
+
+The dependency-free Windows C helper is built with pinned MSVC x64 hardening flags and exposes four narrow commands: `attest`, `create`, `probe-delete`, and `cleanup-delete`. It binds the complete 64-bit NTFS volume serial and 128-bit file IDs. `probe-delete` is capability-only and is permitted only while the retention marker is live; `cleanup-delete` is accepted only after expiry. Both deletion commands verify the opened root/file/content/size/name identities and one-link invariant, use `SetFileInformationByHandle`, confirm the pathname is absent after handle close, and never claim secure erase. Production cleanup accepts only a direct ASCII leaf plus an externally SHA-pinned ownership receipt; caller-supplied loose file identities are not authoritative.
+
+`quality-host-source-build-attestor.mjs` independently requires a clean exact source commit, stable tracked-file tree, exact `Cargo.lock` and `rust-toolchain.toml`, absolute hashed git/cargo/rustc executables, rejected ambient compiler/Cargo overrides, isolated Cargo configuration, and the exact offline Release command. Each attestation binds a direct non-reparse parent chain and atomically reserves an unused, source-commit-scoped Cargo target under `target/sherpa-native/formal-run-trust/quality-host-builds/<commit>`; shared workspace Release artifacts therefore cannot enter the closure or satisfy a cached-build claim. Parent and target directory identities are rechecked around the build and publication. It binds the resulting PE32+ AMD64 console identity, CFG/NX/ASLR hardening flags, sorted import table, exact four adjacent DLLs, and exact seven-file runtime inventory. The quality host is never launched. This is a local orchestrated source/build attestation, not a cross-toolchain reproducible-build claim.
+
+`formal-run-trust-envelope.mjs` live-verifies that build attestation, directly rereads the pinned FLEURS policy `9a659b87a5c12dacf749226d6c51a7be1edbb98c6fae313293c985cbeda1da2c`, performs an actual native create→probe-delete lifecycle, requires byte-identical root and source postflights before publication, and publishes create-new text-free readiness outside the controlled root. A nondecreasing fresh clock rejects expiry both immediately before publication and after persisted readback. The source join remains exactly `google/fleurs@70bb2e84b976b7e960aa89f1c648e09c59f894dd`, `test`, `en_us/ja_jp/cmn_hans_cn`, 320 common IDs, and 960 selected utterances.
+
+```powershell
+pnpm phase0:sherpa-formal-run-trust:test
+pnpm phase0:sherpa-formal-run-trust:windows:test
+
+# The canonical input JSON contains exact local paths and external digests.
+node tools/sherpa-native/quality-host-source-build-attestor.mjs --attest <canonical-input-json>
+node tools/sherpa-native/formal-run-trust-envelope.mjs --assess <canonical-input-json>
+```
+
+The highest authority is `ready-for-materialization-only`: `execution_status=not-run`, `materialization_status=not-run`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, and `public_distribution=false`. These tools contain no archive extraction, corpus materialization, transcript scoring, or model-execution API and do not alter the realtime inference path. Actual 960-item materialization and bounded descriptive execution remain WP-0.4.3o.

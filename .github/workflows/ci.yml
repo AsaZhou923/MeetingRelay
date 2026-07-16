@@ -117,6 +117,15 @@ jobs:
         run: pnpm phase0:sherpa-fleurs-gold-source:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 formal-run trust envelope (offline metadata only)
+        run: pnpm phase0:sherpa-formal-run-trust:test
+        timeout-minutes: 5
+
+      - name: Exercise WP-0.4 Windows controlled-root and handle-bound cleanup contract
+        shell: pwsh
+        run: ./tools/sherpa-native/formal-run-trust-envelope.windows.test.ps1
+        timeout-minutes: 10
+
       - name: Test WP-0.4 native candidate conformance contract
         run: pnpm phase0:sherpa-candidate-conformance:test
         timeout-minutes: 5
@@ -508,6 +517,7 @@ jobs:
           $qualityCargoArguments = @(
             'build', '--release',
             '-p', 'meetingrelay-model-worker-sherpa-native',
+            '--no-default-features',
             '--features', 'native-quality-sample',
             '--bin', 'meetingrelay-sherpa-candidate-quality-host',
             '--message-format=json',
@@ -576,12 +586,85 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_QUALITY_HOST_EXE=$qualityHost" -Encoding utf8
         timeout-minutes: 20
 
-      - name: Audit Release candidate execution-host PE dependencies
+      - name: Attest exact Release quality-host source and build closure
+        shell: pwsh
+        run: |
+          $attestationRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/sherpa-native/formal-run-trust/build-attestations'))
+          New-Item -ItemType Directory -Path $attestationRoot -Force | Out-Null
+          $attestationPath = Join-Path $attestationRoot 'quality-host-source-build-attestation.json'
+          $inputPath = Join-Path $attestationRoot 'quality-host-source-build-input.json'
+          foreach ($candidate in @($attestationPath, $inputPath)) {
+            if (Test-Path -LiteralPath $candidate) {
+              throw "formal source-build attestation refuses an existing output: $candidate"
+            }
+          }
+          $inputRecord = [ordered]@{
+            assetLockPath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/assets.lock.json'))
+            expectedSourceCommit = $env:GITHUB_SHA
+            outputPath = $attestationPath
+            runtimeDir = [IO.Path]::GetFullPath($env:SHERPA_ONNX_LIB_DIR)
+          }
+          [IO.File]::WriteAllText(
+            $inputPath,
+            ($inputRecord | ConvertTo-Json -Compress) + "`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          $forbiddenEnvironment = @(
+            'AR', 'CARGO_BUILD_TARGET', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_HOME',
+            'CARGO_INCREMENTAL', 'CARGO_NET_OFFLINE', 'CARGO_TARGET_DIR', 'CC',
+            'CFLAGS', 'CL', 'CXXFLAGS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
+            'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE',
+            'LDFLAGS', 'LINK', 'RUSTC', 'RUSTC_BOOTSTRAP', 'RUSTC_WRAPPER',
+            'RUSTC_WORKSPACE_WRAPPER', 'RUSTDOCFLAGS', 'RUSTFLAGS', 'RUSTUP_HOME',
+            'RUSTUP_TOOLCHAIN', 'SHERPA_ONNX_LIB_DIR', '_CL_'
+          )
+          foreach ($entry in @(Get-ChildItem Env:)) {
+            $upper = $entry.Name.ToUpperInvariant()
+            if ($forbiddenEnvironment -contains $upper -or
+                $upper.StartsWith('CARGO_PROFILE_', [StringComparison]::Ordinal) -or
+                $upper -match '^CARGO_TARGET_.*_(?:LINKER|RUNNER|RUSTFLAGS)$' -or
+                $upper -match '^(?:AR|CC|CFLAGS|CXXFLAGS|LDFLAGS)_') {
+              Remove-Item -LiteralPath "Env:$($entry.Name)"
+            }
+          }
+          $output = @(& node ./tools/sherpa-native/quality-host-source-build-attestor.mjs --attest $inputPath)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "quality-host source-build attestation failed" }
+          $attestationSha256 = (Get-FileHash -LiteralPath $attestationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $marker = @($output | Where-Object {
+            [string]$_ -ceq "QUALITY_HOST_SOURCE_BUILD_ATTESTATION=PASS attestation_sha256=$attestationSha256 execution_status=not-run formal_claims=none production_evidence=false"
+          })
+          if ($marker.Count -ne 1) {
+            throw "quality-host source-build attestation marker is missing or duplicated"
+          }
+          $attestation = Get-Content -LiteralPath $attestationPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $formalQualityHost = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE "target/sherpa-native/formal-run-trust/quality-host-builds/$($env:GITHUB_SHA)/release/meetingrelay-sherpa-candidate-quality-host.exe"))
+          if (-not (Test-Path -LiteralPath $formalQualityHost -PathType Leaf)) {
+            throw "isolated formal quality-host executable is missing"
+          }
+          $qualityHostSha256 = (Get-FileHash -LiteralPath $formalQualityHost -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ([string]$attestation.source.commit -cne $env:GITHUB_SHA -or
+              [string]$attestation.source.worktree_status -cne 'clean' -or
+              [string]$attestation.executable.sha256 -cne $qualityHostSha256 -or
+              [string]$attestation.authority.execution_status -cne 'not-run' -or
+              [string]$attestation.authority.formal_claims -cne 'none' -or
+              [bool]$attestation.authority.production_evidence -ne $false) {
+            throw "persisted quality-host source-build attestation identity drifted"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_QUALITY_HOST_BUILD_ATTESTATION=$attestationPath" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_QUALITY_HOST_BUILD_ATTESTATION_SHA256=$attestationSha256" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_FORMAL_QUALITY_HOST_EXE=$formalQualityHost" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MEETINGRELAY_QUALITY_HOST_SHA256=$qualityHostSha256" -Encoding utf8
+        timeout-minutes: 20
+
+      - name: Audit Release candidate execution and quality-host PE dependencies
         shell: pwsh
         run: |
           $output = @(./tools/sherpa-native/audit-pe-dependencies.ps1 `
             -RuntimeDir $env:SHERPA_ONNX_LIB_DIR `
-            -ExecutionHostBinaryPath $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE)
+            -ExecutionHostBinaryPath $env:MEETINGRELAY_SHERPA_RELEASE_CANDIDATE_EXECUTION_HOST_EXE `
+            -QualityHostBinaryPath $env:MEETINGRELAY_FORMAL_QUALITY_HOST_EXE `
+            -QualityHostSourceCommit $env:GITHUB_SHA)
           $output | Write-Output
           if ($LASTEXITCODE -ne 0) { throw "candidate execution-host PE dependency audit failed" }
           $marker = @($output | Where-Object {
@@ -590,7 +673,110 @@ jobs:
           if ($marker.Count -ne 1) {
             throw "candidate execution-host PE dependency audit marker is missing or duplicated"
           }
+          $qualityMarker = @($output | Where-Object {
+            [string]$_ -match '^PE_QUALITY_HOST_DEPENDENCY_AUDIT=PASS binary=.+\\target\\sherpa-native\\formal-run-trust\\quality-host-builds\\[0-9a-f]{40}\\release\\meetingrelay-sherpa-candidate-quality-host\.exe imports=.*sherpa-onnx-c-api\.dll.*$'
+          })
+          if ($qualityMarker.Count -ne 1) {
+            throw "candidate quality-host PE dependency audit marker is missing or duplicated"
+          }
         timeout-minutes: 5
+
+      - name: Exercise actual formal-run trust readiness join without model execution
+        shell: pwsh
+        run: |
+          $formalRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/sherpa-native/formal-run-trust/actual-readiness'))
+          $controlledRoot = Join-Path $formalRoot 'controlled'
+          $evidenceRoot = Join-Path $formalRoot 'evidence'
+          New-Item -ItemType Directory -Path $controlledRoot -Force | Out-Null
+          New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+          $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $security = [Security.AccessControl.DirectorySecurity]::new()
+          $security.SetOwner($operatorSid)
+          $security.SetAccessRuleProtection($true, $false)
+          foreach ($sid in @(
+            $operatorSid,
+            [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+            [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+          )) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+              $sid,
+              [Security.AccessControl.FileSystemRights]::FullControl,
+              [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit,
+              [Security.AccessControl.PropagationFlags]::None,
+              [Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$security.AddAccessRule($rule)
+          }
+          Set-Acl -LiteralPath $controlledRoot -AclObject $security
+          $expires = [DateTimeOffset]::UtcNow.AddDays(7)
+          $expires = [DateTimeOffset]::FromUnixTimeSeconds($expires.ToUnixTimeSeconds())
+          [IO.File]::WriteAllText(
+            (Join-Path $controlledRoot '.meetingrelay-retention-v1'),
+            ([string]$expires.ToUnixTimeSeconds()) + "`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          $readinessPath = Join-Path $evidenceRoot 'formal-run-readiness.json'
+          $inputPath = Join-Path $evidenceRoot 'formal-run-readiness-input.json'
+          $policyPath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/formal-run-trust-policy.json'))
+          $fleursPolicyPath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/fleurs-gold-source-policy.json'))
+          $inputRecord = [ordered]@{
+            buildAttestationPath = [IO.Path]::GetFullPath($env:MEETINGRELAY_QUALITY_HOST_BUILD_ATTESTATION)
+            controlledRoot = $controlledRoot
+            expectedBuildAttestationSha256 = $env:MEETINGRELAY_QUALITY_HOST_BUILD_ATTESTATION_SHA256
+            expectedFleursPolicySha256 = '9a659b87a5c12dacf749226d6c51a7be1edbb98c6fae313293c985cbeda1da2c'
+            expectedPolicySha256 = '2bc5219213567d9b8bebb5bbd3e52eba8d5c21a26533a7ec8042fa6505a6e160'
+            expectedQualityHostSha256 = $env:MEETINGRELAY_QUALITY_HOST_SHA256
+            expectedSourceCommit = $env:GITHUB_SHA
+            fleursPolicyPath = $fleursPolicyPath
+            policyPath = $policyPath
+            readinessOutputPath = $readinessPath
+            retentionExpiresAt = $expires.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+          }
+          [IO.File]::WriteAllText(
+            $inputPath,
+            ($inputRecord | ConvertTo-Json -Compress) + "`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          $forbiddenEnvironment = @(
+            'AR', 'CARGO_BUILD_TARGET', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_HOME',
+            'CARGO_INCREMENTAL', 'CARGO_NET_OFFLINE', 'CARGO_TARGET_DIR', 'CC',
+            'CFLAGS', 'CL', 'CXXFLAGS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
+            'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE',
+            'LDFLAGS', 'LINK', 'RUSTC', 'RUSTC_BOOTSTRAP', 'RUSTC_WRAPPER',
+            'RUSTC_WORKSPACE_WRAPPER', 'RUSTDOCFLAGS', 'RUSTFLAGS', 'RUSTUP_HOME',
+            'RUSTUP_TOOLCHAIN', 'SHERPA_ONNX_LIB_DIR', '_CL_'
+          )
+          foreach ($entry in @(Get-ChildItem Env:)) {
+            $upper = $entry.Name.ToUpperInvariant()
+            if ($forbiddenEnvironment -contains $upper -or
+                $upper.StartsWith('CARGO_PROFILE_', [StringComparison]::Ordinal) -or
+                $upper -match '^CARGO_TARGET_.*_(?:LINKER|RUNNER|RUSTFLAGS)$' -or
+                $upper -match '^(?:AR|CC|CFLAGS|CXXFLAGS|LDFLAGS)_') {
+              Remove-Item -LiteralPath "Env:$($entry.Name)"
+            }
+          }
+          $output = @(& node ./tools/sherpa-native/formal-run-trust-envelope.mjs --assess $inputPath)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "actual formal-run trust readiness assessment failed" }
+          $readinessSha256 = (Get-FileHash -LiteralPath $readinessPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $marker = @($output | Where-Object {
+            [string]$_ -ceq "FORMAL_RUN_READINESS=PASS evidence_sha256=$readinessSha256 readiness_status=ready-for-materialization-only formal_claims=none production_evidence=false"
+          })
+          if ($marker.Count -ne 1) {
+            throw "actual formal-run readiness marker is missing or duplicated"
+          }
+          $readiness = Get-Content -LiteralPath $readinessPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ([string]$readiness.source.policy_sha256 -cne $inputRecord.expectedFleursPolicySha256 -or
+              [string]$readiness.source.source_contract_status -cne 'frozen-source-readiness' -or
+              [string]$readiness.readiness_status -cne 'ready-for-materialization-only' -or
+              [string]$readiness.authority.execution_status -cne 'not-run' -or
+              [string]$readiness.authority.materialization_status -cne 'not-run' -or
+              [string]$readiness.authority.formal_claims -cne 'none' -or
+              [bool]$readiness.authority.production_evidence -ne $false -or
+              [bool]$readiness.authority.public_distribution -ne $false) {
+            throw "actual formal-run readiness authority or source join drifted"
+          }
+        timeout-minutes: 15
 
       - name: Probe actual Release candidate execution-host loaded modules
         shell: pwsh

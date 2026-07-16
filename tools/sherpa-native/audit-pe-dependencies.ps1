@@ -4,7 +4,9 @@ param(
     [string[]]$BinaryPath,
     [string[]]$ProvenanceBinaryPath,
     [switch]$ParserSelfTest,
-    [string[]]$ExecutionHostBinaryPath
+    [string[]]$ExecutionHostBinaryPath,
+    [string[]]$QualityHostBinaryPath,
+    [string]$QualityHostSourceCommit
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,6 +27,21 @@ function Get-ExistingPathAttributes {
     }
     catch [IO.DirectoryNotFoundException] {
         return $null
+    }
+}
+
+function Assert-ExactQualityHostReleasePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Binary,
+        [Parameter(Mandatory = $true)][string]$SourceCommit
+    )
+    if ($SourceCommit -cnotmatch "^[0-9a-f]{40}$") {
+        throw "QualityHostSourceCommit must be one exact lowercase 40-hex commit"
+    }
+    $expectedReleaseDirectory = [IO.Path]::GetFullPath((Join-Path $targetRoot "sherpa-native/formal-run-trust/quality-host-builds/$SourceCommit/release"))
+    if ((Split-Path -Leaf $Binary) -cne "meetingrelay-sherpa-candidate-quality-host.exe" -or
+        [IO.Path]::GetFullPath((Split-Path -Parent $Binary)) -ne $expectedReleaseDirectory) {
+        throw "Quality host binary is not the exact source-commit-scoped Release target: $Binary"
     }
 }
 
@@ -232,15 +249,39 @@ if ($ParserSelfTest) {
         }
         throw "Strict dumpbin parser accepted an invalid dependency fixture"
     }
+    $pathFixtureCommit = "a" * 40
+    $validQualityHostPath = Join-Path $targetRoot "sherpa-native/formal-run-trust/quality-host-builds/$pathFixtureCommit/release/meetingrelay-sherpa-candidate-quality-host.exe"
+    Assert-ExactQualityHostReleasePath -Binary $validQualityHostPath -SourceCommit $pathFixtureCommit
+    $invalidQualityHostPaths = @(
+        (Join-Path $targetRoot "release/meetingrelay-sherpa-candidate-quality-host.exe"),
+        (Join-Path $targetRoot "sherpa-native/formal-run-trust/quality-host-builds/$('b' * 40)/release/meetingrelay-sherpa-candidate-quality-host.exe"),
+        (Join-Path $targetRoot "sherpa-native/formal-run-trust/quality-host-builds/$pathFixtureCommit/debug/meetingrelay-sherpa-candidate-quality-host.exe")
+    )
+    foreach ($fixturePath in $invalidQualityHostPaths) {
+        try {
+            Assert-ExactQualityHostReleasePath -Binary $fixturePath -SourceCommit $pathFixtureCommit
+        }
+        catch {
+            continue
+        }
+        throw "Quality-host path validator accepted an invalid isolated target fixture"
+    }
     Write-Output "PE_DEPENDENCY_PARSER_SELF_TEST=PASS"
 }
 else {
     $hasSmokeBinary = $null -ne $BinaryPath -and $BinaryPath.Count -gt 0
     $hasExecutionHostBinary = $null -ne $ExecutionHostBinaryPath -and $ExecutionHostBinaryPath.Count -gt 0
+    $hasQualityHostBinary = $null -ne $QualityHostBinaryPath -and $QualityHostBinaryPath.Count -gt 0
     $hasProvenanceBinary = $null -ne $ProvenanceBinaryPath -and $ProvenanceBinaryPath.Count -gt 0
     if ([string]::IsNullOrWhiteSpace($RuntimeDir) -or
-        (-not $hasSmokeBinary -and -not $hasExecutionHostBinary -and -not $hasProvenanceBinary)) {
-        throw "RuntimeDir and at least one BinaryPath, ExecutionHostBinaryPath, or ProvenanceBinaryPath are required outside ParserSelfTest mode"
+        (-not $hasSmokeBinary -and -not $hasExecutionHostBinary -and -not $hasQualityHostBinary -and -not $hasProvenanceBinary)) {
+        throw "RuntimeDir and at least one BinaryPath, ExecutionHostBinaryPath, QualityHostBinaryPath, or ProvenanceBinaryPath are required outside ParserSelfTest mode"
+    }
+    if ($hasQualityHostBinary -and [string]::IsNullOrWhiteSpace($QualityHostSourceCommit)) {
+        throw "QualityHostSourceCommit is required with QualityHostBinaryPath"
+    }
+    if (-not $hasQualityHostBinary -and -not [string]::IsNullOrWhiteSpace($QualityHostSourceCommit)) {
+        throw "QualityHostSourceCommit is only valid with QualityHostBinaryPath"
     }
 
     & node (Join-Path $scriptRoot "validate-lock.mjs") $lockPath
@@ -356,6 +397,27 @@ foreach ($requestedBinary in $ExecutionHostBinaryPath) {
         }
     }
     Write-Output "PE_EXECUTION_HOST_DEPENDENCY_AUDIT=PASS binary=$binary imports=$($dependencies -join ',')"
+}
+
+foreach ($requestedBinary in $QualityHostBinaryPath) {
+    $binary = Resolve-UnderTarget -Value $requestedBinary -Label "QualityHostBinaryPath"
+    $attributes = Get-ExistingPathAttributes -Path $binary
+    if ($null -eq $attributes -or ($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+        throw "QualityHostBinaryPath is not an existing regular file: $binary"
+    }
+    Assert-ExactQualityHostReleasePath -Binary $binary -SourceCommit $QualityHostSourceCommit
+    $dependencies = @(Get-PeDependencies -Path $binary)
+    if ($dependencies -notcontains "sherpa-onnx-c-api.dll") {
+        throw "Quality host does not directly import sherpa-onnx-c-api.dll: $binary"
+    }
+    foreach ($dependency in $dependencies) {
+        $allowed = $lockedDllNames.ContainsKey($dependency) -or
+            $systemAllowed.ContainsKey($dependency)
+        if (-not $allowed) {
+            throw "Quality host imports a non-allowlisted DLL: $dependency ($binary)"
+        }
+    }
+    Write-Output "PE_QUALITY_HOST_DEPENDENCY_AUDIT=PASS binary=$binary imports=$($dependencies -join ',')"
 }
 
 foreach ($requestedBinary in $ProvenanceBinaryPath) {
