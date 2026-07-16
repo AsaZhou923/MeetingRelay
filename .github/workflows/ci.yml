@@ -693,11 +693,12 @@ jobs:
           $security = [Security.AccessControl.DirectorySecurity]::new()
           $security.SetOwner($operatorSid)
           $security.SetAccessRuleProtection($true, $false)
-          foreach ($sid in @(
+          $controlledPrincipals = @(
             $operatorSid,
             [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
             [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-          )) {
+          )
+          foreach ($sid in $controlledPrincipals) {
             $rule = [Security.AccessControl.FileSystemAccessRule]::new(
               $sid,
               [Security.AccessControl.FileSystemRights]::FullControl,
@@ -710,11 +711,24 @@ jobs:
           Set-Acl -LiteralPath $controlledRoot -AclObject $security
           $expires = [DateTimeOffset]::UtcNow.AddDays(7)
           $expires = [DateTimeOffset]::FromUnixTimeSeconds($expires.ToUnixTimeSeconds())
+          $retentionMarkerPath = Join-Path $controlledRoot '.meetingrelay-retention-v1'
           [IO.File]::WriteAllText(
-            (Join-Path $controlledRoot '.meetingrelay-retention-v1'),
+            $retentionMarkerPath,
             ([string]$expires.ToUnixTimeSeconds()) + "`n",
             [Text.UTF8Encoding]::new($false)
           )
+          $markerSecurity = [Security.AccessControl.FileSecurity]::new()
+          $markerSecurity.SetOwner($operatorSid)
+          $markerSecurity.SetAccessRuleProtection($true, $false)
+          foreach ($sid in $controlledPrincipals) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+              $sid,
+              [Security.AccessControl.FileSystemRights]::FullControl,
+              [Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$markerSecurity.AddAccessRule($rule)
+          }
+          Set-Acl -LiteralPath $retentionMarkerPath -AclObject $markerSecurity
           $readinessPath = Join-Path $evidenceRoot 'formal-run-readiness.json'
           $inputPath = Join-Path $evidenceRoot 'formal-run-readiness-input.json'
           $policyPath = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tools/sherpa-native/formal-run-trust-policy.json'))
