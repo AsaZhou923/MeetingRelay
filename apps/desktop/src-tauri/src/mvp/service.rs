@@ -1,6 +1,11 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+};
 
 use super::contract::{AudioSourceSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus};
+
+pub(crate) const MVP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 #[cfg(windows)]
 use std::{
@@ -8,7 +13,8 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        TryLockError,
+        atomic::{AtomicU8, AtomicU64, AtomicUsize},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -22,8 +28,7 @@ use meetingrelay_model_worker_sherpa_native::{LockedSherpaRealtime, LockedSherpa
 use super::{
     audio::{
         AudioCapture, AudioCaptureMetrics, AudioCaptureOptions, AudioCaptureOutput,
-        AudioCaptureStatus, AudioCaptureStatusKind, AudioDevicePreflight, AudioSourceId,
-        AudioSourceStats, RawAudioPacket,
+        AudioDevicePreflight, AudioSourceId, AudioSourceStats, RawAudioPacket,
     },
     contract::{MAX_INFERENCE_QUEUE_DEPTH, TranscriptSegment},
     dsp::{
@@ -35,6 +40,7 @@ use super::{
 pub struct MvpService {
     snapshot: Arc<Mutex<MvpSnapshot>>,
     inner: Mutex<ServiceInner>,
+    shutdown_started: AtomicBool,
 }
 
 #[derive(Default)]
@@ -50,6 +56,7 @@ impl Default for MvpService {
         Self {
             snapshot: Arc::new(Mutex::new(MvpSnapshot::booting())),
             inner: Mutex::new(ServiceInner::default()),
+            shutdown_started: AtomicBool::new(false),
         }
     }
 }
@@ -58,10 +65,15 @@ impl MvpService {
     pub fn snapshot(&self) -> MvpSnapshot {
         let inner = lock(&self.inner);
         #[cfg(windows)]
-        self.refresh_running_snapshot(&inner);
-        let mut snapshot = lock(&self.snapshot).clone();
-        snapshot.enforce_bounds();
-        snapshot
+        {
+            self.snapshot_locked(&inner)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut snapshot = lock(&self.snapshot).clone();
+            snapshot.enforce_bounds();
+            snapshot
+        }
     }
 
     pub fn preflight(&self) -> Result<MvpSnapshot, String> {
@@ -100,6 +112,22 @@ impl MvpService {
         #[cfg(not(windows))]
         {
             Err("MVP_WINDOWS_ONLY".to_owned())
+        }
+    }
+
+    pub fn shutdown_before(&self, deadline: std::time::Instant) -> Result<(), String> {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        #[cfg(windows)]
+        {
+            self.shutdown_windows(deadline)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = deadline;
+            Ok(())
         }
     }
 
@@ -142,8 +170,10 @@ impl MvpService {
         snapshot.system = ready_source(SourceId::System, &devices.system_output);
         snapshot.microphone = ready_source(SourceId::Microphone, &devices.microphone);
         snapshot.error = None;
-        snapshot.enforce_bounds();
-        Ok(snapshot.clone())
+        Ok(public_snapshot(
+            &mut snapshot,
+            inner.inference.as_ref().map(|worker| &worker.submitter),
+        ))
     }
 
     #[cfg(windows)]
@@ -180,14 +210,15 @@ impl MvpService {
             .expect("inference readiness was checked above")
             .submitter();
         let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(RuntimeErrors::default());
         let metrics = output.metrics.clone();
         let preflight = output.preflight.clone();
         let coordinator = match spawn_coordinator(
             output,
             submitter,
-            Arc::clone(&self.snapshot),
             session_id.clone(),
             Arc::clone(&stop),
+            Arc::clone(&errors),
         ) {
             Ok(coordinator) => coordinator,
             Err(error) => {
@@ -202,6 +233,7 @@ impl MvpService {
             coordinator: Some(coordinator),
             stop,
             metrics,
+            errors,
             started: Instant::now(),
         });
 
@@ -211,13 +243,21 @@ impl MvpService {
         snapshot.system = capturing_source(SourceId::System, &preflight.system_output);
         snapshot.microphone = capturing_source(SourceId::Microphone, &preflight.microphone);
         snapshot.error = None;
-        Ok(snapshot.clone())
+        Ok(public_snapshot(
+            &mut snapshot,
+            inner.inference.as_ref().map(|worker| &worker.submitter),
+        ))
     }
 
     #[cfg(windows)]
     fn stop_windows(&self) -> Result<MvpSnapshot, String> {
+        self.stop_windows_before(Instant::now() + MVP_SHUTDOWN_TIMEOUT)
+    }
+
+    #[cfg(windows)]
+    fn stop_windows_before(&self, deadline: Instant) -> Result<MvpSnapshot, String> {
         let (mut session, submitter) = {
-            let mut inner = lock(&self.inner);
+            let mut inner = lock_before(&self.inner, deadline)?;
             let Some(session) = inner.session.take() else {
                 return Ok(self.snapshot_locked(&inner));
             };
@@ -229,15 +269,14 @@ impl MvpService {
         lock(&self.snapshot).lifecycle = Lifecycle::Stopping;
         session.capture.stop();
         session.stop.store(true, Ordering::Release);
-        let deadline = Instant::now() + Duration::from_secs(12);
 
         if let Some(coordinator) = session.coordinator.take() {
             join_before(coordinator, deadline).inspect_err(|error| self.fail(error))?;
         }
 
-        if let Some(submitter) = submitter {
+        if let Some(submitter) = submitter.as_ref() {
             submitter
-                .barrier(deadline.saturating_duration_since(Instant::now()))
+                .barrier_before(deadline)
                 .inspect_err(|error| self.fail(error))?;
         }
 
@@ -250,37 +289,85 @@ impl MvpService {
         snapshot.microphone.peak = 0.0;
         snapshot.microphone.status = SourceStatus::Ready;
         snapshot.queue_depth = 0;
-        snapshot.error = None;
-        snapshot.enforce_bounds();
-        Ok(snapshot.clone())
+        if snapshot.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+            snapshot.error = None;
+        }
+        if let Some(error) = take_runtime_error(&session.errors) {
+            set_public_error(&mut snapshot, error);
+        }
+        Ok(public_snapshot(&mut snapshot, submitter.as_ref()))
+    }
+
+    #[cfg(windows)]
+    fn shutdown_windows(&self, deadline: Instant) -> Result<(), String> {
+        let stop_error = self.stop_windows_before(deadline).err();
+        let inference_error = match lock_before(&self.inner, deadline) {
+            Ok(mut inner) => inner
+                .inference
+                .take()
+                .and_then(|worker| worker.shutdown_before(deadline).err()),
+            Err(error) => Some(error),
+        };
+
+        stop_error.or(inference_error).map_or(Ok(()), Err)
     }
 
     #[cfg(windows)]
     fn snapshot_locked(&self, inner: &ServiceInner) -> MvpSnapshot {
-        self.refresh_running_snapshot(inner);
-        let mut snapshot = lock(&self.snapshot).clone();
-        snapshot.enforce_bounds();
-        snapshot
-    }
-
-    #[cfg(windows)]
-    fn refresh_running_snapshot(&self, inner: &ServiceInner) {
         if let Some(session) = inner.session.as_ref() {
             self.refresh_from_session(session, false);
         }
-        if let Some(inference) = inner.inference.as_ref() {
-            lock(&self.snapshot).queue_depth = inference.queue_depth();
-        }
+        let mut snapshot = lock(&self.snapshot);
+        let submitter = inner.inference.as_ref().map(|inference| {
+            snapshot.queue_depth = inference.queue_depth();
+            &inference.submitter
+        });
+        public_snapshot(&mut snapshot, submitter)
     }
 
     #[cfg(windows)]
     fn refresh_from_session(&self, session: &RunningSession, stopping: bool) {
         let system = session.metrics.snapshot(AudioSourceId::SystemOutput);
         let microphone = session.metrics.snapshot(AudioSourceId::Microphone);
+        let stream_error = system.stream_errors > 0 || microphone.stream_errors > 0;
         let mut snapshot = lock(&self.snapshot);
         snapshot.elapsed_ms = session.started.elapsed().as_millis().to_string();
         apply_source_stats(&mut snapshot.system, system, !stopping);
         apply_source_stats(&mut snapshot.microphone, microphone, !stopping);
+        if stream_error {
+            set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
+        }
+        if let Some(error) = take_runtime_error(&session.errors) {
+            set_public_error(&mut snapshot, error);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn public_snapshot(
+    snapshot: &mut MvpSnapshot,
+    submitter: Option<&InferenceSubmitter>,
+) -> MvpSnapshot {
+    if let Some(submitter) = submitter {
+        submitter.shared.scrub_stale_interim(snapshot);
+    }
+    snapshot.enforce_bounds();
+    snapshot.clone()
+}
+
+#[cfg(windows)]
+fn set_public_error(snapshot: &mut MvpSnapshot, error: &str) {
+    let priority = |code| match code {
+        "ASR_FINAL_OVERLOAD" => 3,
+        "ASR_WORKER_STOPPED" => 2,
+        _ => 1,
+    };
+    if snapshot
+        .error
+        .as_deref()
+        .is_none_or(|current| priority(error) >= priority(current))
+    {
+        snapshot.error = Some(error.to_owned());
     }
 }
 
@@ -291,11 +378,44 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(windows)]
+fn lock_before<'a, T>(mutex: &'a Mutex<T>, deadline: Instant) -> Result<MutexGuard<'a, T>, String> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TryLockError::WouldBlock) => return Err("MVP_SHUTDOWN_TIMEOUT".to_owned()),
+        }
+    }
+}
+
+#[cfg(windows)]
+type RuntimeErrors = AtomicU8;
+
+#[cfg(windows)]
+fn record_runtime_error(errors: &RuntimeErrors, priority: u8) {
+    errors.fetch_max(priority, Ordering::AcqRel);
+}
+
+#[cfg(windows)]
+fn take_runtime_error(errors: &RuntimeErrors) -> Option<&'static str> {
+    match errors.swap(0, Ordering::AcqRel) {
+        1 => Some("AUDIO_DSP_CONFIGURATION"),
+        2 => Some("ASR_WORKER_STOPPED"),
+        3 => Some("ASR_FINAL_OVERLOAD"),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
 struct RunningSession {
     capture: AudioCapture,
     coordinator: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     metrics: AudioCaptureMetrics,
+    errors: Arc<RuntimeErrors>,
     started: Instant,
 }
 
@@ -406,52 +526,119 @@ fn canonical_asset(path: PathBuf) -> Result<PathBuf, String> {
 #[cfg(windows)]
 #[derive(Clone)]
 struct InferenceSubmitter {
-    sender: SyncSender<InferenceCommand>,
-    queue_depth: Arc<AtomicUsize>,
+    finals: SyncSender<InferenceTask>,
+    shared: Arc<InferenceShared>,
+    worker_thread: thread::Thread,
 }
 
 #[cfg(windows)]
 impl InferenceSubmitter {
     fn submit(&self, task: InferenceTask) -> Result<(), String> {
-        self.queue_depth.fetch_add(1, Ordering::AcqRel);
-        let result = if task.is_final {
-            self.sender
-                .send(InferenceCommand::Recognize(task))
-                .map_err(|_| "ASR_WORKER_STOPPED".to_owned())
-        } else {
-            self.sender
-                .try_send(InferenceCommand::Recognize(task))
-                .map_err(|error| match error {
-                    TrySendError::Full(_) => "ASR_INTERIM_DROPPED".to_owned(),
-                    TrySendError::Disconnected(_) => "ASR_WORKER_STOPPED".to_owned(),
-                })
-        };
-        if result.is_err() {
-            self.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        if self.shared.shutdown.load(Ordering::Acquire) {
+            return Err("ASR_WORKER_STOPPED".to_owned());
         }
-        result
+        if task.is_final {
+            self.submit_final(task)
+        } else {
+            self.submit_interim(task)
+        }
     }
 
-    fn barrier(&self, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        let (sender, receiver) = sync_channel(1);
-        let mut command = InferenceCommand::Barrier(sender);
-        loop {
-            match self.sender.try_send(command) {
-                Ok(()) => break,
-                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
-                    command = returned;
-                    thread::sleep(Duration::from_millis(2));
+    fn barrier_before(&self, deadline: Instant) -> Result<(), String> {
+        while self.shared.pending.load(Ordering::Acquire) != 0 {
+            if Instant::now() >= deadline {
+                return Err("ASR_STOP_TIMEOUT".to_owned());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.shared
+            .pending
+            .load(Ordering::Acquire)
+            .min(MAX_INFERENCE_QUEUE_DEPTH)
+    }
+
+    fn request_shutdown(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.worker_thread.unpark();
+    }
+
+    fn submit_final(&self, task: InferenceTask) -> Result<(), String> {
+        self.shared.pending.fetch_add(1, Ordering::AcqRel);
+        match self.finals.try_send(task) {
+            Ok(()) => {
+                self.shared.latest_interim.fetch_add(1, Ordering::AcqRel);
+                let retired = match self.shared.interim.try_lock() {
+                    Ok(mut interim) => interim.take().is_some(),
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take().is_some(),
+                    Err(TryLockError::WouldBlock) => false,
+                };
+                if retired {
+                    self.shared.pending.fetch_sub(1, Ordering::AcqRel);
                 }
-                Err(TrySendError::Full(_)) => return Err("ASR_STOP_TIMEOUT".to_owned()),
-                Err(TrySendError::Disconnected(_)) => {
-                    return Err("ASR_WORKER_STOPPED".to_owned());
+                self.worker_thread.unpark();
+                Ok(())
+            }
+            Err(error) => {
+                self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+                match error {
+                    TrySendError::Full(_) => Err("ASR_FINAL_OVERLOAD".to_owned()),
+                    TrySendError::Disconnected(_) => Err("ASR_WORKER_STOPPED".to_owned()),
                 }
             }
         }
-        receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| "ASR_STOP_TIMEOUT".to_owned())
+    }
+
+    fn submit_interim(&self, task: InferenceTask) -> Result<(), String> {
+        let generation = self.shared.latest_interim.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut interim = match self.shared.interim.try_lock() {
+            Ok(interim) => interim,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err("ASR_INTERIM_DROPPED".to_owned()),
+        };
+        if interim.is_none() {
+            self.shared.pending.fetch_add(1, Ordering::AcqRel);
+        }
+        *interim = Some((generation, task));
+        drop(interim);
+        self.worker_thread.unpark();
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct InferenceShared {
+    interim: Mutex<Option<(u64, InferenceTask)>>,
+    pending: AtomicUsize,
+    latest_interim: AtomicU64,
+    published_interim: AtomicU64,
+    shutdown: AtomicBool,
+}
+
+#[cfg(windows)]
+impl InferenceShared {
+    fn take_interim(&self) -> Option<(u64, InferenceTask)> {
+        lock(&self.interim).take()
+    }
+
+    fn interim_is_current(&self, generation: u64) -> bool {
+        self.latest_interim.load(Ordering::Acquire) == generation
+    }
+
+    fn finish_task(&self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn scrub_stale_interim(&self, snapshot: &mut MvpSnapshot) {
+        let published = self.published_interim.load(Ordering::Acquire);
+        if published != 0 && published != self.latest_interim.load(Ordering::Acquire) {
+            snapshot.interim = None;
+            self.published_interim.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -467,10 +654,10 @@ impl InferenceWorker {
         snapshot: Arc<Mutex<MvpSnapshot>>,
         paths: LockedSherpaRealtimePaths,
     ) -> Result<Self, String> {
-        let (sender, receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
         let (ready_sender, ready_receiver) = sync_channel(1);
-        let queue_depth = Arc::new(AtomicUsize::new(0));
-        let worker_queue_depth = Arc::clone(&queue_depth);
+        let (finals, final_receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
+        let shared = Arc::new(InferenceShared::default());
+        let worker_shared = Arc::clone(&shared);
         let join = thread::Builder::new()
             .name("meetingrelay-asr".to_owned())
             .spawn(move || {
@@ -479,18 +666,20 @@ impl InferenceWorker {
                 let ready = recognizer.as_ref().map(|_| ()).map_err(Clone::clone);
                 let _ = ready_sender.send(ready);
                 if let Ok(mut recognizer) = recognizer {
-                    inference_loop(&mut recognizer, receiver, snapshot, worker_queue_depth);
+                    inference_loop(&mut recognizer, final_receiver, worker_shared, snapshot);
                 }
             })
             .map_err(|_| "ASR_WORKER_START_FAILED".to_owned())?;
+        let worker_thread = join.thread().clone();
 
         ready_receiver
             .recv()
             .map_err(|_| "ASR_WORKER_START_FAILED".to_owned())??;
         Ok(Self {
             submitter: InferenceSubmitter {
-                sender,
-                queue_depth,
+                finals,
+                shared,
+                worker_thread,
             },
             join: Some(join),
         })
@@ -501,28 +690,26 @@ impl InferenceWorker {
     }
 
     fn queue_depth(&self) -> usize {
-        self.submitter
-            .queue_depth
-            .load(Ordering::Acquire)
-            .min(MAX_INFERENCE_QUEUE_DEPTH)
+        self.submitter.queue_depth()
+    }
+
+    fn shutdown_before(mut self, deadline: Instant) -> Result<(), String> {
+        self.submitter.request_shutdown();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join_before(join, deadline)
     }
 }
 
 #[cfg(windows)]
 impl Drop for InferenceWorker {
     fn drop(&mut self) {
-        let _ = self.submitter.sender.send(InferenceCommand::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        self.submitter.request_shutdown();
+        // A JoinHandle detaches on drop. Application close uses
+        // `shutdown_before` for a bounded join; Drop itself must never block.
+        let _ = self.join.take();
     }
-}
-
-#[cfg(windows)]
-enum InferenceCommand {
-    Recognize(InferenceTask),
-    Barrier(SyncSender<()>),
-    Shutdown,
 }
 
 #[cfg(windows)]
@@ -539,113 +726,169 @@ struct InferenceTask {
 #[cfg(windows)]
 fn inference_loop(
     recognizer: &mut LockedSherpaRealtime,
-    receiver: Receiver<InferenceCommand>,
+    finals: Receiver<InferenceTask>,
+    shared: Arc<InferenceShared>,
     snapshot: Arc<Mutex<MvpSnapshot>>,
-    queue_depth: Arc<AtomicUsize>,
 ) {
-    while let Ok(command) = receiver.recv() {
-        match command {
-            InferenceCommand::Recognize(task) => {
-                queue_depth.fetch_sub(1, Ordering::AcqRel);
-                let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
-                let mut current = lock(&snapshot);
-                if current.session_id.as_deref() != Some(task.session_id.as_str()) {
-                    continue;
-                }
-                match result {
-                    Ok(result) => {
-                        let text = result.original_transcript.as_str().trim().to_owned();
-                        if !is_meaningful_transcript(&text) {
-                            if task.is_final {
-                                current.interim = None;
-                            }
-                            continue;
-                        }
-                        let segment = TranscriptSegment {
-                            segment_id: task.segment_id,
-                            revision: task.revision,
-                            is_final: task.is_final,
-                            text,
-                            started_at_ms: task.started_at_ms,
-                            ended_at_ms: task.is_final.then_some(task.ended_at_ms),
-                        };
-                        if task.is_final {
-                            current.interim = None;
-                            current.finals.push(segment);
-                        } else {
-                            current.interim = Some(segment);
-                        }
-                        current.error = None;
-                        current.enforce_bounds();
-                    }
-                    Err(error) => {
-                        if task.is_final {
-                            current.interim = None;
-                            current.error = Some(error.to_string());
-                        }
-                    }
-                }
-            }
-            InferenceCommand::Barrier(sender) => {
-                let _ = sender.send(());
-            }
-            InferenceCommand::Shutdown => break,
+    loop {
+        let scheduled = match finals.try_recv() {
+            Ok(final_task) => Some((None, final_task)),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => shared
+                .take_interim()
+                .map(|(generation, task)| (Some(generation), task)),
+        };
+        if let Some((interim_generation, task)) = scheduled {
+            process_inference_task(recognizer, &shared, &snapshot, interim_generation, task);
+            shared.finish_task();
+            continue;
         }
+        if shared.shutdown.load(Ordering::Acquire) && shared.pending.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        thread::park_timeout(Duration::from_millis(20));
     }
+}
+
+#[cfg(windows)]
+fn process_inference_task(
+    recognizer: &mut LockedSherpaRealtime,
+    shared: &InferenceShared,
+    snapshot: &Mutex<MvpSnapshot>,
+    interim_generation: Option<u64>,
+    task: InferenceTask,
+) {
+    if interim_generation.is_some_and(|generation| !shared.interim_is_current(generation))
+        || lock(snapshot).session_id.as_deref() != Some(task.session_id.as_str())
+    {
+        return;
+    }
+
+    let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
+    let session_id = task.session_id.clone();
+    let _ = publish_if_current(
+        shared,
+        snapshot,
+        interim_generation,
+        &session_id,
+        move |current| {
+            if task.is_final {
+                current.interim = None;
+                shared.published_interim.store(0, Ordering::Release);
+            }
+            match result {
+                Ok(result) => {
+                    let text = result.original_transcript.as_str().trim().to_owned();
+                    if !is_meaningful_transcript(&text) {
+                        return;
+                    }
+                    let segment = TranscriptSegment {
+                        segment_id: task.segment_id,
+                        revision: task.revision,
+                        is_final: task.is_final,
+                        text,
+                        started_at_ms: task.started_at_ms,
+                        ended_at_ms: task.is_final.then_some(task.ended_at_ms),
+                    };
+                    if task.is_final {
+                        current.finals.push(segment);
+                    } else {
+                        current.interim = Some(segment);
+                        shared.published_interim.store(
+                            interim_generation.expect("interim tasks carry a generation"),
+                            Ordering::Release,
+                        );
+                    }
+                    if current.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+                        current.error = None;
+                    }
+                    current.enforce_bounds();
+                }
+                Err(error) if task.is_final => set_public_error(current, &error.to_string()),
+                Err(_) => {}
+            }
+        },
+    );
+}
+
+#[cfg(windows)]
+fn publish_if_current(
+    shared: &InferenceShared,
+    snapshot: &Mutex<MvpSnapshot>,
+    interim_generation: Option<u64>,
+    session_id: &str,
+    publish: impl FnOnce(&mut MvpSnapshot),
+) -> bool {
+    let mut current = lock(snapshot);
+    let _interim_gate = if let Some(generation) = interim_generation {
+        let gate = lock(&shared.interim);
+        if !shared.interim_is_current(generation) {
+            return false;
+        }
+        Some(gate)
+    } else {
+        None
+    };
+    if current.session_id.as_deref() != Some(session_id) {
+        return false;
+    }
+    publish(&mut current);
+    if interim_generation.is_some_and(|generation| !shared.interim_is_current(generation)) {
+        current.interim = None;
+        shared.published_interim.store(0, Ordering::Release);
+        return false;
+    }
+    true
 }
 
 #[cfg(windows)]
 fn spawn_coordinator(
     output: AudioCaptureOutput,
     submitter: InferenceSubmitter,
-    snapshot: Arc<Mutex<MvpSnapshot>>,
     session_id: String,
     stop: Arc<AtomicBool>,
+    errors: Arc<RuntimeErrors>,
 ) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("meetingrelay-audio".to_owned())
-        .spawn(move || coordinator_loop(output, submitter, snapshot, session_id, stop))
+        .spawn(move || coordinator_loop(output, submitter, session_id, stop, errors))
         .map_err(|_| "AUDIO_COORDINATOR_START_FAILED".to_owned())
 }
 
 #[cfg(windows)]
-fn join_before(coordinator: JoinHandle<()>, deadline: Instant) -> Result<(), String> {
-    while !coordinator.is_finished() {
+fn join_before(handle: JoinHandle<()>, deadline: Instant) -> Result<(), String> {
+    while !handle.is_finished() {
         if Instant::now() >= deadline {
-            return Err("AUDIO_STOP_TIMEOUT".to_owned());
+            return Err("MVP_SHUTDOWN_TIMEOUT".to_owned());
         }
         thread::sleep(Duration::from_millis(2));
     }
-    coordinator
-        .join()
-        .map_err(|_| "AUDIO_COORDINATOR_PANIC".to_owned())
+    handle.join().map_err(|_| "MVP_WORKER_PANIC".to_owned())
 }
 
 #[cfg(windows)]
 fn coordinator_loop(
     output: AudioCaptureOutput,
     submitter: InferenceSubmitter,
-    snapshot: Arc<Mutex<MvpSnapshot>>,
     session_id: String,
     stop: Arc<AtomicBool>,
+    errors: Arc<RuntimeErrors>,
 ) {
     let AudioCaptureOutput {
         packets,
-        statuses,
+        statuses: _statuses,
         preflight,
         ..
     } = output;
     let system = SourcePipeline::new(&preflight.system_output);
     let microphone = SourcePipeline::new(&preflight.microphone);
     let (Ok(mut system), Ok(mut microphone)) = (system, microphone) else {
-        lock(&snapshot).error = Some("AUDIO_DSP_CONFIGURATION".to_owned());
+        record_runtime_error(&errors, 1);
         return;
     };
     let mut endpoint = EnergyEndpointSegmenter::new();
     let mut identity = SegmentIdentity::default();
 
     while !stop.load(Ordering::Acquire) {
-        drain_statuses(&statuses, &snapshot);
         let timed_out = match packets.recv_timeout(Duration::from_millis(20)) {
             Ok(packet) => {
                 route_packet(packet, &mut system, &mut microphone);
@@ -661,7 +904,7 @@ fn coordinator_loop(
             &mut endpoint,
             &mut identity,
             &submitter,
-            &snapshot,
+            &errors,
             &session_id,
         );
     }
@@ -681,13 +924,12 @@ fn coordinator_loop(
         &mut endpoint,
         &mut identity,
         &submitter,
-        &snapshot,
+        &errors,
         &session_id,
     );
     if let Some(event) = endpoint.flush_stop() {
-        submit_segment(event, &mut identity, &submitter, &snapshot, &session_id);
+        submit_segment(event, &mut identity, &submitter, &errors, &session_id);
     }
-    drain_statuses(&statuses, &snapshot);
 }
 
 #[cfg(windows)]
@@ -758,7 +1000,7 @@ fn drain_mixed(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    snapshot: &Arc<Mutex<MvpSnapshot>>,
+    errors: &RuntimeErrors,
     session_id: &str,
 ) {
     const ALIGNMENT_BLOCKS: usize = 4;
@@ -769,7 +1011,7 @@ fn drain_mixed(
             endpoint,
             identity,
             submitter,
-            snapshot,
+            errors,
             session_id,
         );
     }
@@ -780,7 +1022,7 @@ fn drain_mixed(
             endpoint,
             identity,
             submitter,
-            snapshot,
+            errors,
             session_id,
         );
     }
@@ -791,7 +1033,7 @@ fn drain_mixed(
             endpoint,
             identity,
             submitter,
-            snapshot,
+            errors,
             session_id,
         );
     }
@@ -803,7 +1045,7 @@ fn drain_mixed(
                 endpoint,
                 identity,
                 submitter,
-                snapshot,
+                errors,
                 session_id,
             );
         } else if system.is_empty() {
@@ -813,7 +1055,7 @@ fn drain_mixed(
                 endpoint,
                 identity,
                 submitter,
-                snapshot,
+                errors,
                 session_id,
             );
         }
@@ -828,7 +1070,7 @@ fn drain_all_mixed(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    snapshot: &Arc<Mutex<MvpSnapshot>>,
+    errors: &RuntimeErrors,
     session_id: &str,
 ) {
     while !system.is_empty() || !microphone.is_empty() {
@@ -838,7 +1080,7 @@ fn drain_all_mixed(
             endpoint,
             identity,
             submitter,
-            snapshot,
+            errors,
             session_id,
         );
     }
@@ -852,7 +1094,7 @@ fn process_pair(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    snapshot: &Arc<Mutex<MvpSnapshot>>,
+    errors: &RuntimeErrors,
     session_id: &str,
 ) {
     if system.is_none() && microphone.is_none() {
@@ -860,7 +1102,7 @@ fn process_pair(
     }
     let mixed = mix_blocks(system.as_ref(), microphone.as_ref());
     if let Some(event) = endpoint.push_block(&mixed.samples) {
-        submit_segment(event, identity, submitter, snapshot, session_id);
+        submit_segment(event, identity, submitter, errors, session_id);
     }
 }
 
@@ -893,7 +1135,7 @@ fn submit_segment(
     event: SegmentEvent,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    snapshot: &Arc<Mutex<MvpSnapshot>>,
+    errors: &RuntimeErrors,
     session_id: &str,
 ) {
     let (segment, is_final) = match event {
@@ -902,10 +1144,12 @@ fn submit_segment(
     };
     let (segment_id, revision) = identity.metadata(is_final);
     let task = inference_task(session_id, segment_id, revision, is_final, segment);
-    if let Err(error) = submitter.submit(task)
-        && (is_final || error != "ASR_INTERIM_DROPPED")
-    {
-        lock(snapshot).error = Some(error);
+    if let Err(error) = submitter.submit(task) {
+        match error.as_str() {
+            "ASR_FINAL_OVERLOAD" => record_runtime_error(errors, 3),
+            "ASR_INTERIM_DROPPED" => {}
+            _ => record_runtime_error(errors, 2),
+        }
     }
 }
 
@@ -951,32 +1195,35 @@ fn is_meaningful_transcript(text: &str) -> bool {
     text.chars().any(char::is_alphanumeric)
 }
 
-#[cfg(windows)]
-fn drain_statuses(statuses: &Receiver<AudioCaptureStatus>, snapshot: &Arc<Mutex<MvpSnapshot>>) {
-    loop {
-        match statuses.try_recv() {
-            Ok(AudioCaptureStatus {
-                source,
-                kind: AudioCaptureStatusKind::StreamError { .. },
-            }) => {
-                let mut current = lock(snapshot);
-                let source_snapshot = match source {
-                    AudioSourceId::SystemOutput => &mut current.system,
-                    AudioSourceId::Microphone => &mut current.microphone,
-                };
-                source_snapshot.status = SourceStatus::Error;
-                source_snapshot.error = Some("AUDIO_STREAM_ERROR".to_owned());
-                current.error = Some("AUDIO_STREAM_ERROR".to_owned());
-            }
-            Ok(_) => {}
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn queued_task(revision: u32, is_final: bool) -> InferenceTask {
+        InferenceTask {
+            session_id: "session-test".to_owned(),
+            segment_id: "segment-test".to_owned(),
+            revision,
+            is_final,
+            started_at_ms: "0".to_owned(),
+            ended_at_ms: "20".to_owned(),
+            samples: vec![0_i16].into(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_submitter() -> (InferenceSubmitter, Receiver<InferenceTask>) {
+        let (finals, receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
+        (
+            InferenceSubmitter {
+                finals,
+                shared: Arc::new(InferenceShared::default()),
+                worker_thread: thread::current(),
+            },
+            receiver,
+        )
+    }
 
     #[test]
     fn default_service_is_private_memory_only_and_booting() {
@@ -995,6 +1242,167 @@ mod tests {
         let snapshot = service.snapshot();
         assert_eq!(snapshot.system.frames, "0");
         assert_eq!(snapshot.microphone.frames, "0");
+    }
+
+    #[test]
+    fn service_shutdown_is_idempotent_and_deadline_bounded() {
+        let service = MvpService::default();
+        let deadline = Instant::now() + MVP_SHUTDOWN_TIMEOUT;
+        assert_eq!(service.shutdown_before(deadline), Ok(()));
+        assert_eq!(service.shutdown_before(deadline), Ok(()));
+
+        #[cfg(windows)]
+        {
+            let _inner = lock(&service.inner);
+            let started = Instant::now();
+            assert_eq!(
+                lock_before(&service.inner, started).err().as_deref(),
+                Some("MVP_SHUTDOWN_TIMEOUT")
+            );
+            assert!(started.elapsed() < Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inference_submission_is_latest_wins_and_final_priority() {
+        let (submitter, finals) = test_submitter();
+        submitter.submit(queued_task(1, false)).unwrap();
+        submitter.submit(queued_task(2, false)).unwrap();
+        let (generation, interim_task) = submitter.shared.take_interim().unwrap();
+        assert!(!interim_task.is_final);
+        assert_eq!(interim_task.revision, 2);
+        assert!(submitter.shared.interim_is_current(generation));
+        submitter.submit(queued_task(3, false)).unwrap();
+        assert!(!submitter.shared.interim_is_current(generation));
+        submitter.shared.finish_task();
+
+        submitter.submit(queued_task(4, true)).unwrap();
+        assert!(submitter.shared.take_interim().is_none());
+        let final_task = finals.try_recv().unwrap();
+        assert!(final_task.is_final);
+        assert_eq!(final_task.revision, 4);
+        submitter.shared.finish_task();
+        assert_eq!(submitter.barrier_before(Instant::now()), Ok(()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn newer_generation_while_publication_waits_cannot_commit() {
+        let (submitter, _finals) = test_submitter();
+        submitter.submit(queued_task(1, false)).unwrap();
+        let (generation, _task) = submitter.shared.take_interim().unwrap();
+        let snapshot = Arc::new(Mutex::new(MvpSnapshot::booting()));
+        let mut snapshot_guard = lock(&snapshot);
+        snapshot_guard.session_id = Some("session-test".to_owned());
+        let latch = Arc::new(std::sync::Barrier::new(2));
+        let worker_latch = Arc::clone(&latch);
+        let worker_shared = Arc::clone(&submitter.shared);
+        let worker_snapshot = Arc::clone(&snapshot);
+        let worker = thread::spawn(move || {
+            worker_latch.wait();
+            publish_if_current(
+                &worker_shared,
+                &worker_snapshot,
+                Some(generation),
+                "session-test",
+                |current| current.error = Some("STALE_PUBLICATION".to_owned()),
+            )
+        });
+
+        latch.wait();
+        submitter.submit(queued_task(2, false)).unwrap();
+        drop(snapshot_guard);
+        assert!(!worker.join().unwrap());
+        assert_ne!(lock(&snapshot).error.as_deref(), Some("STALE_PUBLICATION"));
+        submitter.shared.finish_task();
+        let _ = submitter.shared.take_interim();
+        submitter.shared.finish_task();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_public_snapshot_boundary_scrubs_a_stale_interim() {
+        let (submitter, _finals) = test_submitter();
+        submitter
+            .shared
+            .published_interim
+            .store(1, Ordering::Release);
+        submitter.shared.latest_interim.store(2, Ordering::Release);
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.interim = Some(TranscriptSegment {
+            segment_id: "segment-stale".to_owned(),
+            revision: 1,
+            is_final: false,
+            text: "stale".to_owned(),
+            started_at_ms: "0".to_owned(),
+            ended_at_ms: None,
+        });
+
+        let returned = public_snapshot(&mut snapshot, Some(&submitter));
+        assert!(returned.interim.is_none());
+        assert!(snapshot.interim.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_queue_only_rejects_capacity_and_ignores_interim_contention() {
+        let (submitter, _finals) = test_submitter();
+        for _ in 0..MAX_INFERENCE_QUEUE_DEPTH {
+            submitter.submit(queued_task(1, true)).unwrap();
+        }
+        assert_eq!(
+            submitter.submit(queued_task(1, true)),
+            Err("ASR_FINAL_OVERLOAD".to_owned())
+        );
+
+        let (contended, finals) = test_submitter();
+        let _interim = lock(&contended.shared.interim);
+        let started = Instant::now();
+        contended.submit(queued_task(1, true)).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(finals.try_recv().unwrap().is_final);
+        contended.shared.finish_task();
+
+        let errors = RuntimeErrors::default();
+        record_runtime_error(&errors, 2);
+        record_runtime_error(&errors, 3);
+        let mut snapshot = MvpSnapshot::booting();
+        set_public_error(&mut snapshot, take_runtime_error(&errors).unwrap());
+        set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
+        assert_eq!(snapshot.error.as_deref(), Some("ASR_FINAL_OVERLOAD"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inference_worker_drop_requests_shutdown_without_joining() {
+        let shared = Arc::new(InferenceShared::default());
+        let worker_shared = Arc::clone(&shared);
+        let (done_sender, done_receiver) = sync_channel(1);
+        let join = thread::spawn(move || {
+            while !worker_shared.shutdown.load(Ordering::Acquire) {
+                thread::park();
+            }
+            thread::sleep(Duration::from_millis(150));
+            let _ = done_sender.send(());
+        });
+        let worker_thread = join.thread().clone();
+        let (finals, _receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
+        let worker = InferenceWorker {
+            submitter: InferenceSubmitter {
+                finals,
+                shared,
+                worker_thread,
+            },
+            join: Some(join),
+        };
+
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached worker should observe shutdown");
     }
 
     #[test]

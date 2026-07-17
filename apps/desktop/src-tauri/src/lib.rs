@@ -1,5 +1,15 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Instant,
+};
+
 use meetingrelay_benchmark_contract::{CONTRACT_VERSION, Observation};
 use serde::Serialize;
+use tauri::Manager;
 
 mod mvp;
 
@@ -30,9 +40,44 @@ fn bootstrap_probe() -> BootstrapProbe {
     }
 }
 
+fn spawn_or_exit(name: &str, task: impl FnOnce() + Send + 'static) {
+    let _ = thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(task)
+        .unwrap_or_else(|_| std::process::exit(1));
+}
+
 fn with_bootstrap_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    let close_started = Arc::new(AtomicBool::new(false));
     builder
         .manage(mvp::MvpService::default())
+        .on_window_event(move |window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            api.prevent_close();
+            if close_started.swap(true, Ordering::AcqRel) {
+                return;
+            }
+
+            let deadline = Instant::now() + mvp::MVP_SHUTDOWN_TIMEOUT;
+            let _ = window.hide();
+            let app = window.app_handle().clone();
+            spawn_or_exit("meetingrelay-shutdown-watchdog", move || {
+                // `app.exit` only requests event-loop exit. Keep this fallback armed
+                // until process termination; the absolute deadline wins any race.
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                std::process::exit(1);
+            });
+            spawn_or_exit("meetingrelay-shutdown", move || {
+                let exit_code = i32::from(
+                    app.state::<mvp::MvpService>()
+                        .shutdown_before(deadline)
+                        .is_err(),
+                );
+                app.exit(exit_code);
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             bootstrap_probe,
             mvp::mvp_preflight,

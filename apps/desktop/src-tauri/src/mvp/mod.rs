@@ -5,6 +5,7 @@ pub mod contract;
 pub mod dsp;
 mod service;
 
+pub(crate) use service::MVP_SHUTDOWN_TIMEOUT;
 pub use service::MvpService;
 
 use contract::MvpSnapshot;
