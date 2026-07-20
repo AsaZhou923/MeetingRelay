@@ -1317,7 +1317,6 @@ async function runCore(rawInput, dependencies) {
   const shardExecutions = [];
   const ledgerEntries = [];
   const responseRows = [];
-  let sequence = 1;
   let scoredSampleCounter = 0;
   const canaryBases = buildCanaryBases(
     initial.snapshot.record.samples,
@@ -1336,20 +1335,21 @@ async function runCore(rawInput, dependencies) {
     assertDigest(canaryBase.wav_sha256, "REALDATA_CANARY");
     if (!Number.isSafeInteger(canaryBase.wav_size_bytes) || canaryBase.wav_size_bytes < 1) fail("REALDATA_CANARY");
     const requests = [];
+    let shardSequence = 1;
     let shardCanaryInserted = false;
     for (const sample of shardSamples) {
-      requests.push(requestFor(sample, sequence, shardIndex, false));
-      sequence += 1;
+      requests.push(requestFor(sample, shardSequence, shardIndex, false));
+      shardSequence += 1;
       scoredSampleCounter += 1;
       if (scoredSampleCounter % initial.policy.policy.canary.cadence_samples === 0) {
-        requests.push(requestFor(canaryBase, sequence, shardIndex, true));
-        sequence += 1;
+        requests.push(requestFor(canaryBase, shardSequence, shardIndex, true));
+        shardSequence += 1;
         shardCanaryInserted = true;
       }
     }
     if (!shardCanaryInserted) {
-      requests.push(requestFor(canaryBase, sequence, shardIndex, true));
-      sequence += 1;
+      requests.push(requestFor(canaryBase, shardSequence, shardIndex, true));
+      shardSequence += 1;
     }
     const shardResult = await runShardProcess({ dependencies, input, policy: initial.policy.policy, requests });
     const responses = shardResult.responses;

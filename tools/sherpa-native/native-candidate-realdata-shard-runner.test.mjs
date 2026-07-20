@@ -316,6 +316,7 @@ function mockDependencies({ responses, hooks = {} } = {}) {
     ledgerPublishes: 0,
     requestLog,
     sealPublishes: 0,
+    shardRequestLog: [],
     startupLog: [],
     get snapshotCalls() { return snapshotCalls; },
     get snapshotIdentityCalls() { return snapshotIdentityCalls; },
@@ -353,6 +354,7 @@ function mockDependencies({ responses, hooks = {} } = {}) {
         assert.match(startupArguments[8], /^(?:0|[1-9][0-9]*)$/u);
         assert.equal(new Set(requests.map((request) => request.language)).size, 1);
         assert.ok(requests.length <= Number(startupArguments[7]));
+        calls.shardRequestLog.push(requests.map((request) => ({ ...request })));
         calls.startupLog.push([...startupArguments]);
         requestLog.push(...requests.map((request) => ({ ...request })));
         if (responses?.throwOnCall === invokeCalls) throw new Error("synthetic crash");
@@ -536,6 +538,16 @@ test("real-data runner partitions 960 samples, uses fresh shard processes, exclu
   assert.equal(result.record.execution.shards.every((shard) => shard.sample_count === 64), true);
   assert.equal(result.record.execution.shards.every((shard) => shard.canary_count === 2), true);
   assert.equal(calls.startupLog.every((argv) => argv[7] === "66"), true);
+  assert.equal(calls.shardRequestLog.length, 15);
+  assert.deepEqual(calls.shardRequestLog[0].map((request) => request.request_sequence), Array.from({ length: 66 }, (_, index) => index + 1));
+  assert.deepEqual(calls.shardRequestLog[1].map((request) => request.request_sequence), Array.from({ length: 66 }, (_, index) => index + 1));
+  assert.equal(calls.shardRequestLog[1][0].request_sequence, 1);
+  for (const shardRequests of calls.shardRequestLog) {
+    assert.deepEqual(
+      shardRequests.filter((request) => request.is_canary).map((request) => request.request_sequence),
+      [33, 66],
+    );
+  }
   assert.deepEqual(Object.keys(result.record.execution.canary_identity_sha256_by_language), ["en", "ja", "zh"]);
   assert.deepEqual(Object.keys(result.record.execution.canary_transcript_sha256_by_language), ["en", "ja", "zh"]);
   assert.equal(result.record.execution.shards.every((shard) => shard.canary_count >= 1), true);
@@ -560,6 +572,8 @@ test("real-data runner partitions 960 samples, uses fresh shard processes, exclu
   });
   assert.equal(result.record.resource_observations.status_counts.observed, 15);
   assert.equal(result.record.resource_observations.status_counts.unavailable, 975);
+  const ledger = await readControlledHypothesisLedger(input.controlledRoot, input.ledgerRelativePath);
+  assert.deepEqual(ledger.record.entries.map((entry) => entry.sequence), Array.from({ length: 960 }, (_, index) => index + 1));
   const text = await readFile(input.finalEvidencePath, "utf8");
   assert.equal(text.includes(input.controlledRoot), false);
   assert.equal(text.includes("hello world"), false);
