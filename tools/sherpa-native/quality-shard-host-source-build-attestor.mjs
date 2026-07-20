@@ -21,7 +21,7 @@ const AUTHORITY = Object.freeze({
   public_distribution: false,
   quality_gate_status: "not-assessed",
 });
-const EXPECTED_FEATURES = Object.freeze(["native-quality-shard", "native-sherpa"]);
+const EXPECTED_FEATURES = Object.freeze(["native-quality-sample", "native-quality-shard", "native-sherpa"]);
 const EXPECTED_FILENAME = process.platform === "win32"
   ? "meetingrelay-sherpa-candidate-quality-shard-host.exe"
   : "meetingrelay-sherpa-candidate-quality-shard-host";

@@ -23,6 +23,7 @@ const QUALITY_HOST_EXE = `${QUALITY_HOST}.exe`;
 const SAMPLE_BUILD_TARGET_LEAF = "quality-host-builds";
 const SHARD_BUILD_TARGET_LEAF = "shard-host-builds";
 const SHARD_BUILD_SCRIPT_OUTPUT_SAFE_BUDGET = 246;
+const SHARD_FEATURES = Object.freeze(["native-quality-sample", "native-quality-shard", "native-sherpa"]);
 const TARGET = "x86_64-pc-windows-msvc";
 const CARGO_ARGS = Object.freeze([
   "build",
@@ -549,7 +550,7 @@ test("module profile defaults to sample and explicit shard switches only identit
   ];
   fx.state.cargoStdout = `${JSON.stringify(cargoArtifact(shardExecutablePath, {
     executable: shardExecutablePath,
-    features: ["native-quality-shard", "native-sherpa"],
+    features: SHARD_FEATURES,
     filenames: [shardExecutablePath],
     target: {
       name: shardHost,
@@ -576,7 +577,7 @@ test("module profile defaults to sample and explicit shard switches only identit
   };
   const result = await shardProfileAttestor.__attestQualityHostSourceBuildForTest(fx.input, fx.ops);
   assert.equal(result.record.kind, "meetingrelay-quality-shard-host-source-build-attestation-v1");
-  assert.deepEqual(result.record.cargo.features, ["native-quality-shard", "native-sherpa"]);
+  assert.deepEqual(result.record.cargo.features, SHARD_FEATURES);
   assert.equal(result.record.executable.filename, shardHostExe);
   assert.deepEqual(
     fx.state.commands.find(({ executable, args }) => executableName(executable) === "cargo.exe" && args[0] === "build")?.args,

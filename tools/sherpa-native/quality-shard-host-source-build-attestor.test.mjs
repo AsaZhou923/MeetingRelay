@@ -22,6 +22,7 @@ const EXECUTABLE_SHA256 = "b".repeat(64);
 const QUALITY_SHARD_HOST = "meetingrelay-sherpa-candidate-quality-shard-host";
 const QUALITY_SHARD_HOST_EXE = `${QUALITY_SHARD_HOST}.exe`;
 const SHARD_BUILD_TARGET_LEAF = "shard-host-builds";
+const SHARD_FEATURES = Object.freeze(["native-quality-sample", "native-quality-shard", "native-sherpa"]);
 const TARGET = "x86_64-pc-windows-msvc";
 const CARGO_ARGS = Object.freeze([
   "build",
@@ -100,7 +101,7 @@ function runtimeFixture() {
 function cargoArtifact(executablePath, overrides = {}) {
   const record = {
     executable: executablePath,
-    features: ["native-quality-shard", "native-sherpa"],
+    features: SHARD_FEATURES,
     filenames: [executablePath],
     fresh: false,
     package_id: "path+file:///C:/repo/crates/model-worker-sherpa-native#meetingrelay-model-worker-sherpa-native@0.1.0",
@@ -359,7 +360,7 @@ function attestation(overrides = {}) {
       quality_gate_status: "not-assessed",
     },
     cargo: {
-      features: ["native-quality-shard", "native-sherpa"],
+      features: SHARD_FEATURES,
       lock_sha256: "c".repeat(64),
       profile: "release",
     },
@@ -422,7 +423,7 @@ test("attest path performs a clean-source isolated offline Release shard-host bu
     public_distribution: false,
     quality_gate_status: "not-assessed",
   });
-  assert.deepEqual(result.record.cargo.features, ["native-quality-shard", "native-sherpa"]);
+  assert.deepEqual(result.record.cargo.features, SHARD_FEATURES);
   assert.equal(result.record.executable.filename, QUALITY_SHARD_HOST_EXE);
   assert.deepEqual(result.record.executable.required_dll_characteristics, [
     "DYNAMIC_BASE", "GUARD_CF", "HIGH_ENTROPY_VA", "NX_COMPAT",
@@ -475,11 +476,10 @@ test("attest path rejects dirty source, ambient overrides, preexisting target, b
     };
     await expectCode(() => __attestQualityShardHostSourceBuildForTest(fx.input, fx.ops), "QUALITY_SHARD_HOST_ATTESTOR_BUILD");
   });
-  await t.test("single-sample artifact masquerade", async () => {
+  await t.test("missing transitive sample feature", async () => {
     const fx = fixture();
     fx.state.cargoStdout = `${JSON.stringify(cargoArtifact(fx.executablePath, {
-      features: ["native-quality-sample", "native-sherpa"],
-      target: { name: "meetingrelay-sherpa-candidate-quality-host" },
+      features: ["native-quality-shard", "native-sherpa"],
     }))}\n`;
     await expectCode(() => __attestQualityShardHostSourceBuildForTest(fx.input, fx.ops), "QUALITY_SHARD_HOST_ATTESTOR_ARTIFACT");
   });
@@ -533,20 +533,26 @@ test("shard-host attestation binds the separate shard binary and source closure"
     expectedSourceCommit: SOURCE_COMMIT,
   });
   assert.equal(result.sha256, sha256(bytes));
-  assert.deepEqual(result.record.cargo.features, ["native-quality-shard", "native-sherpa"]);
+  assert.deepEqual(result.record.cargo.features, SHARD_FEATURES);
   assert.equal(result.record.authority.execution_status, "not-run");
 });
 
-test("single-sample host attestation cannot masquerade as the shard host", async () => {
-  const record = attestation({
-    cargo: { ...attestation().cargo, features: ["native-quality-sample", "native-sherpa"] },
-  });
-  await expectCode(
-    async () => validateQualityShardHostSourceBuildAttestationBytes(
-      Buffer.from(encodeCanonicalJsonLine(record), "utf8"),
-    ),
-    "QUALITY_SHARD_HOST_CARGO",
-  );
+test("shard-host attestation requires the exact transitive Cargo feature closure", async () => {
+  for (const features of [
+    ["native-quality-shard", "native-sherpa"],
+    ["native-quality-sample", "native-sherpa"],
+    [...SHARD_FEATURES, "native-extra"],
+  ]) {
+    const record = attestation({
+      cargo: { ...attestation().cargo, features },
+    });
+    await expectCode(
+      async () => validateQualityShardHostSourceBuildAttestationBytes(
+        Buffer.from(encodeCanonicalJsonLine(record), "utf8"),
+      ),
+      "QUALITY_SHARD_HOST_CARGO",
+    );
+  }
 });
 
 test("pinned attestation reader requires external digest executable and source commit anchors", async (t) => {
