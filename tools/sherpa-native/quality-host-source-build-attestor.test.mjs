@@ -20,6 +20,9 @@ import * as shardProfileAttestor from "./quality-host-source-build-attestor.mjs?
 const COMMIT = "a".repeat(40);
 const QUALITY_HOST = "meetingrelay-sherpa-candidate-quality-host";
 const QUALITY_HOST_EXE = `${QUALITY_HOST}.exe`;
+const SAMPLE_BUILD_TARGET_LEAF = "quality-host-builds";
+const SHARD_BUILD_TARGET_LEAF = "shard-host-builds";
+const SHARD_BUILD_SCRIPT_OUTPUT_SAFE_BUDGET = 246;
 const TARGET = "x86_64-pc-windows-msvc";
 const CARGO_ARGS = Object.freeze([
   "build",
@@ -163,7 +166,7 @@ function fixture() {
     "target",
     "sherpa-native",
     "formal-run-trust",
-    "quality-host-builds",
+    SAMPLE_BUILD_TARGET_LEAF,
     COMMIT,
   );
   const releaseDir = path.win32.join(buildTargetRoot, "release");
@@ -531,7 +534,7 @@ test("module profile defaults to sample and explicit shard switches only identit
     "target",
     "sherpa-native",
     "formal-run-trust",
-    "quality-shard-host-builds",
+    SHARD_BUILD_TARGET_LEAF,
     COMMIT,
   );
   const shardReleaseDir = path.win32.join(shardBuildTargetRoot, "release");
@@ -593,6 +596,37 @@ test("module profile defaults to sample and explicit shard switches only identit
     ],
   );
   assert.equal(fx.state.buildTargetBindCalls[0].buildTargetRoot, shardBuildTargetRoot);
+});
+
+test("shard profile build target stays below the sample profile Windows path budget", () => {
+  const currentRoot = path.win32.resolve(process.cwd());
+  const sampleBuildScriptOutput = path.win32.join(
+    currentRoot,
+    "target",
+    "sherpa-native",
+    "formal-run-trust",
+    SAMPLE_BUILD_TARGET_LEAF,
+    "e".repeat(40),
+    "release",
+    "build",
+    "meetingrelay-model-worker-sherpa-native-ffffffffffffffff",
+    "out",
+  );
+  const shardBuildScriptOutput = path.win32.join(
+    currentRoot,
+    "target",
+    "sherpa-native",
+    "formal-run-trust",
+    SHARD_BUILD_TARGET_LEAF,
+    "e".repeat(40),
+    "release",
+    "build",
+    "meetingrelay-model-worker-sherpa-native-ffffffffffffffff",
+    "out",
+  );
+  assert.equal(shardBuildScriptOutput.split(path.win32.sep).includes(SHARD_BUILD_TARGET_LEAF), true);
+  assert.equal(shardBuildScriptOutput.length <= sampleBuildScriptOutput.length, true);
+  assert.equal(shardBuildScriptOutput.length <= SHARD_BUILD_SCRIPT_OUTPUT_SAFE_BUDGET, true);
 });
 
 test("attestor requires an unused commit-scoped Cargo target before building", async () => {

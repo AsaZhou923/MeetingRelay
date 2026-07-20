@@ -23,7 +23,7 @@ const MODULE_PROFILES = Object.freeze({
     kind: "meetingrelay-quality-host-source-build-attestation-v1",
   }),
   shard: Object.freeze({
-    buildTargetLeaf: "quality-shard-host-builds",
+    buildTargetLeaf: "shard-host-builds",
     cargoFeature: "native-quality-shard",
     features: Object.freeze(["native-quality-shard", "native-sherpa"]),
     host: "meetingrelay-sherpa-candidate-quality-shard-host",

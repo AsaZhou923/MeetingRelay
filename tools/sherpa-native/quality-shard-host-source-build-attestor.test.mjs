@@ -21,6 +21,7 @@ const SOURCE_COMMIT = "a".repeat(40);
 const EXECUTABLE_SHA256 = "b".repeat(64);
 const QUALITY_SHARD_HOST = "meetingrelay-sherpa-candidate-quality-shard-host";
 const QUALITY_SHARD_HOST_EXE = `${QUALITY_SHARD_HOST}.exe`;
+const SHARD_BUILD_TARGET_LEAF = "shard-host-builds";
 const TARGET = "x86_64-pc-windows-msvc";
 const CARGO_ARGS = Object.freeze([
   "build",
@@ -145,7 +146,7 @@ function fixture() {
     "target",
     "sherpa-native",
     "formal-run-trust",
-    "quality-shard-host-builds",
+    SHARD_BUILD_TARGET_LEAF,
     SOURCE_COMMIT,
   );
   const releaseDir = path.win32.join(buildTargetRoot, "release");
@@ -439,7 +440,7 @@ test("attest path performs a clean-source isolated offline Release shard-host bu
     ({ executable, args }) => executableName(executable) === "cargo.exe" && args[0] === "build",
   )?.options.env;
   assert.equal(buildEnvironment.CARGO_NET_OFFLINE, "true");
-  assert.equal(buildEnvironment.CARGO_TARGET_DIR.endsWith(`quality-shard-host-builds\\${SOURCE_COMMIT}`), true);
+  assert.equal(buildEnvironment.CARGO_TARGET_DIR.endsWith(`${SHARD_BUILD_TARGET_LEAF}\\${SOURCE_COMMIT}`), true);
   assert.equal(buildEnvironment.SHERPA_ONNX_LIB_DIR, fx.runtimeDir);
   assert.equal(fx.state.buildTargetBindCalls[0].requireAbsent, true);
   assert.equal(fx.state.commands.some(({ executable }) => pathKey(executable) === pathKey(fx.executablePath)), false);
