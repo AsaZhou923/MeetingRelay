@@ -193,16 +193,20 @@ function validateTarHeader(block) {
   if (checksumTarHeader(block) !== expectedChecksum) fail("FMC_TAR_HEADER");
   const typeflag = block[156] === 0 ? "0" : String.fromCharCode(block[156]);
   const memberPath = tarPathFromHeader(block);
+  const segmentPath = typeflag === "5" && memberPath.endsWith("/")
+    ? memberPath.slice(0, -1)
+    : memberPath;
   if (
     memberPath === "" ||
     memberPath.includes("\0") ||
     memberPath.includes(":") ||
     memberPath.includes("\\") ||
-    memberPath.split("/").some((segment) => segment === "." || segment === ".." || segment === "")
+    segmentPath === "" ||
+    segmentPath.split("/").some((segment) => segment === "." || segment === ".." || segment === "")
   ) {
     fail("FMC_TAR_PATH");
   }
-  for (const segment of memberPath.replace(/\/$/u, "").split("/")) {
+  for (const segment of segmentPath.split("/")) {
     if (!TAR_PATH_SEGMENT.test(segment) || WINDOWS_DOS_DEVICE.test(segment)) fail("FMC_TAR_PATH");
   }
   const size = parseTarOctal(block, 124, 12);

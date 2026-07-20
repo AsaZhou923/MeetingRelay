@@ -262,12 +262,46 @@ test("rejects missing and duplicate selected archive members", async (t) => {
   await assert.rejects(() => materialize(duplicate), { code: "FMC_ARCHIVE_SELECTED_DUPLICATE" });
 });
 
+test("accepts a canonical zero-size tar directory member", async (t) => {
+  const f = await fixture(t, {
+    entries: {
+      en_us: [
+        { name: "test/", typeflag: "5" },
+        { body: wav(9, 1), name: "test/1.wav" },
+        { body: wav(10, 2), name: "test/2.wav" },
+        { body: wav(11, 3), name: "test/3.wav" },
+      ],
+    },
+  });
+  const result = await materialize(f);
+  assert.equal(result.materializedSampleCount, 9);
+});
+
+test("rejects malformed tar directory and regular-file slash forms", async (t) => {
+  for (const [name, entry, code] of [
+    ["directory without trailing slash", { name: "test", typeflag: "5" }, "FMC_TAR_DIRECTORY"],
+    ["directory with content", { body: Buffer.from([1]), name: "test/", typeflag: "5" }, "FMC_TAR_DIRECTORY"],
+    ["directory with double trailing slash", { name: "test//", typeflag: "5" }, "FMC_TAR_PATH"],
+    ["root directory", { name: "/", typeflag: "5" }, "FMC_TAR_PATH"],
+    ["empty directory", { name: "", typeflag: "5" }, "FMC_TAR_PATH"],
+    ["regular file with trailing slash", { name: "test/", typeflag: "0" }, "FMC_TAR_PATH"],
+  ]) {
+    await t.test(name, async (tt) => {
+      const f = await fixture(tt, { entries: { en_us: [entry] } });
+      await assert.rejects(() => materialize(f), { code });
+    });
+  }
+});
+
 test("rejects traversal, absolute-like, duplicate-path, and special tar members", async (t) => {
   for (const [name, entries, code] of [
     ["traversal", [{ body: wav(9), name: "../1.wav" }], "FMC_TAR_PATH"],
     ["backslash", [{ body: wav(9), name: "bad\\1.wav" }], "FMC_TAR_PATH"],
+    ["double-slash", [{ body: wav(9), name: "test//1.wav" }], "FMC_TAR_PATH"],
     ["tar-option-injection", [{ body: wav(9), name: "--checkpoint-action=exec=calc" }], "FMC_TAR_PATH"],
     ["duplicate-path", [{ body: wav(9), name: "test/1.wav" }, { body: wav(9), name: "test/1.wav" }], "FMC_TAR_DUPLICATE_MEMBER"],
+    ["pax", [{ name: "PaxHeaders/test", typeflag: "x" }], "FMC_TAR_UNSAFE_MEMBER"],
+    ["block-device", [{ name: "test/device", typeflag: "4" }], "FMC_TAR_UNSAFE_MEMBER"],
     ["symlink", [{ name: "test/link.wav", typeflag: "2" }], "FMC_TAR_UNSAFE_MEMBER"],
   ]) {
     await test(name, async (tt) => {
