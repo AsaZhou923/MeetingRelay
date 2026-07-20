@@ -220,6 +220,129 @@ function validateTarHeader(block) {
   return { memberPath, size, typeflag };
 }
 
+function quantizeFloat32ToS16(sample) {
+  if (!Number.isFinite(sample) || sample < -1 || sample > 1) fail("FMC_WAV_FORMAT");
+  const scaled = sample * 32_768;
+  const rounded = scaled < 0 ? Math.ceil(scaled - 0.5) : Math.floor(scaled + 0.5);
+  return Math.max(-32_768, Math.min(32_767, rounded));
+}
+
+function canonicalizeObservedFleursFloat32Wave(bytes, expectedSampleFrames) {
+  if (
+    bytes.length < 58 ||
+    bytes.subarray(0, 4).toString("ascii") !== "RIFF" ||
+    bytes.readUInt32LE(4) !== bytes.length - 8 ||
+    bytes.subarray(8, 12).toString("ascii") !== "WAVE"
+  ) {
+    fail("FMC_WAV_FORMAT");
+  }
+
+  const allowedChunkIds = new Set(["fmt ", "fact", "data"]);
+  const chunks = new Map();
+  const chunkOrder = [];
+  let offset = 12;
+  while (offset < bytes.length) {
+    if (bytes.length - offset < 8) fail("FMC_WAV_FORMAT");
+    const id = bytes.subarray(offset, offset + 4).toString("latin1");
+    if (!allowedChunkIds.has(id) || chunks.has(id)) fail("FMC_WAV_FORMAT");
+    const size = bytes.readUInt32LE(offset + 4);
+    const dataOffset = offset + 8;
+    const dataEnd = dataOffset + size;
+    const paddedEnd = dataEnd + (size % 2);
+    if (dataEnd > bytes.length || paddedEnd > bytes.length) fail("FMC_WAV_FORMAT");
+    if (paddedEnd !== dataEnd && bytes[dataEnd] !== 0) fail("FMC_WAV_FORMAT");
+    chunks.set(id, { dataOffset, size });
+    chunkOrder.push(id);
+    offset = paddedEnd;
+  }
+  if (
+    chunkOrder.length !== 3 ||
+    chunkOrder[0] !== "fmt " ||
+    chunkOrder[1] !== "fact" ||
+    chunkOrder[2] !== "data"
+  ) {
+    fail("FMC_WAV_FORMAT");
+  }
+
+  const format = chunks.get("fmt ");
+  if (
+    format.size !== 18 ||
+    bytes.readUInt16LE(format.dataOffset) !== 3 ||
+    bytes.readUInt16LE(format.dataOffset + 2) !== 1 ||
+    bytes.readUInt32LE(format.dataOffset + 4) !== 16_000 ||
+    bytes.readUInt32LE(format.dataOffset + 8) !== 64_000 ||
+    bytes.readUInt16LE(format.dataOffset + 12) !== 4 ||
+    bytes.readUInt16LE(format.dataOffset + 14) !== 32 ||
+    bytes.readUInt16LE(format.dataOffset + 16) !== 0
+  ) {
+    fail("FMC_WAV_FORMAT");
+  }
+
+  const fact = chunks.get("fact");
+  const data = chunks.get("data");
+  if (fact.size !== 4 || data.size === 0 || data.size % 4 !== 0) fail("FMC_WAV_FORMAT");
+  const factSampleFrames = bytes.readUInt32LE(fact.dataOffset);
+  const dataSampleFrames = data.size / 4;
+  if (
+    factSampleFrames !== dataSampleFrames ||
+    factSampleFrames !== expectedSampleFrames ||
+    44 + dataSampleFrames * 2 > MAX_WAV_BYTES
+  ) {
+    fail("FMC_WAV_FORMAT");
+  }
+
+  const output = Buffer.alloc(44 + dataSampleFrames * 2);
+  output.write("RIFF", 0, 4, "ascii");
+  output.writeUInt32LE(output.length - 8, 4);
+  output.write("WAVE", 8, 4, "ascii");
+  output.write("fmt ", 12, 4, "ascii");
+  output.writeUInt32LE(16, 16);
+  output.writeUInt16LE(1, 20);
+  output.writeUInt16LE(1, 22);
+  output.writeUInt32LE(16_000, 24);
+  output.writeUInt32LE(32_000, 28);
+  output.writeUInt16LE(2, 32);
+  output.writeUInt16LE(16, 34);
+  output.write("data", 36, 4, "ascii");
+  output.writeUInt32LE(dataSampleFrames * 2, 40);
+  for (let index = 0; index < dataSampleFrames; index += 1) {
+    const sample = bytes.readFloatLE(data.dataOffset + index * 4);
+    output.writeInt16LE(quantizeFloat32ToS16(sample), 44 + index * 2);
+  }
+  return output;
+}
+
+function canonicalizeSelectedFleursWave(bytes, expectedSampleFrames) {
+  try {
+    if (
+      !Buffer.isBuffer(bytes) ||
+      bytes.length < 44 ||
+      bytes.length > MAX_WAV_BYTES ||
+      !Number.isSafeInteger(expectedSampleFrames) ||
+      expectedSampleFrames <= 0
+    ) {
+      fail("FMC_WAV_FORMAT");
+    }
+    try {
+      const pcm = inspectPcmS16leWave(bytes);
+      if (
+        pcm.channelCount === 1 &&
+        pcm.bitsPerSample === 16 &&
+        pcm.sampleRateHz === 16_000 &&
+        pcm.sampleFrames === expectedSampleFrames
+      ) {
+        return bytes;
+      }
+    } catch {
+      // The only alternate accepted representation is the observed FLEURS float32 layout below.
+    }
+    return canonicalizeObservedFleursFloat32Wave(bytes, expectedSampleFrames);
+  } catch (error) {
+    if (error instanceof FleursMaterializedCorpusError) throw error;
+    fail("FMC_WAV_FORMAT", { cause: error });
+  }
+}
+
 class SelectedTarExtractor extends Transform {
   constructor(expectedByFilename, publishRoot) {
     super();
@@ -285,16 +408,10 @@ class SelectedTarExtractor extends Transform {
         const body = this.buffer.subarray(0, this.remaining);
         this.buffer = this.buffer.subarray(this.remaining);
         if (this.current !== null) {
-          const bytes = Buffer.from(body);
-          const wav = inspectPcmS16leWave(bytes);
-          if (
-            wav.channelCount !== 1 ||
-            wav.bitsPerSample !== 16 ||
-            wav.sampleRateHz !== 16_000 ||
-            wav.sampleFrames !== this.current.expected.num_samples
-          ) {
-            fail("FMC_WAV_FORMAT");
-          }
+          const bytes = canonicalizeSelectedFleursWave(
+            Buffer.from(body),
+            this.current.expected.num_samples,
+          );
           const relativePath = `wav/${this.current.expected.config}/${this.current.filename}`;
           const absolutePath = resolveInside(this.publishRoot, relativePath, "FMC_OUTPUT_PATH");
           await mkdir(path.dirname(absolutePath), { recursive: true });

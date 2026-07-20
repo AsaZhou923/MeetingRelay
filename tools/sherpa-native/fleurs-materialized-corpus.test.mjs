@@ -57,6 +57,50 @@ function wav(samples, seed = 1, overrides = {}) {
   return out;
 }
 
+function riffChunk(id, body, declaredSize = body.length) {
+  const header = Buffer.alloc(8);
+  header.write(id, 0, 4, "ascii");
+  header.writeUInt32LE(declaredSize, 4);
+  return Buffer.concat([header, body, body.length % 2 === 0 ? Buffer.alloc(0) : Buffer.alloc(1)]);
+}
+
+function floatWav(samples, overrides = {}) {
+  const values = Array.isArray(samples)
+    ? samples
+    : Array.from({ length: samples }, (_, index) => ((index % 9) - 4) / 8);
+  const formatSize = overrides.formatSize ?? 18;
+  const channelCount = overrides.channelCount ?? 1;
+  const sampleRate = overrides.sampleRate ?? 16_000;
+  const bitsPerSample = overrides.bitsPerSample ?? 32;
+  const blockAlign = overrides.blockAlign ?? channelCount * (bitsPerSample / 8);
+  const byteRate = overrides.byteRate ?? sampleRate * blockAlign;
+  const format = Buffer.alloc(formatSize);
+  format.writeUInt16LE(overrides.format ?? 3, 0);
+  format.writeUInt16LE(channelCount, 2);
+  format.writeUInt32LE(sampleRate, 4);
+  format.writeUInt32LE(byteRate, 8);
+  format.writeUInt16LE(blockAlign, 12);
+  format.writeUInt16LE(bitsPerSample, 14);
+  if (formatSize >= 18) format.writeUInt16LE(overrides.cbSize ?? 0, 16);
+
+  const fact = Buffer.alloc(overrides.factSize ?? 4);
+  if (fact.length >= 4) fact.writeUInt32LE(overrides.factFrames ?? values.length, 0);
+  const data = Buffer.alloc(values.length * 4);
+  for (const [index, value] of values.entries()) data.writeFloatLE(value, index * 4);
+  const chunks = [
+    riffChunk("fmt ", format),
+    riffChunk("fact", fact),
+    ...(overrides.extraChunksBeforeData ?? []).map((chunk) => riffChunk(chunk.id, chunk.body)),
+    riffChunk("data", data, overrides.dataSize ?? data.length),
+  ];
+  const chunkBytes = Buffer.concat(chunks);
+  const header = Buffer.alloc(12);
+  header.write("RIFF", 0, 4, "ascii");
+  header.writeUInt32LE(4 + chunkBytes.length, 4);
+  header.write("WAVE", 8, 4, "ascii");
+  return Buffer.concat([header, chunkBytes]);
+}
+
 function tarHeader(name, size, typeflag = "0") {
   const block = Buffer.alloc(512, 0);
   block.write(name, 0, 100, "utf8");
@@ -307,6 +351,83 @@ test("rejects traversal, absolute-like, duplicate-path, and special tar members"
     await test(name, async (tt) => {
       const f = await fixture(tt, { entries: { en_us: entries } });
       await assert.rejects(() => materialize(f), { code });
+    });
+  }
+});
+
+test("canonicalizes the observed FLEURS float32 WAV layout to deterministic PCM S16LE", async (t) => {
+  const floatSamples = [-1, -0.5, -1 / 65_536, -0, 0, 1 / 65_536, 0.5, 32_767 / 32_768, 1];
+  const unchangedPcm = wav(10, 2);
+  const f = await fixture(t, {
+    entries: {
+      en_us: [
+        { name: "test/", typeflag: "5" },
+        { body: floatWav(floatSamples), name: "test/1.wav" },
+        { body: unchangedPcm, name: "test/2.wav" },
+        { body: wav(11, 3), name: "test/3.wav" },
+      ],
+    },
+  });
+  const result = await materialize(f);
+  const converted = await readFile(path.join(result.finalRoot, "wav", "en_us", "1.wav"));
+  assert.equal(converted.length, 44 + floatSamples.length * 2);
+  assert.equal(converted.subarray(0, 4).toString("ascii"), "RIFF");
+  assert.equal(converted.readUInt32LE(4), converted.length - 8);
+  assert.equal(converted.subarray(8, 12).toString("ascii"), "WAVE");
+  assert.equal(converted.readUInt16LE(20), 1);
+  assert.equal(converted.readUInt16LE(22), 1);
+  assert.equal(converted.readUInt32LE(24), 16_000);
+  assert.equal(converted.readUInt32LE(28), 32_000);
+  assert.equal(converted.readUInt16LE(32), 2);
+  assert.equal(converted.readUInt16LE(34), 16);
+  assert.equal(converted.subarray(36, 40).toString("ascii"), "data");
+  assert.equal(converted.readUInt32LE(40), floatSamples.length * 2);
+  assert.deepEqual(
+    Array.from({ length: floatSamples.length }, (_, index) => converted.readInt16LE(44 + index * 2)),
+    [-32_768, -16_384, -1, 0, 0, 1, 16_384, 32_767, 32_767],
+  );
+  assert.deepEqual(await readFile(path.join(result.finalRoot, "wav", "en_us", "2.wav")), unchangedPcm);
+
+  const manifest = JSON.parse(await readFile(path.join(result.finalRoot, "corpus-manifest.json"), "utf8"));
+  const sample = manifest.samples.find((entry) => entry.sample_id === "fleurs-en_us-1");
+  assert.equal(sample.wav.sample_format, "pcm-s16le");
+  assert.equal(sample.wav.bits_per_sample, 16);
+  assert.equal(sample.wav.size_bytes, converted.length);
+  assert.equal(sample.wav.sha256, sha256(converted));
+  assert.equal(sample.wav.pcm_sha256, sha256(converted.subarray(44)));
+});
+
+test("rejects unsafe or inconsistent FLEURS float32 WAV structures with a stable code", async (t) => {
+  const nineSamples = (first) => [first, ...Array(8).fill(0)];
+  for (const [name, build] of [
+    ["wrong format tag", () => floatWav(9, { format: 1 })],
+    ["wrong fmt size", () => floatWav(9, { formatSize: 16 })],
+    ["nonzero cbSize", () => floatWav(9, { cbSize: 2 })],
+    ["stereo", () => floatWav(Array(18).fill(0), { channelCount: 2, factFrames: 9 })],
+    ["non-16k sample rate", () => floatWav(9, { sampleRate: 8_000 })],
+    ["wrong byte rate", () => floatWav(9, { byteRate: 63_999 })],
+    ["wrong block alignment", () => floatWav(9, { blockAlign: 8 })],
+    ["wrong bit depth", () => floatWav(9, { bitsPerSample: 64 })],
+    ["wrong fact size", () => floatWav(9, { factSize: 8 })],
+    ["fact and data frame mismatch", () => floatWav(9, { factFrames: 8 })],
+    ["selection frame mismatch", () => floatWav(8)],
+    ["unaligned data size", () => floatWav(9, { dataSize: 35 })],
+    ["unknown LIST chunk", () => floatWav(9, { extraChunksBeforeData: [{ body: Buffer.alloc(4), id: "LIST" }] })],
+    ["duplicate fact chunk", () => floatWav(9, { extraChunksBeforeData: [{ body: Buffer.alloc(4), id: "fact" }] })],
+    ["out-of-bounds data chunk", () => floatWav(9, { dataSize: 0xffff_ffff })],
+    ["truncated data chunk", () => {
+      const bytes = Buffer.from(floatWav(9).subarray(0, -1));
+      bytes.writeUInt32LE(bytes.length - 8, 4);
+      return bytes;
+    }],
+    ["NaN sample", () => floatWav(nineSamples(Number.NaN))],
+    ["infinite sample", () => floatWav(nineSamples(Number.POSITIVE_INFINITY))],
+    ["sample above one", () => floatWav(nineSamples(1.000_1))],
+    ["sample below negative one", () => floatWav(nineSamples(-1.000_1))],
+  ]) {
+    await t.test(name, async (tt) => {
+      const f = await fixture(tt, { entries: { en_us: [{ body: build(), name: "test/1.wav" }] } });
+      await assert.rejects(() => materialize(f), { code: "FMC_WAV_FORMAT" });
     });
   }
 });
