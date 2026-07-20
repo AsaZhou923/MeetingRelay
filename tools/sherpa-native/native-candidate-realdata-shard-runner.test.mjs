@@ -311,8 +311,11 @@ function mockDependencies({ responses, hooks = {} } = {}) {
   let invokeCalls = 0;
   const requestLog = [];
   const calls = {
+    finalPublishes: 0,
     get invokeCalls() { return invokeCalls; },
+    ledgerPublishes: 0,
     requestLog,
+    sealPublishes: 0,
     startupLog: [],
     get snapshotCalls() { return snapshotCalls; },
     get snapshotIdentityCalls() { return snapshotIdentityCalls; },
@@ -324,6 +327,7 @@ function mockDependencies({ responses, hooks = {} } = {}) {
       aggregateScores: aggregateDescriptiveAsrScores,
       controlledRootIdentityReader: async (input, readiness) => {
         rootIdentityCalls += 1;
+        if (responses?.rootReaderThrow !== undefined) throw responses.rootReaderThrow;
         const identityDrift = responses?.rootMismatch || (responses?.rootDrift && rootIdentityCalls > 1);
         const volumeDrift = responses?.rootVolumeDrift && rootIdentityCalls > 1;
         const attestationDrift = responses?.rootInventoryDrift && rootIdentityCalls > 1;
@@ -337,6 +341,7 @@ function mockDependencies({ responses, hooks = {} } = {}) {
         });
       },
       finalPublisher: async (outputPath, bytes) => {
+        calls.finalPublishes += 1;
         await hooks.beforeFinalWrite?.();
         await writeFile(outputPath, bytes, { flag: "wx" });
       },
@@ -459,7 +464,10 @@ function mockDependencies({ responses, hooks = {} } = {}) {
               },
         };
       },
-      ledgerPublisher: publishControlledHypothesisLedger,
+      ledgerPublisher: async (...args) => {
+        calls.ledgerPublishes += 1;
+        return publishControlledHypothesisLedger(...args);
+      },
       ledgerReader: readControlledHypothesisLedger,
       monotonicNow: (() => {
         let value = 1000n;
@@ -468,7 +476,7 @@ function mockDependencies({ responses, hooks = {} } = {}) {
           return value;
         };
       })(),
-      now: () => new Date("2026-07-21T00:00:00Z"),
+      now: hooks.now ?? (() => new Date("2026-07-21T00:00:00Z")),
       policyReader: async (input) => {
         const bytes = await policyBytesPromise;
         const policy = JSON.parse(bytes.toString("utf8"));
@@ -477,7 +485,10 @@ function mockDependencies({ responses, hooks = {} } = {}) {
         return { bytes, policy, sha256: sha };
       },
       scoreTranscript: scoreAsrTranscript,
-      sealPublisher: publishControlledHypothesisLedgerSeal,
+      sealPublisher: async (...args) => {
+        calls.sealPublishes += 1;
+        return publishControlledHypothesisLedgerSeal(...args);
+      },
       sealReader: readControlledHypothesisLedgerSeal,
       shardHostBuildAttestationReader: async () => shardHostAttestation(),
       snapshotIdentityReader: async (input) => {
@@ -570,6 +581,38 @@ test("policy freezes 64 scored samples and 66 total host requests per shard", as
   );
 });
 
+test("realdata runner floors nonzero-millisecond production clocks to canonical UTC seconds", async (t) => {
+  const { input } = await makeContext(t);
+  const nowValues = [
+    "2026-07-21T00:00:00.987Z",
+    "2026-07-21T00:00:01.456Z",
+    "2026-07-21T00:00:02.789Z",
+    "2026-07-21T00:00:03.321Z",
+    "2026-07-21T00:00:04.654Z",
+  ].map((value) => new Date(value));
+  let nowIndex = 0;
+  const { dependencies } = mockDependencies({
+    hooks: {
+      now: () => nowValues[Math.min(nowIndex++, nowValues.length - 1)],
+    },
+  });
+  const result = await __runNativeCandidateRealdataShardEvaluationForTest(input, dependencies);
+  assert.equal(result.record.clock.started_at_utc, "2026-07-21T00:00:01Z");
+  assert.equal(result.record.clock.finished_at_utc, "2026-07-21T00:00:02Z");
+  assert.doesNotMatch(result.record.clock.started_at_utc, /\.\d{3}Z$/u);
+  assert.doesNotMatch(result.record.clock.finished_at_utc, /\.\d{3}Z$/u);
+
+  const invalid = mockDependencies({
+    hooks: {
+      now: () => new Date(Number.NaN),
+    },
+  });
+  await expectCode(
+    () => __runNativeCandidateRealdataShardEvaluationForTest(input, invalid.dependencies),
+    "REALDATA_CLOCK",
+  );
+});
+
 test("production realdata policy reader requires the explicit realdata policy digest", async (t) => {
   await makeContext(t);
   const policyBytes = await readFile(POLICY_PATH);
@@ -640,6 +683,29 @@ test("controlled root and materialized corpus roots are bound before run and bef
       () => __runNativeCandidateRealdataShardEvaluationForTest(input, dependencies),
       "REALDATA_CONTROLLED_ROOT_IDENTITY",
     );
+    await assert.rejects(readFile(input.finalEvidencePath), { code: "ENOENT" });
+  }
+});
+
+test("controlled root identity reader failures become stable runner errors before publishing", async (t) => {
+  for (const cause of [
+    new Error("external process failed"),
+    Object.assign(new Error("FORMAL_TRUST_RETENTION_FORMAT"), { code: "FORMAL_TRUST_RETENTION_FORMAT" }),
+  ]) {
+    const { input } = await makeContext(t);
+    const { calls, dependencies } = mockDependencies({
+      responses: { rootReaderThrow: cause },
+    });
+    await assert.rejects(
+      __runNativeCandidateRealdataShardEvaluationForTest(input, dependencies),
+      (error) =>
+        error instanceof NativeCandidateRealdataShardRunnerError &&
+        error.code === "REALDATA_CONTROLLED_ROOT_IDENTITY" &&
+        error.cause === cause,
+    );
+    assert.equal(calls.ledgerPublishes, 0);
+    assert.equal(calls.sealPublishes, 0);
+    assert.equal(calls.finalPublishes, 0);
     await assert.rejects(readFile(input.finalEvidencePath), { code: "ENOENT" });
   }
 });

@@ -111,6 +111,14 @@ function assertDecimal(value, code) {
   if (typeof value !== "string" || !DECIMAL.test(value) || value.length > 20) fail(code);
 }
 
+function formatUtcSecond(value, code = "REALDATA_CLOCK") {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) fail(code);
+  const floored = new Date(Math.floor(value.getTime() / 1000) * 1000);
+  const formatted = floored.toISOString().replace(".000Z", "Z");
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u.test(formatted)) fail(code);
+  return formatted;
+}
+
 function assertAggregateDecimal(value, code) {
   if (typeof value !== "string" || !DECIMAL.test(value) || value.length > 1000) fail(code);
 }
@@ -1244,7 +1252,7 @@ async function loadExternal(input, dependencies, { includeSnapshot } = { include
     sha256(tokensBytes) !== input.expectedTokensSha256
   ) fail("REALDATA_STARTUP_DIGEST");
   const readiness = validateFormalRunReadinessEnvelopeBytes(readinessBytes, {
-    currentTime: dependencies.now().toISOString().replace(".000Z", "Z"),
+    currentTime: formatUtcSecond(dependencies.now(), "REALDATA_CLOCK"),
     expectedBuildAttestationSha256: input.expectedReadinessBuildAttestationSha256,
     expectedCreateReceiptSha256: input.expectedCreateReceiptSha256,
     expectedDeleteReceiptSha256: input.expectedDeleteReceiptSha256,
@@ -1254,7 +1262,8 @@ async function loadExternal(input, dependencies, { includeSnapshot } = { include
   if (readiness.sha256 !== input.expectedReadinessSha256) fail("REALDATA_READINESS_DIGEST");
   if (readiness.record.quality_host.source_commit !== input.expectedSourceCommit) fail("REALDATA_SOURCE_COMMIT");
   if (fleursPolicy.policySha256 !== readiness.record.source.policy_sha256) fail("REALDATA_SOURCE_JOIN");
-  const controlledRootIdentity = await dependencies.controlledRootIdentityReader(input, readiness);
+  const controlledRootIdentity = await dependencies.controlledRootIdentityReader(input, readiness)
+    .catch((error) => fail("REALDATA_CONTROLLED_ROOT_IDENTITY", { cause: error }));
   assertControlledRootIdentity(readiness, controlledRootIdentity);
   if (shardHostAttestation.record.source.commit !== input.expectedSourceCommit) fail("REALDATA_SOURCE_COMMIT");
   if (shardHostAttestation.record.executable.runtime_bundle_sha256 !== input.expectedRuntimeBundleSha256) {
@@ -1420,10 +1429,10 @@ async function runCore(rawInput, dependencies) {
     aggregate,
     authority: { ...AUTHORITY },
     clock: {
-      finished_at_utc: finishedAt.toISOString().replace(".000Z", "Z"),
+      finished_at_utc: formatUtcSecond(finishedAt),
       monotonic_clock_domain: "process.hrtime.bigint",
       monotonic_duration_ns: monotonicDurationNs,
-      started_at_utc: startedAt.toISOString().replace(".000Z", "Z"),
+      started_at_utc: formatUtcSecond(startedAt),
     },
     corpus_identity: {
       manifest_sha256: initial.snapshot.record.materialization.manifest_sha256,
