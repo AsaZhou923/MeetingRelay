@@ -256,21 +256,25 @@ try {
     Set-ExactControlledAcl -Path $stressRoot
     $stressRetentionExpires = [DateTimeOffset]::UtcNow.AddDays(1).ToUnixTimeSeconds()
     $stressRetentionText = ([string]$stressRetentionExpires) + "`n"
+    $stressRetentionMarkerPath = Join-Path $stressRoot ".meetingrelay-retention-v1"
     [IO.File]::WriteAllText(
-        (Join-Path $stressRoot ".meetingrelay-retention-v1"),
+        $stressRetentionMarkerPath,
         $stressRetentionText,
         [Text.UTF8Encoding]::new($false)
     )
+    Set-ExactControlledAcl -Path $stressRetentionMarkerPath
     $stressDirectoryDepth = 4
     $stressLeafDirectory = $stressRoot
     for ($level = 1; $level -le $stressDirectoryDepth; $level++) {
         $stressLeafDirectory = Join-Path $stressLeafDirectory ("level-{0:D2}" -f $level)
         New-Item -ItemType Directory -Path $stressLeafDirectory | Out-Null
+        Set-ExactControlledAcl -Path $stressLeafDirectory
     }
     $stressFileCount = 1967
     for ($index = 0; $index -lt $stressFileCount; $index++) {
         $stressEntry = Join-Path $stressLeafDirectory ("entry-{0:D4}.bin" -f $index)
         [IO.File]::WriteAllBytes($stressEntry, [byte[]](0x5a))
+        Set-ExactControlledAcl -Path $stressEntry
     }
     $stressExpectedCount = 1 + $stressDirectoryDepth + $stressFileCount
     $stressExpectedBytes = $stressFileCount + [Text.Encoding]::UTF8.GetByteCount($stressRetentionText)
@@ -278,7 +282,11 @@ try {
     $stressSecondResult = Invoke-Attestor -Argument @("attest", $stressRoot)
     if ($stressFirstResult.ExitCode -ne 0 -or $stressFirstResult.Stderr.Length -ne 0 -or
         $stressSecondResult.ExitCode -ne 0 -or $stressSecondResult.Stderr.Length -ne 0) {
-        throw "Large recursive inventory did not attest successfully"
+        $stressFirstStdoutBytes = [Text.Encoding]::UTF8.GetByteCount($stressFirstResult.Stdout)
+        $stressFirstStderrBytes = [Text.Encoding]::UTF8.GetByteCount($stressFirstResult.Stderr)
+        $stressSecondStdoutBytes = [Text.Encoding]::UTF8.GetByteCount($stressSecondResult.Stdout)
+        $stressSecondStderrBytes = [Text.Encoding]::UTF8.GetByteCount($stressSecondResult.Stderr)
+        throw "Large recursive inventory did not attest successfully (first_exit=$($stressFirstResult.ExitCode), first_stdout_bytes=$stressFirstStdoutBytes, first_stderr_bytes=$stressFirstStderrBytes, second_exit=$($stressSecondResult.ExitCode), second_stdout_bytes=$stressSecondStdoutBytes, second_stderr_bytes=$stressSecondStderrBytes)"
     }
     $stressFirst = ConvertFrom-ReceiptLine -Line $stressFirstResult.Stdout -ExpectedMarker "CONTROLLED_ROOT_ATTESTATION=PASS"
     $stressSecond = ConvertFrom-ReceiptLine -Line $stressSecondResult.Stdout -ExpectedMarker "CONTROLLED_ROOT_ATTESTATION=PASS"
