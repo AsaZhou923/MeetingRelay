@@ -33,7 +33,11 @@ const KIND = "meetingrelay-native-candidate-realdata-shard-evidence-v1";
 const POLICY_KIND = "meetingrelay-native-candidate-realdata-shard-policy-v1";
 const REQUEST_KIND = "meetingrelay-native-candidate-realdata-shard-request-v1";
 const RESPONSE_KIND = "meetingrelay-native-candidate-quality-shard-response-v1";
-const VERSION = "1.0";
+const POLICY_SCHEMA_VERSION = "1.0";
+const RESPONSE_SCHEMA_VERSION = "1.0";
+const EVIDENCE_SCHEMA_VERSION = "1.1";
+const CANDIDATE_IDENTITY_SET_KIND = "meetingrelay-native-candidate-quality-shard-candidate-identity-set-v1";
+const CANDIDATE_IDENTITY_SET_SCHEMA_VERSION = "1.0";
 const SAMPLE_COUNT = 960;
 const DIGEST = /^(?!0{64}$)[0-9a-f]{64}$/u;
 const COMMIT = /^(?!0{40}$)[0-9a-f]{40}$/u;
@@ -234,7 +238,7 @@ function parseCanonicalLine(bytes, code) {
 function validatePolicy(policy) {
   exactKeys(policy, ["authority", "canary", "execution", "kind", "schema_version"], "REALDATA_POLICY");
   if (
-    policy.kind !== POLICY_KIND || policy.schema_version !== VERSION ||
+    policy.kind !== POLICY_KIND || policy.schema_version !== POLICY_SCHEMA_VERSION ||
     !isDeepStrictEqual(policy.authority, {
       formal_claims: "none",
       production_evidence: false,
@@ -819,7 +823,7 @@ function validateHostResponse(response, request, sample, expected) {
   const candidateIdentitySha256 = sha256(Buffer.from(encodeCanonicalJsonLine(response.candidate), "utf8"));
   const expectedSample = expectedResponseSampleIdentity(request, sample);
   if (
-    response.kind !== RESPONSE_KIND || response.schema_version !== VERSION ||
+    response.kind !== RESPONSE_KIND || response.schema_version !== RESPONSE_SCHEMA_VERSION ||
     response.execution.request_sequence !== request.request_sequence ||
     response.sample.sample_id !== request.sample_id ||
     response.sample.classification !== expectedSample.classification ||
@@ -873,6 +877,7 @@ function validateHostResponse(response, request, sample, expected) {
   return {
     attempt: 1,
     candidate_identity_sha256: candidateIdentitySha256,
+    candidate_parameter_sha256: response.candidate.parameter_sha256,
     component_record_sha256: sha256(Buffer.from(encodeCanonicalJsonLine({
       execution: {
         execute_elapsed_ns: response.execution.execute_elapsed_ns,
@@ -934,6 +939,23 @@ function assertNoPrivateOrPathLikeLeak(value, code, keyPath = []) {
 function validateDigestLanguageMap(value, code) {
   exactKeys(value, ["en", "ja", "zh"], code);
   for (const digest of Object.values(value)) assertDigest(digest, code);
+}
+
+function validateDistinctDigestLanguageMap(value, code) {
+  validateDigestLanguageMap(value, code);
+  if (new Set(Object.values(value)).size !== 3) fail(code);
+  return value;
+}
+
+function computeCandidateIdentityJoinSha256(candidateIdentityByLanguage, parameterSha256ByLanguage) {
+  const identityMap = validateDistinctDigestLanguageMap(candidateIdentityByLanguage, "REALDATA_HOST_IDENTITY");
+  const parameterMap = validateDistinctDigestLanguageMap(parameterSha256ByLanguage, "REALDATA_HOST_IDENTITY");
+  return sha256(Buffer.from(encodeCanonicalJsonLine({
+    candidate_identity_sha256_by_language: identityMap,
+    candidate_parameter_sha256_by_language: parameterMap,
+    kind: CANDIDATE_IDENTITY_SET_KIND,
+    schema_version: CANDIDATE_IDENTITY_SET_SCHEMA_VERSION,
+  }), "utf8"));
 }
 
 function validateStatusCountMap(value, allowed, code) {
@@ -1110,20 +1132,46 @@ function validateFinalExecution(value) {
 }
 
 function validateEvidenceRecord(record) {
+  if (
+    record !== null && typeof record === "object" && !Array.isArray(record) &&
+    (!Object.hasOwn(record, "host_identity") ||
+      !Object.hasOwn(record, "ledger_identity") ||
+      record.host_identity === null ||
+      record.ledger_identity === null ||
+      typeof record.host_identity !== "object" ||
+      typeof record.ledger_identity !== "object" ||
+      Array.isArray(record.host_identity) ||
+      Array.isArray(record.ledger_identity))
+  ) fail("REALDATA_HOST_IDENTITY");
   exactKeys(record, ROOT_KEYS, "REALDATA_EVIDENCE_FIELDS");
   if (
-    record.kind !== KIND || record.schema_version !== VERSION ||
+    record.kind !== KIND || record.schema_version !== EVIDENCE_SCHEMA_VERSION ||
     record.measurement_status !== "measured" ||
     record.quality_gate_status !== "not-assessed" ||
     !isDeepStrictEqual(record.authority, AUTHORITY) ||
-    record.execution.sample_count !== SAMPLE_COUNT ||
-    record.ledger_identity.entry_count !== SAMPLE_COUNT
+    record.execution.sample_count !== SAMPLE_COUNT
   ) fail("REALDATA_EVIDENCE");
   validatePublicAggregate(record.aggregate, record.scorer_identity);
   validateFinalExecution(record.execution);
   validateResourceObservationSummary(record.resource_observations);
-  assertDigest(record.host_identity.candidate_identity_sha256, "REALDATA_HOST_IDENTITY");
-  if (record.ledger_identity.candidate_identity_sha256 !== record.host_identity.candidate_identity_sha256) {
+  exactKeys(record.ledger_identity, [
+    "candidate_identity_join_sha256", "entry_count", "hardware_evidence_sha256",
+    "projection_sha256", "seal_sha256", "sha256",
+  ], "REALDATA_HOST_IDENTITY");
+  if (record.ledger_identity.entry_count !== SAMPLE_COUNT) fail("REALDATA_EVIDENCE");
+  exactKeys(record.host_identity, [
+    "build_attestation_sha256", "candidate_identity_join_sha256",
+    "candidate_identity_sha256_by_language", "candidate_parameter_sha256_by_language",
+    "executable_sha256", "source_commit", "source_tree_sha256",
+  ], "REALDATA_HOST_IDENTITY");
+  const expectedCandidateIdentityJoinSha256 = computeCandidateIdentityJoinSha256(
+    record.host_identity.candidate_identity_sha256_by_language,
+    record.host_identity.candidate_parameter_sha256_by_language,
+  );
+  if (
+    record.host_identity.candidate_identity_join_sha256 !== expectedCandidateIdentityJoinSha256 ||
+    record.ledger_identity.candidate_identity_join_sha256 !== expectedCandidateIdentityJoinSha256
+  ) {
     fail("REALDATA_HOST_IDENTITY");
   }
   if (record.ledger_identity.hardware_evidence_sha256 !== record.execution.run_resource_observations_sha256) {
@@ -1196,7 +1244,7 @@ function buildResourceObservations(entries) {
 
 function buildLedgerJoins(input, external, joins) {
   return {
-    candidate_identity_sha256: joins.candidateIdentitySha256,
+    candidate_identity_sha256: joins.candidateIdentityJoinSha256,
     corpus_manifest_sha256: external.snapshot.record.materialization.manifest_sha256,
     corpus_snapshot_sha256: external.snapshot.sha256,
     execution_host_sha256: external.shardHostAttestation.record.executable.sha256,
@@ -1325,7 +1373,8 @@ async function runCore(rawInput, dependencies) {
   const canaryIdentityByLanguage = new Map();
   const canaryTranscriptByLanguage = new Map();
   let canaryCount = 0;
-  let candidateIdentitySha256;
+  const candidateIdentityByLanguage = new Map();
+  const candidateParameterByLanguage = new Map();
   const startedAt = dependencies.now();
   const monotonicStart = dependencies.monotonicNow();
   for (const [shardIndex, shardSamples] of shards.entries()) {
@@ -1363,9 +1412,17 @@ async function runCore(rawInput, dependencies) {
         hostSha256: input.expectedShardHostSha256,
         startup: initial.startup,
       });
-      if (candidateIdentitySha256 === undefined) candidateIdentitySha256 = entry.candidate_identity_sha256;
-      else if (candidateIdentitySha256 !== entry.candidate_identity_sha256) fail("REALDATA_HOST_IDENTITY");
-      const { candidate_identity_sha256: _candidateIdentitySha256, ...ledgerEntry } = entry;
+      const priorCandidateIdentity = candidateIdentityByLanguage.get(entry.language);
+      if (priorCandidateIdentity === undefined) candidateIdentityByLanguage.set(entry.language, entry.candidate_identity_sha256);
+      else if (priorCandidateIdentity !== entry.candidate_identity_sha256) fail("REALDATA_HOST_IDENTITY");
+      const priorCandidateParameter = candidateParameterByLanguage.get(entry.language);
+      if (priorCandidateParameter === undefined) candidateParameterByLanguage.set(entry.language, entry.candidate_parameter_sha256);
+      else if (priorCandidateParameter !== entry.candidate_parameter_sha256) fail("REALDATA_HOST_IDENTITY");
+      const {
+        candidate_identity_sha256: _candidateIdentitySha256,
+        candidate_parameter_sha256: _candidateParameterSha256,
+        ...ledgerEntry
+      } = entry;
       responseRows.push({
         request,
         response: responses[index],
@@ -1401,11 +1458,16 @@ async function runCore(rawInput, dependencies) {
   const postRun = await loadExternal(input, dependencies, { includeSnapshot: false });
   assertExternalStable(initial, postRun);
 
-  if (candidateIdentitySha256 === undefined) fail("REALDATA_HOST_IDENTITY");
+  const candidateIdentitySha256ByLanguage = sortedObjectFromMap(candidateIdentityByLanguage);
+  const candidateParameterSha256ByLanguage = sortedObjectFromMap(candidateParameterByLanguage);
+  const candidateIdentityJoinSha256 = computeCandidateIdentityJoinSha256(
+    candidateIdentitySha256ByLanguage,
+    candidateParameterSha256ByLanguage,
+  );
   const resourceObservations = buildResourceObservations(responseRows);
   const hardwareEvidenceSha256 = sha256(Buffer.from(encodeCanonicalJsonLine(resourceObservations), "utf8"));
   const ledgerJoins = buildLedgerJoins(input, initial, {
-    candidateIdentitySha256,
+    candidateIdentityJoinSha256,
     hardwareEvidenceSha256,
   });
   const ledger = buildControlledHypothesisLedger({ entries: ledgerEntries, joins: ledgerJoins });
@@ -1460,7 +1522,9 @@ async function runCore(rawInput, dependencies) {
     },
     host_identity: {
       build_attestation_sha256: initial.shardHostAttestation.sha256,
-      candidate_identity_sha256: candidateIdentitySha256,
+      candidate_identity_join_sha256: candidateIdentityJoinSha256,
+      candidate_identity_sha256_by_language: candidateIdentitySha256ByLanguage,
+      candidate_parameter_sha256_by_language: candidateParameterSha256ByLanguage,
       executable_sha256: initial.shardHostAttestation.record.executable.sha256,
       source_commit: initial.shardHostAttestation.record.source.commit,
       source_tree_sha256: initial.shardHostAttestation.record.source.tree_sha256,
@@ -1468,7 +1532,7 @@ async function runCore(rawInput, dependencies) {
     kind: KIND,
     ledger_identity: {
       entry_count: SAMPLE_COUNT,
-      candidate_identity_sha256: candidateIdentitySha256,
+      candidate_identity_join_sha256: candidateIdentityJoinSha256,
       hardware_evidence_sha256: hardwareEvidenceSha256,
       projection_sha256: seal.projectionSha256,
       seal_sha256: seal.sealSha256,
@@ -1485,7 +1549,7 @@ async function runCore(rawInput, dependencies) {
       readiness_sha256: initial.readiness.sha256,
     },
     resource_observations: resourceObservations,
-    schema_version: VERSION,
+    schema_version: EVIDENCE_SCHEMA_VERSION,
     scorer_identity: getAsrScorerProfile(),
     source_identity: {
       commit: input.expectedSourceCommit,

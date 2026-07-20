@@ -47,6 +47,11 @@ const ROOT_OPERATOR_SID_SHA256 = "d".repeat(64);
 const CORPUS_MANIFEST_SHA256 = "8".repeat(64);
 const CORPUS_PROJECTION_SHA256 = "9".repeat(64);
 const CORPUS_SNAPSHOT_SHA256 = "b".repeat(64);
+const PARAMETER_SHA256_BY_LANGUAGE = Object.freeze({
+  en: "f411caf1efd92b18b953c3bfd0bf6a4eb49d18068554ce9e70d8a493d325065d",
+  ja: "946af178a84c720f928d08ed084fe37625a57447b2ad8e8dc5d36034ea319bf5",
+  zh: "0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e",
+});
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -65,6 +70,27 @@ function sampleIdentitySha256(sample) {
     wav_sha256: sample.wav_sha256,
     wav_size_bytes: sample.wav_size_bytes,
   }), "utf8"));
+}
+
+function candidateIdentityJoinSha256(candidateIdentityByLanguage, candidateParameterSha256ByLanguage) {
+  return sha256(Buffer.from(encodeCanonicalJsonLine({
+    candidate_identity_sha256_by_language: candidateIdentityByLanguage,
+    candidate_parameter_sha256_by_language: candidateParameterSha256ByLanguage,
+    kind: "meetingrelay-native-candidate-quality-shard-candidate-identity-set-v1",
+    schema_version: "1.0",
+  }), "utf8"));
+}
+
+function expectedCandidateIdentitySha256ByLanguage(input) {
+  return Object.fromEntries(["en", "ja", "zh"].map((language) => [language, sha256(Buffer.from(encodeCanonicalJsonLine({
+    asset_lock_sha256: input.expectedAssetLockSha256,
+    candidate_id: "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu",
+    model_sha256: input.expectedModelSha256,
+    package_lock_sha256: input.expectedPackageLockSha256,
+    parameter_sha256: PARAMETER_SHA256_BY_LANGUAGE[language],
+    runtime_bundle_sha256: input.expectedRuntimeBundleSha256,
+    tokens_sha256: input.expectedTokensSha256,
+  }), "utf8"))]));
 }
 
 function languageFor(index) {
@@ -374,6 +400,12 @@ function mockDependencies({ responses, hooks = {} } = {}) {
             ? (responses?.canaryDrift && invokeCalls > 1 ? "drifted canary" : "stable canary")
             : referenceFor(language);
           const transcriptBytes = Buffer.from(transcript, "utf8");
+          const candidateId = responses?.candidateIdentityDrift && language === "en" && invokeCalls > 1
+            ? "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu-drift"
+            : "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu";
+          const parameterSha256 = responses?.duplicateLanguageParameter && language === "ja"
+            ? PARAMETER_SHA256_BY_LANGUAGE.zh
+            : PARAMETER_SHA256_BY_LANGUAGE[language];
           const response = {
             authority: responses?.missingHostAuthority
               ? undefined
@@ -384,10 +416,10 @@ function mockDependencies({ responses, hooks = {} } = {}) {
                 },
             candidate: {
               asset_lock_sha256: startupIdentities.asset_lock_sha256,
-              candidate_id: "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu",
+              candidate_id: candidateId,
               model_sha256: startupIdentities.model_sha256,
               package_lock_sha256: startupIdentities.package_lock_sha256,
-              parameter_sha256: "d".repeat(64),
+              parameter_sha256: parameterSha256,
               runtime_bundle_sha256: startupIdentities.runtime_bundle_sha256,
               tokens_sha256: startupIdentities.tokens_sha256,
             },
@@ -538,6 +570,17 @@ test("real-data runner partitions 960 samples, uses fresh shard processes, exclu
   assert.equal(result.record.execution.shards.every((shard) => shard.sample_count === 64), true);
   assert.equal(result.record.execution.shards.every((shard) => shard.canary_count === 2), true);
   assert.equal(calls.startupLog.every((argv) => argv[7] === "66"), true);
+  const expectedCandidateIdentityByLanguage = expectedCandidateIdentitySha256ByLanguage(input);
+  const expectedCandidateIdentityJoinSha256 = candidateIdentityJoinSha256(
+    expectedCandidateIdentityByLanguage,
+    PARAMETER_SHA256_BY_LANGUAGE,
+  );
+  assert.deepEqual(result.record.host_identity.candidate_identity_sha256_by_language, expectedCandidateIdentityByLanguage);
+  assert.deepEqual(result.record.host_identity.candidate_parameter_sha256_by_language, PARAMETER_SHA256_BY_LANGUAGE);
+  assert.equal(result.record.host_identity.candidate_identity_join_sha256, expectedCandidateIdentityJoinSha256);
+  assert.equal(result.record.ledger_identity.candidate_identity_join_sha256, expectedCandidateIdentityJoinSha256);
+  assert.equal("candidate_identity_sha256" in result.record.host_identity, false);
+  assert.equal("candidate_identity_sha256" in result.record.ledger_identity, false);
   assert.equal(calls.shardRequestLog.length, 15);
   assert.deepEqual(calls.shardRequestLog[0].map((request) => request.request_sequence), Array.from({ length: 66 }, (_, index) => index + 1));
   assert.deepEqual(calls.shardRequestLog[1].map((request) => request.request_sequence), Array.from({ length: 66 }, (_, index) => index + 1));
@@ -574,6 +617,7 @@ test("real-data runner partitions 960 samples, uses fresh shard processes, exclu
   assert.equal(result.record.resource_observations.status_counts.unavailable, 975);
   const ledger = await readControlledHypothesisLedger(input.controlledRoot, input.ledgerRelativePath);
   assert.deepEqual(ledger.record.entries.map((entry) => entry.sequence), Array.from({ length: 960 }, (_, index) => index + 1));
+  assert.equal(ledger.record.joins.candidate_identity_sha256, expectedCandidateIdentityJoinSha256);
   const text = await readFile(input.finalEvidencePath, "utf8");
   assert.equal(text.includes(input.controlledRoot), false);
   assert.equal(text.includes("hello world"), false);
@@ -753,6 +797,8 @@ test("shard response omission duplicate reorder reset drift timeout and resource
     ["missing-authority", { missingHostAuthority: true }, "REALDATA_HOST_AUTHORITY"],
     ["extra-authority", { extraHostAuthority: true }, "REALDATA_HOST_AUTHORITY"],
     ["escalated-authority", { hostAuthorityEscalation: true }, "REALDATA_HOST_AUTHORITY"],
+    ["same-language-candidate-drift", { candidateIdentityDrift: true }, "REALDATA_HOST_IDENTITY"],
+    ["duplicate-language-parameter", { duplicateLanguageParameter: true }, "REALDATA_HOST_IDENTITY"],
   ]) {
     const { input } = await makeContext(t);
     const { dependencies } = mockDependencies({ responses });
@@ -823,8 +869,22 @@ test("strict final validator rejects quality authority escalation and selected/d
     (record) => { record.resource_observations.status_counts.available = 1; },
     (record) => { record.resource_observations.supervisor_process_status_counts.observed = 1; },
     (record) => { record.ledger_identity.hardware_evidence_sha256 = "a".repeat(64); },
+    (record) => { record.host_identity = null; },
+    (record) => { record.ledger_identity = null; },
     (record) => { record.host_identity.reference_text = "stable canary"; },
     (record) => { record.host_identity.file_path = "C:\\controlled\\private\\x.wav"; },
+    (record) => { record.host_identity.candidate_identity_sha256 = "a".repeat(64); },
+    (record) => { delete record.host_identity.candidate_identity_sha256_by_language.ja; },
+    (record) => { record.host_identity.candidate_identity_sha256_by_language.fr = "a".repeat(64); },
+    (record) => { record.host_identity.candidate_identity_sha256_by_language.en = "0".repeat(64); },
+    (record) => { record.host_identity.candidate_identity_sha256_by_language.ja = record.host_identity.candidate_identity_sha256_by_language.zh; },
+    (record) => { delete record.host_identity.candidate_parameter_sha256_by_language.ja; },
+    (record) => { record.host_identity.candidate_parameter_sha256_by_language.fr = "a".repeat(64); },
+    (record) => { record.host_identity.candidate_parameter_sha256_by_language.en = "0".repeat(64); },
+    (record) => { record.host_identity.candidate_parameter_sha256_by_language.ja = record.host_identity.candidate_parameter_sha256_by_language.zh; },
+    (record) => { record.host_identity.candidate_identity_join_sha256 = "a".repeat(64); },
+    (record) => { record.ledger_identity.candidate_identity_join_sha256 = "a".repeat(64); },
+    (record) => { record.ledger_identity.candidate_identity_sha256 = record.ledger_identity.candidate_identity_join_sha256; },
     (record) => { record.aggregate = {}; },
     (record) => { record.aggregate.extra = true; },
     (record) => { record.aggregate.authority.production_evidence = true; },
@@ -845,6 +905,23 @@ test("strict final validator rejects quality authority escalation and selected/d
         Buffer.from(encodeCanonicalJsonLine(mutated), "utf8"),
       ),
       (error) => error instanceof NativeCandidateRealdataShardRunnerError,
+    );
+  }
+  for (const mutate of [
+    (record) => { delete record.host_identity; },
+    (record) => { delete record.ledger_identity; },
+    (record) => { record.host_identity = null; },
+    (record) => { record.ledger_identity = null; },
+  ]) {
+    const mutated = clone(baseline);
+    mutate(mutated);
+    assert.throws(
+      () => validateNativeCandidateRealdataShardEvidenceRecord(
+        Buffer.from(encodeCanonicalJsonLine(mutated), "utf8"),
+      ),
+      (error) =>
+        error instanceof NativeCandidateRealdataShardRunnerError &&
+        error.code === "REALDATA_HOST_IDENTITY",
     );
   }
 });
@@ -932,6 +1009,15 @@ test("schema freezes public root shape and authority ceilings", async (t) => {
   ));
   assert.equal(schema.additionalProperties, false);
   assert.deepEqual([...schema.required].sort(), Object.keys(result.record).sort());
+  assert.equal(schema.properties.schema_version.const, "1.1");
+  assert.deepEqual(
+    [...schema.properties.host_identity.required].sort(),
+    Object.keys(result.record.host_identity).sort(),
+  );
+  assert.deepEqual(
+    [...schema.properties.ledger_identity.required].sort(),
+    Object.keys(result.record.ledger_identity).sort(),
+  );
   assert.equal(schema.properties.measurement_status.const, "measured");
   assert.equal(schema.properties.quality_gate_status.const, "not-assessed");
   assert.equal(schema.$defs.publicAuthority.properties.formal_claims.const, "none");

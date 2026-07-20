@@ -59,26 +59,28 @@
       "additionalProperties": false,
       "properties": {
         "build_attestation_sha256": { "$ref": "#/$defs/digest" },
-        "candidate_identity_sha256": { "$ref": "#/$defs/digest" },
+        "candidate_identity_join_sha256": { "$ref": "#/$defs/digest" },
+        "candidate_identity_sha256_by_language": { "$ref": "#/$defs/languageDigestMap" },
+        "candidate_parameter_sha256_by_language": { "$ref": "#/$defs/languageDigestMap" },
         "executable_sha256": { "$ref": "#/$defs/digest" },
         "source_commit": { "$ref": "#/$defs/commit" },
         "source_tree_sha256": { "$ref": "#/$defs/digest" }
       },
-      "required": ["build_attestation_sha256", "candidate_identity_sha256", "executable_sha256", "source_commit", "source_tree_sha256"],
+      "required": ["build_attestation_sha256", "candidate_identity_join_sha256", "candidate_identity_sha256_by_language", "candidate_parameter_sha256_by_language", "executable_sha256", "source_commit", "source_tree_sha256"],
       "type": "object"
     },
     "kind": { "const": "meetingrelay-native-candidate-realdata-shard-evidence-v1" },
     "ledger_identity": {
       "additionalProperties": false,
       "properties": {
-        "candidate_identity_sha256": { "$ref": "#/$defs/digest" },
+        "candidate_identity_join_sha256": { "$ref": "#/$defs/digest" },
         "entry_count": { "const": 960 },
         "hardware_evidence_sha256": { "$ref": "#/$defs/digest" },
         "projection_sha256": { "$ref": "#/$defs/digest" },
         "seal_sha256": { "$ref": "#/$defs/digest" },
         "sha256": { "$ref": "#/$defs/digest" }
       },
-      "required": ["candidate_identity_sha256", "entry_count", "hardware_evidence_sha256", "projection_sha256", "seal_sha256", "sha256"],
+      "required": ["candidate_identity_join_sha256", "entry_count", "hardware_evidence_sha256", "projection_sha256", "seal_sha256", "sha256"],
       "type": "object"
     },
     "measurement_status": { "const": "measured" },
@@ -102,7 +104,7 @@
       "type": "object"
     },
     "resource_observations": { "$ref": "#/$defs/resourceObservationSummary" },
-    "schema_version": { "const": "1.0" },
+    "schema_version": { "const": "1.1" },
     "scorer_identity": {
       "additionalProperties": false,
       "properties": {
