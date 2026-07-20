@@ -30,6 +30,8 @@ mod candidate_execution;
 mod candidate_fault;
 #[cfg(feature = "native-quality-sample")]
 mod candidate_quality_sample;
+#[cfg(feature = "native-quality-shard")]
+mod candidate_quality_shard;
 mod realtime;
 mod worker_provenance;
 
@@ -51,6 +53,11 @@ pub use candidate_fault::{NATIVE_CANDIDATE_FAULT_CHECKPOINT_KIND, NativeCandidat
 pub use candidate_quality_sample::{
     NativeCandidateQualitySampleError, NativeCandidateQualitySampleIdentity,
     NativeCandidateQualitySampleInput, run_locked_native_candidate_quality_sample,
+};
+#[cfg(feature = "native-quality-shard")]
+pub use candidate_quality_shard::{
+    NativeCandidateQualityShardError, NativeCandidateQualityShardInput,
+    run_locked_native_candidate_quality_shard,
 };
 pub use realtime::{
     LOCKED_REALTIME_MAX_PCM16_BYTES, LOCKED_REALTIME_SAMPLE_RATE_HZ, LockedSherpaRealtime,

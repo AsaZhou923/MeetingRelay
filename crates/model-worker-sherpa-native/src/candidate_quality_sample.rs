@@ -24,13 +24,13 @@ use crate::{
     locked_schema_registry_sha256, locked_worker_manifest, sha256_file,
 };
 
-const SAMPLE_RATE_HZ: u32 = 16_000;
-const CHANNELS: u16 = 1;
-const PCM_BYTES_PER_SAMPLE: u64 = 2;
-const NANOS_PER_SAMPLE: u64 = 62_500;
-const MIN_WAV_BYTES: u64 = 44;
-const MAX_WAV_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TRANSCRIPT_UTF8_BYTES: usize = 16_384;
+pub(crate) const SAMPLE_RATE_HZ: u32 = 16_000;
+pub(crate) const CHANNELS: u16 = 1;
+pub(crate) const PCM_BYTES_PER_SAMPLE: u64 = 2;
+pub(crate) const NANOS_PER_SAMPLE: u64 = 62_500;
+pub(crate) const MIN_WAV_BYTES: u64 = 44;
+pub(crate) const MAX_WAV_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_TRANSCRIPT_UTF8_BYTES: usize = 16_384;
 const MAX_RECORD_BYTES: usize = 4_096 + (MAX_TRANSCRIPT_UTF8_BYTES * 6);
 const RESOURCE_UNAVAILABLE_REASON: &str = "SHERPA_QUALITY_RESOURCE_SAMPLING_UNAVAILABLE";
 static QUALITY_SAMPLE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -60,16 +60,16 @@ pub struct NativeCandidateQualitySampleInput {
 }
 
 #[derive(Clone)]
-struct ResolvedNativeCandidateQualitySampleInput {
-    executable_path: PathBuf,
-    schema_registry_path: PathBuf,
-    model_path: PathBuf,
-    tokens_path: PathBuf,
-    runtime_lib_dir: PathBuf,
-    asset_lock_path: PathBuf,
-    package_lock_path: PathBuf,
-    wav_path: PathBuf,
-    sample: NativeCandidateQualitySampleIdentity,
+pub(crate) struct ResolvedNativeCandidateQualitySampleInput {
+    pub(crate) executable_path: PathBuf,
+    pub(crate) schema_registry_path: PathBuf,
+    pub(crate) model_path: PathBuf,
+    pub(crate) tokens_path: PathBuf,
+    pub(crate) runtime_lib_dir: PathBuf,
+    pub(crate) asset_lock_path: PathBuf,
+    pub(crate) package_lock_path: PathBuf,
+    pub(crate) wav_path: PathBuf,
+    pub(crate) sample: NativeCandidateQualitySampleIdentity,
 }
 
 impl NativeCandidateQualitySampleInput {
@@ -266,11 +266,11 @@ impl QualityTranscriptIdentity {
     }
 }
 
-struct VerifiedQualityWav {
-    samples: Vec<i16>,
-    pcm_bytes: u64,
-    sample_count: u64,
-    audio_duration_ns: u64,
+pub(crate) struct VerifiedQualityWav {
+    pub(crate) samples: Vec<i16>,
+    pub(crate) pcm_bytes: u64,
+    pub(crate) sample_count: u64,
+    pub(crate) audio_duration_ns: u64,
 }
 
 struct QualityMeasurement {
@@ -350,7 +350,7 @@ fn validate_input(
     Ok(())
 }
 
-fn locked_config(
+pub(crate) fn locked_config(
     input: &ResolvedNativeCandidateQualitySampleInput,
 ) -> Result<SherpaNativeConfig, NativeCandidateQualitySampleError> {
     let descriptor = locked_engine_descriptor();
@@ -380,7 +380,7 @@ fn locked_config(
     Ok(config)
 }
 
-fn read_verified_quality_wav(
+pub(crate) fn read_verified_quality_wav(
     input: &ResolvedNativeCandidateQualitySampleInput,
 ) -> Result<VerifiedQualityWav, NativeCandidateQualitySampleError> {
     reject_reparse_ancestors(&input.wav_path)?;
@@ -534,7 +534,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, NativeCandidateQualitySa
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
-fn canonical_sample_identity_sha256(sample: &NativeCandidateQualitySampleIdentity) -> Sha256Digest {
+pub(crate) fn canonical_sample_identity_sha256(
+    sample: &NativeCandidateQualitySampleIdentity,
+) -> Sha256Digest {
     let material = format!(
         concat!(
             "{{\"language\":\"{}\",\"pcm_sha256\":\"{}\",",
@@ -642,7 +644,7 @@ fn encode_record(
     Ok(output.into_bytes())
 }
 
-fn write_canonical_json_string(
+pub(crate) fn write_canonical_json_string(
     output: &mut String,
     value: &str,
 ) -> Result<(), NativeCandidateQualitySampleError> {
@@ -670,7 +672,7 @@ fn locked_digest(value: &str) -> Result<Sha256Digest, NativeCandidateQualitySamp
         .map_err(|_| NativeCandidateQualitySampleError::Configuration)
 }
 
-fn current_regular_executable() -> Result<PathBuf, NativeCandidateQualitySampleError> {
+pub(crate) fn current_regular_executable() -> Result<PathBuf, NativeCandidateQualitySampleError> {
     let executable =
         std::env::current_exe().map_err(|_| NativeCandidateQualitySampleError::Provenance)?;
     reject_reparse_ancestors(&executable)?;
@@ -682,7 +684,9 @@ fn current_regular_executable() -> Result<PathBuf, NativeCandidateQualitySampleE
     Ok(executable)
 }
 
-fn validate_regular_non_reparse_file(path: &Path) -> Result<(), NativeCandidateQualitySampleError> {
+pub(crate) fn validate_regular_non_reparse_file(
+    path: &Path,
+) -> Result<(), NativeCandidateQualitySampleError> {
     reject_reparse_ancestors(path)?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| NativeCandidateQualitySampleError::AssetUnavailable)?;

@@ -12,6 +12,7 @@ default = []
 native-sherpa = ["dep:sherpa-onnx"]
 native-fault-fixture = []
 native-quality-sample = ["native-sherpa"]
+native-quality-shard = ["native-quality-sample"]
 
 [dependencies]
 meetingrelay-model-worker-contract = { path = "../model-worker-contract" }
@@ -39,6 +40,13 @@ bench = false
 name = "meetingrelay-sherpa-candidate-quality-host"
 path = "src/bin/meetingrelay_sherpa_candidate_quality_host.rs"
 required-features = ["native-quality-sample"]
+test = false
+bench = false
+
+[[bin]]
+name = "meetingrelay-sherpa-candidate-quality-shard-host"
+path = "src/bin/meetingrelay_sherpa_candidate_quality_shard_host.rs"
+required-features = ["native-quality-shard"]
 test = false
 bench = false
 

@@ -1183,6 +1183,16 @@ async function invokeNativeAttestor(input) {
   return Buffer.from(encodeCanonicalJsonLine(record), "utf8");
 }
 
+export async function attestFormalRunControlledRootIdentity(input) {
+  const bytes = await invokeNativeAttestor(input);
+  return validateNativeControlledRootAttestationBytes(bytes, {
+    controlledRoot: input.controlledRoot,
+    expectedPolicySha256: input.expectedPolicySha256,
+    expectedRetentionExpiresAt: input.expectedRetentionExpiresAt,
+    policy: buildFormalRunTrustPolicy().policy,
+  });
+}
+
 async function defaultBuildAttestationReader(input) {
   const stable = await readStableRegularFile(input.buildAttestationPath, "FORMAL_TRUST_HOST_ATTESTATION");
   const digest = sha256(stable.bytes);

@@ -421,6 +421,7 @@ subjectTest("module exports only the formal trust, readiness, and cleanup contra
     "__cleanupControlledArtifactForTest",
     "__publishFormalRunReadinessEnvelopeForTest",
     "assessFormalRunReadiness",
+    "attestFormalRunControlledRootIdentity",
     "buildFormalRunReadinessEnvelope",
     "buildFormalRunTrustPolicy",
     "cleanupControlledArtifact",

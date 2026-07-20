@@ -169,9 +169,38 @@ pnpm phase0:sherpa-quality-foundation:test
 pnpm phase0:sherpa-quality-foundation:validate <absolute-evidence-path>
 pnpm phase0:sherpa-quality-evidence:validate <absolute-final-evidence-path>
 pnpm phase0:sherpa-fleurs-gold-source:test
+pnpm phase0:sherpa-realdata-shard:test
 ```
 
 There is intentionally no `phase0:sherpa-quality-foundation:run` script. An authorized caller must invoke the one-argument programmatic runner with all external trust anchors and controlled output locations. Even a successful run under the committed policy establishes only scorer mechanics; lawful independent-gold data, frozen thresholds, approvals, and written distribution authority remain separate prerequisites for any real quality or product decision.
+
+## FLEURS 960 materialization and real-data shard runner
+
+`fleurs-materialized-corpus.mjs` is the WP-0.4.3o materialization boundary. It consumes the frozen FLEURS source selection, pinned archive identities, and a caller-controlled root, publishes one create-new snapshot directory under `controlledRoot/snapshots/<snapshotId>`, and writes the accepted `corpus-manifest.json` plus a text-free `materialization-public-evidence.json`. That public evidence contains only digests, counts, source status, validation date, and the fixed authority ceiling; it rejects filenames, paths, URLs, references, transcripts, and distribution claims. The private audio/reference materials remain under the controlled root.
+
+Actual snapshot materialization is an operator action from a compact canonical JSON-line input file. The input object must provide absolute local paths for the controlled root, dataset card, policy, TSV files, and three local FLEURS archive files plus the externally pinned policy/archive digests.
+
+```powershell
+pnpm phase0:sherpa-fleurs-materialize:run <absolute-input-json>
+```
+
+The publisher uses the hardened Windows create-new directory primitive; a preexisting or concurrently appearing `snapshots/<snapshotId>` directory is preserved and the run fails closed with retained staging residue for later audited cleanup.
+
+`quality-shard-host-source-build-attestor.mjs` is separate from the earlier single-sample `quality-host-source-build-attestor.mjs`. The formal-readiness envelope still proves the controlled root and frozen FLEURS source policy, but it must not be reused as proof of the shard host. The shard-host attestation binds the distinct `meetingrelay-sherpa-candidate-quality-shard-host` Release binary, `native-quality-shard,native-sherpa` feature closure, clean source commit, Cargo/toolchain digests, PE hardening, import table, and runtime bundle identity. The runner requires this separate attestation before executing any shard.
+
+`native-candidate-realdata-shard-runner.mjs` consumes an already materialized snapshot exactly once through `quality-corpus`, then runs bounded single-language shards through one fresh OS process per shard. It sends ordered sample requests using the Rust shard host's strict nine-argument startup contract and exact-order stdin JSON, and interleaves sealed canaries at the policy cadence fixed by `native-candidate-realdata-shard-policy.json` (SHA-256 `9a76fa1602bde8a277551b5f2d4b3b964a2215bb4b2f049e478703f08a0e6260`). The policy distinguishes the maximum 64 scored samples per shard from the finite total host-request limit: with cadence 32, every 64-scored shard carries exactly two canary requests, so the Rust host `maxRequestCount` argument is fixed to 66 and any larger shard request set fails before spawn. The timeout is bounded at 900,000 ms for a 64-scored-sample / 66-host-request shard so the first actual descriptive run is not invalidated by an arbitrary two-minute cap; it is not a throughput or performance claim. Canary transcript identity is tracked per language/canary identity, every shard receives at least one canary, and canary rows are excluded from the private ledger and all scoring. Omission, duplication, reorder, shard/process failure, timeout, fresh-process/stream flag drift, canary drift, source/root/host/policy/corpus identity drift, malformed clock/resource data, or final-publication ambiguity fails closed.
+
+The final public evidence is text-free and path-free. It binds the exact FLEURS policy, materialization evidence, corpus manifest/snapshot, live readiness, separate shard-host source/build attestation, host executable, canonical Rust response candidate identity, source commit, scorer profile, private ledger, seal, and a canonical SHA of the run's text-free resource observations. It reports `measurement_status=measured`, raw UTC wall timestamps, `process.hrtime.bigint` monotonic duration, 960 sample count, shard/canary counts, exact `en`/`ja`/`zh` canary digest maps, descriptive per-language CER/WER aggregate, Rust host resource counts using `observed|unavailable`, and separate Node supervisor process-resource counts using `available|unavailable`. It hard-codes `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, and `public_distribution=false`; threshold, pass/fail, rank, selection, default, publication, and product-readiness fields are rejected.
+
+```powershell
+pnpm phase0:sherpa-realdata-shard:test
+
+# Actual runs require a canonical input JSON with only explicit local paths and expected SHA-256 anchors.
+pnpm phase0:sherpa-realdata-shard:run <absolute-input-json>
+pnpm phase0:sherpa-realdata-shard:validate <absolute-final-evidence-path>
+```
+
+CI exercises this lane only with offline fixtures and mock shard processes. It never downloads FLEURS, uploads private artifacts, publishes audio/transcripts, or claims a threshold. The actual controlled-root/materialized-corpus/shard-host run is an operator action after the source-bound shard-host attestation exists for the exact clean commit.
 
 ## Formal-run trust envelope
 
@@ -192,4 +221,4 @@ node tools/sherpa-native/quality-host-source-build-attestor.mjs --attest <canoni
 node tools/sherpa-native/formal-run-trust-envelope.mjs --assess <canonical-input-json>
 ```
 
-The highest authority is `ready-for-materialization-only`: `execution_status=not-run`, `materialization_status=not-run`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, and `public_distribution=false`. These tools contain no archive extraction, corpus materialization, transcript scoring, or model-execution API and do not alter the realtime inference path. Actual 960-item materialization and bounded descriptive execution remain WP-0.4.3o.
+The highest authority is `ready-for-materialization-only`: `execution_status=not-run`, `materialization_status=not-run`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, and `public_distribution=false`. These tools do not alter the realtime inference path and do not attest the WP-0.4.3o shard host. Actual 960-item materialization and bounded descriptive execution are handled by the separate WP-0.4.3o lane above.

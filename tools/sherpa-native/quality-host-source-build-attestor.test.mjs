@@ -15,6 +15,7 @@ import {
   runQualityHostSourceBuildAttestorCli,
   verifyQualityHostSourceBuildAttestationLive,
 } from "./quality-host-source-build-attestor.mjs";
+import * as shardProfileAttestor from "./quality-host-source-build-attestor.mjs?profile=shard";
 
 const COMMIT = "a".repeat(40);
 const QUALITY_HOST = "meetingrelay-sherpa-candidate-quality-host";
@@ -519,6 +520,79 @@ test("successful fixture emits the strict formal build attestation without launc
     new Set(fx.state.commands.map(({ executable }) => pathKey(executable))),
     new Set(Object.values(fx.toolPaths).map(pathKey)),
   );
+});
+
+test("module profile defaults to sample and explicit shard switches only identity constants", async () => {
+  const fx = fixture();
+  const shardHost = "meetingrelay-sherpa-candidate-quality-shard-host";
+  const shardHostExe = `${shardHost}.exe`;
+  const shardBuildTargetRoot = path.win32.join(
+    fx.repoRoot,
+    "target",
+    "sherpa-native",
+    "formal-run-trust",
+    "quality-shard-host-builds",
+    COMMIT,
+  );
+  const shardReleaseDir = path.win32.join(shardBuildTargetRoot, "release");
+  const shardExecutablePath = path.win32.join(shardReleaseDir, shardHostExe);
+  fx.state.files.set(pathKey(shardExecutablePath), peFixture());
+  for (const [name, bytes] of fx.runtime.filter(([name]) => name.endsWith(".dll"))) {
+    fx.state.files.set(pathKey(path.win32.join(shardReleaseDir, name)), bytes);
+  }
+  fx.state.releaseEntries = [
+    { kind: "file", name: shardHostExe },
+    ...fx.runtime.filter(([name]) => name.endsWith(".dll")).map(([name]) => ({ kind: "file", name })),
+  ];
+  fx.state.cargoStdout = `${JSON.stringify(cargoArtifact(shardExecutablePath, {
+    executable: shardExecutablePath,
+    features: ["native-quality-shard", "native-sherpa"],
+    filenames: [shardExecutablePath],
+    target: {
+      name: shardHost,
+      src_path: "C:\\repo\\crates\\model-worker-sherpa-native\\src\\bin\\meetingrelay_sherpa_candidate_quality_shard_host.rs",
+    },
+  }))}\n`;
+  fx.ops.bindBuildTarget = async (request) => {
+    fx.state.buildTargetBindCalls.push({ ...request });
+    if (pathKey(request.buildTargetRoot) !== pathKey(shardBuildTargetRoot)) {
+      throw Object.assign(new Error("unexpected build target"), { code: "EINVAL" });
+    }
+    if (request.requireAbsent) {
+      if (fx.state.buildTargetExists) throw Object.assign(new Error("exists"), { code: "EEXIST" });
+      fx.state.buildTargetExists = true;
+    } else if (!fx.state.buildTargetExists) {
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    }
+    return Object.freeze({ token: "shard-binding" });
+  };
+  const listDirectory = fx.ops.listDirectory;
+  fx.ops.listDirectory = async (directory) => {
+    if (pathKey(directory) === pathKey(shardReleaseDir)) return fx.state.releaseEntries;
+    return listDirectory(directory);
+  };
+  const result = await shardProfileAttestor.__attestQualityHostSourceBuildForTest(fx.input, fx.ops);
+  assert.equal(result.record.kind, "meetingrelay-quality-shard-host-source-build-attestation-v1");
+  assert.deepEqual(result.record.cargo.features, ["native-quality-shard", "native-sherpa"]);
+  assert.equal(result.record.executable.filename, shardHostExe);
+  assert.deepEqual(
+    fx.state.commands.find(({ executable, args }) => executableName(executable) === "cargo.exe" && args[0] === "build")?.args,
+    [
+      "build",
+      "--release",
+      "-p",
+      "meetingrelay-model-worker-sherpa-native",
+      "--no-default-features",
+      "--features",
+      "native-quality-shard",
+      "--bin",
+      shardHost,
+      "--message-format=json",
+      "--offline",
+      "--locked",
+    ],
+  );
+  assert.equal(fx.state.buildTargetBindCalls[0].buildTargetRoot, shardBuildTargetRoot);
 });
 
 test("attestor requires an unused commit-scoped Cargo target before building", async () => {

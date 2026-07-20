@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregate": { "$ref": "#/$defs/asrAggregate" },
+    "authority": { "$ref": "#/$defs/publicAuthority" },
+    "clock": {
+      "additionalProperties": false,
+      "properties": {
+        "finished_at_utc": { "type": "string" },
+        "monotonic_clock_domain": { "const": "process.hrtime.bigint" },
+        "monotonic_duration_ns": { "$ref": "#/$defs/decimal" },
+        "started_at_utc": { "type": "string" }
+      },
+      "required": ["finished_at_utc", "monotonic_clock_domain", "monotonic_duration_ns", "started_at_utc"],
+      "type": "object"
+    },
+    "corpus_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_sha256": { "$ref": "#/$defs/digest" },
+        "sample_count": { "const": 960 },
+        "snapshot_sha256": { "$ref": "#/$defs/digest" },
+        "text_free_projection_sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["manifest_sha256", "sample_count", "snapshot_sha256", "text_free_projection_sha256"],
+      "type": "object"
+    },
+    "execution": {
+      "additionalProperties": false,
+      "properties": {
+        "canary_count": { "minimum": 1, "type": "integer" },
+        "canary_identity_sha256_by_language": { "$ref": "#/$defs/languageDigestMap" },
+        "canary_transcript_sha256_by_language": { "$ref": "#/$defs/languageDigestMap" },
+        "run_resource_observations_sha256": { "$ref": "#/$defs/digest" },
+        "sample_count": { "const": 960 },
+        "shard_count": { "minimum": 1, "type": "integer" },
+        "shards": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "canary_count": { "minimum": 1, "type": "integer" },
+              "host_process_fresh": { "const": true },
+              "resource_observation": { "$ref": "#/$defs/supervisorResourceObservation" },
+              "sample_count": { "minimum": 1, "type": "integer" },
+              "shard_index": { "minimum": 0, "type": "integer" }
+            },
+            "required": ["canary_count", "host_process_fresh", "resource_observation", "sample_count", "shard_index"],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": ["canary_count", "canary_identity_sha256_by_language", "canary_transcript_sha256_by_language", "run_resource_observations_sha256", "sample_count", "shard_count", "shards"],
+      "type": "object"
+    },
+    "host_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "build_attestation_sha256": { "$ref": "#/$defs/digest" },
+        "candidate_identity_sha256": { "$ref": "#/$defs/digest" },
+        "executable_sha256": { "$ref": "#/$defs/digest" },
+        "source_commit": { "$ref": "#/$defs/commit" },
+        "source_tree_sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["build_attestation_sha256", "candidate_identity_sha256", "executable_sha256", "source_commit", "source_tree_sha256"],
+      "type": "object"
+    },
+    "kind": { "const": "meetingrelay-native-candidate-realdata-shard-evidence-v1" },
+    "ledger_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_identity_sha256": { "$ref": "#/$defs/digest" },
+        "entry_count": { "const": 960 },
+        "hardware_evidence_sha256": { "$ref": "#/$defs/digest" },
+        "projection_sha256": { "$ref": "#/$defs/digest" },
+        "seal_sha256": { "$ref": "#/$defs/digest" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["candidate_identity_sha256", "entry_count", "hardware_evidence_sha256", "projection_sha256", "seal_sha256", "sha256"],
+      "type": "object"
+    },
+    "measurement_status": { "const": "measured" },
+    "policy_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "fleurs_policy_sha256": { "$ref": "#/$defs/digest" },
+        "realdata_policy_sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["fleurs_policy_sha256", "realdata_policy_sha256"],
+      "type": "object"
+    },
+    "quality_gate_status": { "const": "not-assessed" },
+    "readiness_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "controlled_root_attestation_sha256": { "$ref": "#/$defs/digest" },
+        "readiness_sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["controlled_root_attestation_sha256", "readiness_sha256"],
+      "type": "object"
+    },
+    "resource_observations": { "$ref": "#/$defs/resourceObservationSummary" },
+    "schema_version": { "const": "1.0" },
+    "scorer_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": { "const": "meetingrelay-asr-scorer-profile-v1" },
+        "profile_sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["profile_id", "profile_sha256"],
+      "type": "object"
+    },
+    "source_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": { "$ref": "#/$defs/commit" },
+        "dataset_id": { "const": "google/fleurs" },
+        "revision": { "const": "70bb2e84b976b7e960aa89f1c648e09c59f894dd" },
+        "source_contract_status": { "const": "frozen-source-readiness" },
+        "utterance_count": { "const": 960 }
+      },
+      "required": ["commit", "dataset_id", "revision", "source_contract_status", "utterance_count"],
+      "type": "object"
+    }
+  },
+  "required": ["aggregate", "authority", "clock", "corpus_identity", "execution", "host_identity", "kind", "ledger_identity", "measurement_status", "policy_identity", "quality_gate_status", "readiness_identity", "resource_observations", "schema_version", "scorer_identity", "source_identity"],
+  "type": "object",
+  "$defs": {
+    "commit": { "pattern": "^(?!0{40}$)[0-9a-f]{40}$", "type": "string" },
+    "aggregateAuthority": {
+      "additionalProperties": false,
+      "properties": {
+        "formal_claims": { "const": "none" },
+        "production_evidence": { "const": false }
+      },
+      "required": ["formal_claims", "production_evidence"],
+      "type": "object"
+    },
+    "aggregateRate": {
+      "additionalProperties": false,
+      "properties": {
+        "denominator": { "pattern": "^(?:0|[1-9][0-9]*)$", "type": "string" },
+        "numerator": { "pattern": "^(?:0|[1-9][0-9]*)$", "type": "string" },
+        "status": { "enum": ["measured", "not-comparable"] }
+      },
+      "required": ["denominator", "numerator", "status"],
+      "type": "object"
+    },
+    "aggregateErrorSums": {
+      "additionalProperties": false,
+      "properties": {
+        "deletions": { "minimum": 0, "type": "integer" },
+        "hypothesis_units": { "minimum": 0, "type": "integer" },
+        "insertions": { "minimum": 0, "type": "integer" },
+        "reference_units": { "minimum": 0, "type": "integer" },
+        "substitutions": { "minimum": 0, "type": "integer" },
+        "total": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["deletions", "hypothesis_units", "insertions", "reference_units", "substitutions", "total"],
+      "type": "object"
+    },
+    "aggregateRange": {
+      "additionalProperties": false,
+      "properties": {
+        "maximum": { "$ref": "#/$defs/aggregateRate" },
+        "minimum": { "$ref": "#/$defs/aggregateRate" }
+      },
+      "required": ["maximum", "minimum"],
+      "type": "object"
+    },
+    "aggregateLanguageSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "comparable_sample_count": { "minimum": 0, "type": "integer" },
+        "error_sums": { "$ref": "#/$defs/aggregateErrorSums" },
+        "key": { "enum": ["en", "ja", "zh"] },
+        "macro_error_rate": { "$ref": "#/$defs/aggregateRate" },
+        "sample_count": { "minimum": 0, "type": "integer" },
+        "utterance_error_rate_range": { "$ref": "#/$defs/aggregateRange" },
+        "zero_reference_correct": { "minimum": 0, "type": "integer" },
+        "zero_reference_hallucinations": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["comparable_sample_count", "error_sums", "key", "macro_error_rate", "sample_count", "utterance_error_rate_range", "zero_reference_correct", "zero_reference_hallucinations"],
+      "type": "object"
+    },
+    "aggregateLanguageScenarioSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "comparable_sample_count": { "minimum": 0, "type": "integer" },
+        "error_sums": { "$ref": "#/$defs/aggregateErrorSums" },
+        "key": { "pattern": "^(?:en|ja|zh)\\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string" },
+        "language": { "enum": ["en", "ja", "zh"] },
+        "macro_error_rate": { "$ref": "#/$defs/aggregateRate" },
+        "sample_count": { "minimum": 0, "type": "integer" },
+        "scenario": { "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string" },
+        "utterance_error_rate_range": { "$ref": "#/$defs/aggregateRange" },
+        "zero_reference_correct": { "minimum": 0, "type": "integer" },
+        "zero_reference_hallucinations": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["comparable_sample_count", "error_sums", "key", "language", "macro_error_rate", "sample_count", "scenario", "utterance_error_rate_range", "zero_reference_correct", "zero_reference_hallucinations"],
+      "type": "object"
+    },
+    "asrAggregate": {
+      "additionalProperties": false,
+      "properties": {
+        "assessment_status": { "const": "descriptive-only" },
+        "authority": { "$ref": "#/$defs/aggregateAuthority" },
+        "by_language": {
+          "items": { "$ref": "#/$defs/aggregateLanguageSummary" },
+          "minItems": 1,
+          "type": "array"
+        },
+        "by_language_scenario": {
+          "items": { "$ref": "#/$defs/aggregateLanguageScenarioSummary" },
+          "minItems": 1,
+          "type": "array"
+        },
+        "sample_count": { "const": 960 },
+        "scorer_profile": { "$ref": "#/$defs/scorerProfile" }
+      },
+      "required": ["assessment_status", "authority", "by_language", "by_language_scenario", "sample_count", "scorer_profile"],
+      "type": "object"
+    },
+    "decimal": { "pattern": "^(?:0|[1-9][0-9]*)$", "type": "string" },
+    "digest": { "pattern": "^(?!0{64}$)[0-9a-f]{64}$", "type": "string" },
+    "hostStatusCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "observed": { "minimum": 0, "type": "integer" },
+        "unavailable": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["observed", "unavailable"],
+      "type": "object"
+    },
+    "languageDigestMap": {
+      "additionalProperties": false,
+      "properties": {
+        "en": { "$ref": "#/$defs/digest" },
+        "ja": { "$ref": "#/$defs/digest" },
+        "zh": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["en", "ja", "zh"],
+      "type": "object"
+    },
+    "publicAuthority": {
+      "additionalProperties": false,
+      "properties": {
+        "formal_claims": { "const": "none" },
+        "production_evidence": { "const": false },
+        "public_distribution": { "const": false }
+      },
+      "required": ["formal_claims", "production_evidence", "public_distribution"],
+      "type": "object"
+    },
+    "scorerProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": { "const": "meetingrelay-asr-scorer-profile-v1" },
+        "profile_sha256": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["profile_id", "profile_sha256"],
+      "type": "object"
+    },
+    "resourceObservationSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "host_peak_ram_bytes_max": { "type": ["integer", "null"] },
+        "sample_count": { "minimum": 1, "type": "integer" },
+        "status_counts": { "$ref": "#/$defs/hostStatusCounts" },
+        "supervisor_process_peak_working_set64_max": { "type": ["integer", "null"] },
+        "supervisor_process_status_counts": { "$ref": "#/$defs/supervisorStatusCounts" }
+      },
+      "required": ["host_peak_ram_bytes_max", "sample_count", "status_counts", "supervisor_process_peak_working_set64_max", "supervisor_process_status_counts"],
+      "type": "object"
+    },
+    "supervisorResourceObservation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": { "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string" },
+            "status": { "const": "unavailable" }
+          },
+          "required": ["reason", "status"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "final_total_processor_time_ms": { "minimum": 0, "type": "integer" },
+            "max_peak_working_set64": { "minimum": 0, "type": "integer" },
+            "max_total_processor_time_ms": { "minimum": 0, "type": "integer" },
+            "max_working_set64": { "minimum": 0, "type": "integer" },
+            "sample_count": { "minimum": 1, "type": "integer" },
+            "status": { "const": "available" }
+          },
+          "required": ["final_total_processor_time_ms", "max_peak_working_set64", "max_total_processor_time_ms", "max_working_set64", "sample_count", "status"],
+          "type": "object"
+        }
+      ]
+    },
+    "supervisorStatusCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "available": { "minimum": 0, "type": "integer" },
+        "unavailable": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["available", "unavailable"],
+      "type": "object"
+    }
+  }
+}

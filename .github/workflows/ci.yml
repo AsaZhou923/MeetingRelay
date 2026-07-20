@@ -123,6 +123,10 @@ jobs:
         run: pnpm phase0:sherpa-formal-run-trust:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
+        run: pnpm phase0:sherpa-realdata-shard:test
+        timeout-minutes: 5
+
       - name: Exercise WP-0.4 Windows controlled-root and handle-bound cleanup contract
         shell: pwsh
         run: ./tools/sherpa-native/formal-run-trust-envelope.windows.test.ps1
@@ -224,6 +228,12 @@ jobs:
             Add-Content -LiteralPath $env:GITHUB_ENV -Value $matches[0] -Encoding utf8
           }
         timeout-minutes: 25
+
+      - name: Build and test WP-0.4 quality shard host contract (no real data)
+        run: |
+          cargo build -p meetingrelay-model-worker-sherpa-native --bin meetingrelay-sherpa-candidate-quality-shard-host --release --no-default-features --features native-quality-shard --offline --locked
+          cargo test -p meetingrelay-model-worker-sherpa-native --test candidate_quality_shard_host_cli --no-default-features --features native-quality-shard --offline --locked
+        timeout-minutes: 10
 
       - name: Test sherpa path hardening against materialized assets
         shell: pwsh

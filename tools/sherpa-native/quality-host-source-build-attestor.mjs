@@ -13,13 +13,36 @@ import { fileURLToPath } from "node:url";
 
 import { encodeCanonicalJsonLine } from "../phase0-harness/canonical-json.mjs";
 
-const KIND = "meetingrelay-quality-host-source-build-attestation-v1";
+const MODULE_PROFILE_NAME = new URL(import.meta.url).searchParams.get("profile") ?? "sample";
+const MODULE_PROFILES = Object.freeze({
+  sample: Object.freeze({
+    buildTargetLeaf: "quality-host-builds",
+    cargoFeature: "native-quality-sample",
+    features: Object.freeze(["native-quality-sample", "native-sherpa"]),
+    host: "meetingrelay-sherpa-candidate-quality-host",
+    kind: "meetingrelay-quality-host-source-build-attestation-v1",
+  }),
+  shard: Object.freeze({
+    buildTargetLeaf: "quality-shard-host-builds",
+    cargoFeature: "native-quality-shard",
+    features: Object.freeze(["native-quality-shard", "native-sherpa"]),
+    host: "meetingrelay-sherpa-candidate-quality-shard-host",
+    kind: "meetingrelay-quality-shard-host-source-build-attestation-v1",
+  }),
+});
+if (!Object.hasOwn(MODULE_PROFILES, MODULE_PROFILE_NAME)) {
+  throw Object.assign(new Error("unsupported quality host attestor profile"), {
+    code: "QUALITY_HOST_ATTESTOR_PROFILE",
+  });
+}
+const MODULE_PROFILE = MODULE_PROFILES[MODULE_PROFILE_NAME];
+const KIND = MODULE_PROFILE.kind;
 const SCHEMA_VERSION = "1.0";
 const TARGET = "x86_64-pc-windows-msvc";
 const PACKAGE = "meetingrelay-model-worker-sherpa-native";
-const QUALITY_HOST = "meetingrelay-sherpa-candidate-quality-host";
+const QUALITY_HOST = MODULE_PROFILE.host;
 const QUALITY_HOST_EXE = `${QUALITY_HOST}.exe`;
-const FEATURES = Object.freeze(["native-quality-sample", "native-sherpa"]);
+const FEATURES = MODULE_PROFILE.features;
 const CARGO_ARGS = Object.freeze([
   "build",
   "--release",
@@ -27,7 +50,7 @@ const CARGO_ARGS = Object.freeze([
   PACKAGE,
   "--no-default-features",
   "--features",
-  "native-quality-sample",
+  MODULE_PROFILE.cargoFeature,
   "--bin",
   QUALITY_HOST,
   "--message-format=json",
@@ -109,7 +132,7 @@ const BUILD_TARGET_SUBTREE_RELATIVE = Object.freeze([
   "target",
   "sherpa-native",
   "formal-run-trust",
-  "quality-host-builds",
+  MODULE_PROFILE.buildTargetLeaf,
 ]);
 const CONTROLLED_ENCODED_RUSTFLAGS = Object.freeze([
   "-Ccontrol-flow-guard=checks",
