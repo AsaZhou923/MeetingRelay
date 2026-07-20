@@ -16,6 +16,7 @@ tauri-build = { version = "=2.6.2", features = [] }
 
 [dependencies]
 meetingrelay-benchmark-contract = { path = "../../../crates/benchmark-contract" }
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-windows"] }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "=2.11.2", default-features = false, features = ["wry", "compression"] }
 

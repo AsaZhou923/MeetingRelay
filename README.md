@@ -1,6 +1,18 @@
 # MeetingRelay
 
-MeetingRelay is currently in **WP-0.4.3g native candidate execution/conformance foundation (In Progress)**. WP-0.4.3a through WP-0.4.3f3a2b are Done/Passed; f3a1 source `122b1d930188fcc773d1086a0f7c4a5c63adb7e4` supplies the deterministic 28-material/26-entry sealed bundle plan without granting trust, f3a2a source `2e02db4a6721fd3dc85c68f044e3080adc38c56c` supplies the externally pinned Windows materializer core, and f3a2b source `95e91317142b1475f6d79eec13851ab95f9f70ff` hardens that core with a native destination no-replace publish operation, deterministic hostile-writer checkpoints, identity-swap rejection, and conservative cleanup reporting. The f3b foundation adds measured-HW input closeout without executing the candidate/model or creating evidence; g adds a separately supervised Release host that exercises the locked native adapter and semantic contract while preserving `InProcess` protocol transport and non-production authority. These slices do not claim quality/performance, rank or select a candidate, approve distribution, or grant production authority. The parent WP-0.4.3 and `CT-WORKER-CANDIDATE-001` remain open.
+MeetingRelay is currently closing **MVP-FT-003 local durable transcript, restart recovery, strong-kill recovery, and JSON/Markdown/TXT export**. MVP-FT-001 and MVP-FT-002 are Done/Passed. MVP-FT-003 is implemented and has passed the local acceptance surface, including Release Tauri target-machine smoke. This README does not independently serve as remote Done evidence; use the external project task list for the exact source SHA and remote CI record.
+
+The current MVP durable contract is `meetingrelay.mvp.durable.v1`. SQLite/WAL is the only transaction truth for saved meetings; interim text remains memory-only; final transcript segments appear as saved only after the storage commit is acknowledged. The desktop app can reopen the latest meeting after normal restart, recover already committed final segments exactly once after process kill, and export JSON, Markdown, and TXT from one consistent snapshot.
+
+This status is intentionally scoped. It does not close the full V1 storage/API migration, WP-1.1, WP-1.4, WP-1.7, Phase 1 formal gates, raw-audio persistence, pause/resume, backup/corruption reconstruction, live export, translation, speaker attribution, summary, search, full meeting library, retention/delete, DOCX/PDF, or formal long-duration performance gates.
+
+## Current MVP evidence
+
+- FT001/FT002: Done/Passed in the project task list.
+- FT003 local Rust gate: `230 passed / 1 ignored`.
+- FT003 frontend gate: `12 passed`.
+- Release Tauri smoke: verified loopback + microphone capture, normal restart, strong-kill recovery with exact-once committed finals, reopen recent meeting, and actual JSON/Markdown/TXT file open.
+- Exact source SHA and remote CI evidence are recorded in the external project task list.
 
 ## Prerequisites
 
@@ -15,41 +27,56 @@ Use a Developer PowerShell or another shell where the MSVC toolchain is availabl
 
 ## Workspace commands
 
+Run from the repository root unless a command says otherwise.
+
 ```powershell
-pnpm install
+pnpm install --frozen-lockfile
 pnpm desktop:typecheck
-pnpm desktop:dev
 pnpm desktop:build
-pnpm phase0:fixtures:test
-pnpm phase0:fixtures:validate
-pnpm phase0:candidate-artifacts:test
-pnpm phase0:candidate-artifacts:validate
-pnpm phase0:hw-ref:test
-pnpm phase0:sherpa-assets:test
-pnpm phase0:sherpa-assets:validate
-pnpm phase0:sherpa-candidate-plan:test
-pnpm phase0:sherpa-candidate-bundle-plan:test
-pnpm phase0:sherpa-candidate-measured-closeout:test
-pnpm phase0:sherpa-candidate-materializer:test
-pnpm phase0:sherpa-candidate-conformance:test
-pnpm phase0:ledgers:test
-pnpm phase0:ledgers:validate
-pnpm phase0:provider:test
-pnpm phase0:provider:validate
-pnpm phase0:clock:test
-pnpm phase0:clock:validate
-pnpm phase0:resources:test
-pnpm phase0:resources:validate
-cargo test --package meetingrelay-model-worker-contract --all-targets --locked
-cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
-pnpm tauri -- --version
+pnpm --dir apps/desktop test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo check --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --all-features --locked
+pnpm --dir apps/desktop run tauri:build:ci
+powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -DryRun
 ```
 
-The desktop commands delegate to `apps/desktop`. The Tauri command forwards additional arguments to that package's Tauri CLI script.
+Use the MVP launcher for local smoke runs with cached, lock-verified Sherpa assets:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1
+```
+
+The desktop commands delegate to `apps/desktop`. The MVP launcher verifies the existing Sherpa lock, materializes sealed assets, stages locked runtime DLLs, builds/checks the frontend, and runs Tauri in development mode. Downloads are disabled by default; use `-AllowDownload` only when intentionally acquiring missing locked archives or pnpm store content.
 
 ## Verification
 
-Run the complete Phase 0 verification surface from the repository root:
+For MVP-FT-003, the acceptance surface is:
+
+```powershell
+pnpm install --frozen-lockfile
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo check --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --all-features --locked
+pnpm --dir apps/desktop test
+pnpm desktop:typecheck
+pnpm desktop:build
+pnpm --dir apps/desktop run tauri:build:ci
+powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -DryRun
+```
+
+Then run the Release app on the target Windows machine and verify:
+
+- consent is required before capture;
+- system loopback and microphone both produce frames;
+- committed final segments are visible only after SQLite/WAL commit acknowledgment;
+- normal restart can reopen the latest meeting;
+- force-kill after a saved final recovers the committed final exactly once;
+- JSON, Markdown, and TXT exports open as real UTF-8/LF files and contain the same meeting/snapshot/final order.
+
+Run the historical Phase 0 verification surface when changing candidate-model, materializer, contract, ledger, or provenance code:
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -84,7 +111,7 @@ cargo test --workspace --release --all-targets --all-features --locked
 pnpm desktop:typecheck
 pnpm desktop:build
 cargo build --package meetingrelay-desktop --release --locked
-pnpm --dir apps/desktop tauri build --no-bundle
+pnpm --dir apps/desktop run tauri:build:ci
 ```
 
 Native-feature checks and the ignored real SenseVoice smoke require the sealed assets and pinned DLLs to be materialized and staged first. Follow [the sherpa asset instructions](tools/sherpa-native/README.md) and [the adapter smoke instructions](crates/model-worker-sherpa-native/README.md). The upstream build script's implicit network-download path is not an accepted project workflow.

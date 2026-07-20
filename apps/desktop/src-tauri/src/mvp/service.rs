@@ -3,7 +3,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use super::contract::{AudioSourceSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus};
+use super::{
+    contract::{AudioSourceSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus},
+    export::{ExportResult, export_meeting},
+    storage::{
+        DurableFinal, FinalCandidate, MvpStorage, MvpStorageWriter, segment_from_durable,
+        visible_window_start_sequence,
+    },
+};
 
 pub(crate) const MVP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
@@ -18,7 +25,7 @@ use std::{
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -39,6 +46,8 @@ use super::{
 
 pub struct MvpService {
     snapshot: Arc<Mutex<MvpSnapshot>>,
+    storage: Option<MvpStorage>,
+    storage_writer: Option<Arc<MvpStorageWriter>>,
     inner: Mutex<ServiceInner>,
     shutdown_started: AtomicBool,
 }
@@ -53,15 +62,34 @@ struct ServiceInner {
 
 impl Default for MvpService {
     fn default() -> Self {
-        Self {
-            snapshot: Arc::new(Mutex::new(MvpSnapshot::booting())),
-            inner: Mutex::new(ServiceInner::default()),
-            shutdown_started: AtomicBool::new(false),
-        }
+        Self::new_with_storage_result(MvpStorage::open_default())
     }
 }
 
 impl MvpService {
+    fn new_with_storage_result(storage_result: Result<MvpStorage, String>) -> Self {
+        let (storage, storage_writer, storage_error) = match storage_result {
+            Ok(storage) => match MvpStorageWriter::start(storage.clone()) {
+                Ok(writer) => (Some(storage), Some(Arc::new(writer)), None),
+                Err(error) => (Some(storage), None, Some(error)),
+            },
+            Err(error) => (None, None, Some(error)),
+        };
+        let mut snapshot = MvpSnapshot::booting();
+        if storage_error.is_none() {
+            snapshot.durability_status = "ready".to_owned();
+        } else {
+            snapshot.durability_status = "error".to_owned();
+            snapshot.error = storage_error.clone();
+        }
+        Self {
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            storage,
+            storage_writer,
+            inner: Mutex::new(ServiceInner::default()),
+            shutdown_started: AtomicBool::new(false),
+        }
+    }
     pub fn snapshot(&self) -> MvpSnapshot {
         let inner = lock(&self.inner);
         #[cfg(windows)]
@@ -115,6 +143,45 @@ impl MvpService {
         }
     }
 
+    pub fn open_recent(&self) -> Result<MvpSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let recent = storage
+            .recent_meeting()?
+            .ok_or_else(|| "MVP_STORAGE_RECENT_EMPTY".to_owned())?;
+        self.apply_meeting_snapshot(writer.open_meeting(&recent.id)?)
+    }
+
+    pub fn open_meeting(&self, meeting_id: &str) -> Result<MvpSnapshot, String> {
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        self.apply_meeting_snapshot(writer.open_meeting(meeting_id)?)
+    }
+
+    pub fn export_meeting(
+        &self,
+        meeting_id: &str,
+        target_dir: String,
+    ) -> Result<ExportResult, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        export_meeting(storage, writer, meeting_id, target_dir)
+    }
+
     pub fn shutdown_before(&self, deadline: std::time::Instant) -> Result<(), String> {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -137,17 +204,71 @@ impl MvpService {
         snapshot.error = Some(error.to_owned());
     }
 
+    fn apply_meeting_snapshot(
+        &self,
+        meeting: super::storage::MeetingSnapshot,
+    ) -> Result<MvpSnapshot, String> {
+        let mut snapshot = lock(&self.snapshot);
+        let total = meeting.finals.len();
+        let mut finals = meeting
+            .finals
+            .iter()
+            .map(segment_from_durable)
+            .collect::<Vec<_>>();
+        if finals.len() > super::contract::MAX_FINAL_SEGMENTS {
+            let remove = finals.len() - super::contract::MAX_FINAL_SEGMENTS;
+            finals.drain(..remove);
+        }
+        snapshot.meeting_id = Some(meeting.meeting.id.clone());
+        snapshot.session_id = Some(meeting.meeting.id.clone());
+        snapshot.latest_opened_meeting = Some(meeting.meeting.id);
+        snapshot.finals = finals;
+        snapshot.interim = None;
+        snapshot.memory_only = false;
+        snapshot.durability_status = meeting.meeting.state;
+        snapshot.saved_final_count = total.to_string();
+        snapshot.total_final_count = total.to_string();
+        snapshot.last_saved_sequence = meeting
+            .finals
+            .last()
+            .map(|final_segment| final_segment.sequence.to_string());
+        snapshot.visible_final_window_start_sequence = visible_window_start_sequence(total);
+        snapshot.enforce_bounds();
+        Ok(snapshot.clone())
+    }
+
+    fn refresh_latest_opened_meeting(&self) -> Result<(), String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let recent = storage.recent_meeting()?;
+        let mut snapshot = lock(&self.snapshot);
+        snapshot.latest_opened_meeting = recent.map(|meeting| meeting.id);
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn preflight_windows(&self) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
             return Ok(self.snapshot_locked(&inner));
         }
+        if self.storage.is_none() || self.storage_writer.is_none() {
+            let error = storage_error_from_snapshot(&self.snapshot);
+            self.fail(&error);
+            return Err(error);
+        }
 
         {
             let mut snapshot = lock(&self.snapshot);
             snapshot.lifecycle = Lifecycle::Booting;
             snapshot.error = None;
+        }
+        if self.storage.is_some() {
+            let writer = self.storage_writer.as_ref().expect("checked above");
+            writer.recover_interrupted()?;
+            self.refresh_latest_opened_meeting()?;
         }
 
         let devices = AudioCapture::preflight_default_devices().map_err(|error| {
@@ -158,13 +279,18 @@ impl MvpService {
 
         if inner.inference.is_none() {
             let paths = resolve_model_paths().inspect_err(|error| self.fail(error))?;
-            let worker = InferenceWorker::prepare(Arc::clone(&self.snapshot), paths)
-                .inspect_err(|error| self.fail(error))?;
+            let worker = InferenceWorker::prepare(
+                Arc::clone(&self.snapshot),
+                paths,
+                self.storage_writer.clone(),
+            )
+            .inspect_err(|error| self.fail(error))?;
             inner.inference = Some(worker);
         }
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
+        snapshot.durability_status = "ready".to_owned();
         snapshot.model_ready = true;
         snapshot.model_label = "SenseVoice · zh · CPU · local".to_owned();
         snapshot.system = ready_source(SourceId::System, &devices.system_output);
@@ -182,8 +308,20 @@ impl MvpService {
         if inner.session.is_some() {
             return Err("SESSION_ALREADY_RUNNING".to_owned());
         }
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
         if inner.inference.is_none() || lock(&self.snapshot).lifecycle != Lifecycle::Ready {
             return Err("MVP_NOT_READY".to_owned());
+        }
+        let meeting = writer.start_meeting(true, "SenseVoice · zh · CPU · local")?;
+
+        if let Some(inference) = inner.inference.as_ref() {
+            inference
+                .submitter
+                .shared
+                .seed_durable_sequence(meeting.last_final_sequence);
         }
 
         {
@@ -192,6 +330,12 @@ impl MvpService {
             snapshot.error = None;
             snapshot.interim = None;
             snapshot.finals.clear();
+            snapshot.meeting_id = Some(meeting.id.clone());
+            snapshot.durability_status = "recording".to_owned();
+            snapshot.saved_final_count = "0".to_owned();
+            snapshot.total_final_count = "0".to_owned();
+            snapshot.visible_final_window_start_sequence = "1".to_owned();
+            snapshot.last_saved_sequence = None;
             snapshot.elapsed_ms = "0".to_owned();
             snapshot.system.frames = "0".to_owned();
             snapshot.microphone.frames = "0".to_owned();
@@ -199,11 +343,12 @@ impl MvpService {
 
         let (capture, output) = AudioCapture::start_default(AudioCaptureOptions::default())
             .map_err(|error| {
+                let _ = writer.interrupt_meeting(&meeting.id);
                 let code = public_audio_error(&error.to_string());
                 self.fail(&code);
                 code
             })?;
-        let session_id = next_session_id();
+        let session_id = meeting.id.clone();
         let submitter = inner
             .inference
             .as_ref()
@@ -223,6 +368,7 @@ impl MvpService {
             Ok(coordinator) => coordinator,
             Err(error) => {
                 drop(capture);
+                let _ = writer.interrupt_meeting(&meeting.id);
                 self.fail(&error);
                 return Err(error);
             }
@@ -235,11 +381,13 @@ impl MvpService {
             metrics,
             errors,
             started: Instant::now(),
+            meeting_id: meeting.id.clone(),
         });
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Recording;
         snapshot.session_id = Some(session_id);
+        snapshot.meeting_id = Some(meeting.id);
         snapshot.system = capturing_source(SourceId::System, &preflight.system_output);
         snapshot.microphone = capturing_source(SourceId::Microphone, &preflight.microphone);
         snapshot.error = None;
@@ -279,9 +427,16 @@ impl MvpService {
                 .barrier_before(deadline)
                 .inspect_err(|error| self.fail(error))?;
         }
+        if let Some(writer) = self.storage_writer.as_ref()
+            && let Err(error) = writer.complete_meeting(&session.meeting_id)
+        {
+            self.fail(&error);
+            return Err(error);
+        }
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
+        snapshot.durability_status = "completed".to_owned();
         snapshot.system.active = false;
         snapshot.system.peak = 0.0;
         snapshot.system.status = SourceStatus::Ready;
@@ -377,6 +532,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn storage_error_from_snapshot(snapshot: &Mutex<MvpSnapshot>) -> String {
+    lock(snapshot)
+        .error
+        .clone()
+        .unwrap_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())
+}
+
 #[cfg(windows)]
 fn lock_before<'a, T>(mutex: &'a Mutex<T>, deadline: Instant) -> Result<MutexGuard<'a, T>, String> {
     loop {
@@ -417,6 +579,7 @@ struct RunningSession {
     metrics: AudioCaptureMetrics,
     errors: Arc<RuntimeErrors>,
     started: Instant,
+    meeting_id: String,
 }
 
 #[cfg(windows)]
@@ -474,17 +637,6 @@ fn public_audio_error(detail: &str) -> String {
         .take(180)
         .collect::<String>();
     format!("AUDIO_UNAVAILABLE:{normalized}")
-}
-
-#[cfg(windows)]
-fn next_session_id() -> String {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    let epoch_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("local-{epoch_ms}-{sequence}")
 }
 
 #[cfg(windows)]
@@ -616,6 +768,7 @@ struct InferenceShared {
     pending: AtomicUsize,
     latest_interim: AtomicU64,
     published_interim: AtomicU64,
+    next_final_sequence: AtomicU64,
     shutdown: AtomicBool,
 }
 
@@ -631,6 +784,20 @@ impl InferenceShared {
 
     fn finish_task(&self) {
         self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn next_durable_sequence_candidate(&self) -> u64 {
+        self.next_final_sequence.load(Ordering::Acquire) + 1
+    }
+
+    fn advance_durable_sequence_after_ack(&self, sequence: u64) {
+        self.next_final_sequence
+            .fetch_max(sequence, Ordering::AcqRel);
+    }
+
+    fn seed_durable_sequence(&self, last_final_sequence: u64) {
+        self.next_final_sequence
+            .store(last_final_sequence, Ordering::Release);
     }
 
     fn scrub_stale_interim(&self, snapshot: &mut MvpSnapshot) {
@@ -653,6 +820,7 @@ impl InferenceWorker {
     fn prepare(
         snapshot: Arc<Mutex<MvpSnapshot>>,
         paths: LockedSherpaRealtimePaths,
+        storage_writer: Option<Arc<MvpStorageWriter>>,
     ) -> Result<Self, String> {
         let (ready_sender, ready_receiver) = sync_channel(1);
         let (finals, final_receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
@@ -666,7 +834,13 @@ impl InferenceWorker {
                 let ready = recognizer.as_ref().map(|_| ()).map_err(Clone::clone);
                 let _ = ready_sender.send(ready);
                 if let Ok(mut recognizer) = recognizer {
-                    inference_loop(&mut recognizer, final_receiver, worker_shared, snapshot);
+                    inference_loop(
+                        &mut recognizer,
+                        final_receiver,
+                        worker_shared,
+                        snapshot,
+                        storage_writer,
+                    );
                 }
             })
             .map_err(|_| "ASR_WORKER_START_FAILED".to_owned())?;
@@ -729,6 +903,7 @@ fn inference_loop(
     finals: Receiver<InferenceTask>,
     shared: Arc<InferenceShared>,
     snapshot: Arc<Mutex<MvpSnapshot>>,
+    storage_writer: Option<Arc<MvpStorageWriter>>,
 ) {
     loop {
         let scheduled = match finals.try_recv() {
@@ -738,7 +913,14 @@ fn inference_loop(
                 .map(|(generation, task)| (Some(generation), task)),
         };
         if let Some((interim_generation, task)) = scheduled {
-            process_inference_task(recognizer, &shared, &snapshot, interim_generation, task);
+            process_inference_task(
+                recognizer,
+                &shared,
+                &snapshot,
+                storage_writer.as_deref(),
+                interim_generation,
+                task,
+            );
             shared.finish_task();
             continue;
         }
@@ -754,6 +936,7 @@ fn process_inference_task(
     recognizer: &mut LockedSherpaRealtime,
     shared: &InferenceShared,
     snapshot: &Mutex<MvpSnapshot>,
+    storage_writer: Option<&MvpStorageWriter>,
     interim_generation: Option<u64>,
     task: InferenceTask,
 ) {
@@ -765,6 +948,75 @@ fn process_inference_task(
 
     let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
     let session_id = task.session_id.clone();
+    let durable_final = match result {
+        Ok(result) => {
+            let text = result.original_transcript.as_str().trim().to_owned();
+            if !is_meaningful_transcript(&text) {
+                return;
+            }
+            if task.is_final {
+                let sequence = shared.next_durable_sequence_candidate();
+                let Some(storage_writer) = storage_writer else {
+                    let _ = publish_if_current(
+                        shared,
+                        snapshot,
+                        interim_generation,
+                        &session_id,
+                        |current| set_public_error(current, "MVP_STORAGE_UNAVAILABLE"),
+                    );
+                    return;
+                };
+                match storage_writer.commit_final(FinalCandidate {
+                    meeting_id: task.session_id.clone(),
+                    segment_id: task.segment_id.clone(),
+                    sequence,
+                    revision: task.revision,
+                    text,
+                    started_at_ms: task.started_at_ms.clone(),
+                    ended_at_ms: task.ended_at_ms.clone(),
+                }) {
+                    Ok(ack) => {
+                        shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);
+                        Some(Ok((ack.final_segment, ack.duplicate)))
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            } else {
+                let segment = TranscriptSegment {
+                    segment_id: task.segment_id.clone(),
+                    sequence: "0".to_owned(),
+                    revision: task.revision,
+                    is_final: false,
+                    saved: false,
+                    text,
+                    started_at_ms: task.started_at_ms.clone(),
+                    ended_at_ms: None,
+                    committed_at: None,
+                    commit_id: None,
+                };
+                let _ = publish_if_current(
+                    shared,
+                    snapshot,
+                    interim_generation,
+                    &session_id,
+                    move |current| {
+                        current.interim = Some(segment);
+                        shared.published_interim.store(
+                            interim_generation.expect("interim tasks carry a generation"),
+                            Ordering::Release,
+                        );
+                        if current.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+                            current.error = None;
+                        }
+                        current.enforce_bounds();
+                    },
+                );
+                return;
+            }
+        }
+        Err(error) if task.is_final => Some(Err(error.to_string())),
+        Err(_) => None,
+    };
     let _ = publish_if_current(
         shared,
         snapshot,
@@ -775,39 +1027,42 @@ fn process_inference_task(
                 current.interim = None;
                 shared.published_interim.store(0, Ordering::Release);
             }
-            match result {
-                Ok(result) => {
-                    let text = result.original_transcript.as_str().trim().to_owned();
-                    if !is_meaningful_transcript(&text) {
-                        return;
-                    }
-                    let segment = TranscriptSegment {
-                        segment_id: task.segment_id,
-                        revision: task.revision,
-                        is_final: task.is_final,
-                        text,
-                        started_at_ms: task.started_at_ms,
-                        ended_at_ms: task.is_final.then_some(task.ended_at_ms),
-                    };
-                    if task.is_final {
-                        current.finals.push(segment);
-                    } else {
-                        current.interim = Some(segment);
-                        shared.published_interim.store(
-                            interim_generation.expect("interim tasks carry a generation"),
-                            Ordering::Release,
-                        );
-                    }
-                    if current.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
-                        current.error = None;
-                    }
-                    current.enforce_bounds();
-                }
-                Err(error) if task.is_final => set_public_error(current, &error.to_string()),
-                Err(_) => {}
+            if let Some(result) = durable_final {
+                apply_final_commit_result(current, result);
             }
         },
     );
+}
+
+#[cfg(windows)]
+fn apply_final_commit_result(
+    current: &mut MvpSnapshot,
+    result: Result<(DurableFinal, bool), String>,
+) {
+    match result {
+        Ok((final_segment, duplicate)) => {
+            let total = usize::try_from(final_segment.sequence).unwrap_or(usize::MAX);
+            if !duplicate
+                && !current
+                    .finals
+                    .iter()
+                    .any(|segment| segment.commit_id.as_deref() == Some(&final_segment.commit_id))
+            {
+                current.finals.push(segment_from_durable(&final_segment));
+            }
+            current.memory_only = false;
+            current.durability_status = "recording".to_owned();
+            current.saved_final_count = total.to_string();
+            current.total_final_count = total.to_string();
+            current.last_saved_sequence = Some(final_segment.sequence.to_string());
+            current.visible_final_window_start_sequence = visible_window_start_sequence(total);
+            if current.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+                current.error = None;
+            }
+            current.enforce_bounds();
+        }
+        Err(error) => set_public_error(current, &error),
+    }
 }
 
 #[cfg(windows)]
@@ -1200,6 +1455,18 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    fn temp_storage_writer(test_name: &str) -> (MvpStorage, MvpStorageWriter) {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-service-{test_name}-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let writer = MvpStorageWriter::start(storage.clone()).unwrap();
+        (storage, writer)
+    }
+
+    #[cfg(windows)]
     fn queued_task(revision: u32, is_final: bool) -> InferenceTask {
         InferenceTask {
             session_id: "session-test".to_owned(),
@@ -1226,13 +1493,60 @@ mod tests {
     }
 
     #[test]
-    fn default_service_is_private_memory_only_and_booting() {
+    fn default_service_is_private_local_durable_and_booting() {
         let snapshot = MvpService::default().snapshot();
         assert_eq!(snapshot.lifecycle, Lifecycle::Booting);
         assert!(snapshot.local_only);
-        assert!(snapshot.memory_only);
+        assert!(!snapshot.memory_only);
         assert_eq!(snapshot.system.frames, "0");
         assert_eq!(snapshot.microphone.frames, "0");
+    }
+
+    #[test]
+    fn storage_initialization_failure_is_public_and_blocks_start() {
+        let service =
+            MvpService::new_with_storage_result(Err("MVP_STORAGE_TEST_OPEN_FAILED".to_owned()));
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.durability_status, "error");
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("MVP_STORAGE_TEST_OPEN_FAILED")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                service.start(true),
+                Err("MVP_STORAGE_TEST_OPEN_FAILED".to_owned())
+            );
+            assert_eq!(
+                service.preflight(),
+                Err("MVP_STORAGE_TEST_OPEN_FAILED".to_owned())
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(service.start(true), Err("MVP_WINDOWS_ONLY".to_owned()));
+        }
+    }
+
+    #[test]
+    fn latest_opened_meeting_refreshes_from_storage_recent() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-service-recent-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let writer = MvpStorageWriter::start(storage.clone()).unwrap();
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer.complete_meeting(&meeting.id).unwrap();
+        drop(writer);
+        let service = MvpService::new_with_storage_result(Ok(storage));
+        service.refresh_latest_opened_meeting().unwrap();
+        assert_eq!(
+            service.snapshot().latest_opened_meeting.as_deref(),
+            Some(meeting.id.as_str())
+        );
     }
 
     #[test]
@@ -1332,11 +1646,15 @@ mod tests {
         let mut snapshot = MvpSnapshot::booting();
         snapshot.interim = Some(TranscriptSegment {
             segment_id: "segment-stale".to_owned(),
+            sequence: "0".to_owned(),
             revision: 1,
             is_final: false,
+            saved: false,
             text: "stale".to_owned(),
             started_at_ms: "0".to_owned(),
             ended_at_ms: None,
+            committed_at: None,
+            commit_id: None,
         });
 
         let returned = public_snapshot(&mut snapshot, Some(&submitter));
@@ -1371,6 +1689,90 @@ mod tests {
         set_public_error(&mut snapshot, take_runtime_error(&errors).unwrap());
         set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
         assert_eq!(snapshot.error.as_deref(), Some("ASR_FINAL_OVERLOAD"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_overload_does_not_consume_durable_sequence() {
+        let (submitter, _finals) = test_submitter();
+        for _ in 0..MAX_INFERENCE_QUEUE_DEPTH {
+            submitter.submit(queued_task(1, true)).unwrap();
+        }
+        assert_eq!(
+            submitter.submit(queued_task(1, true)),
+            Err("ASR_FINAL_OVERLOAD".to_owned())
+        );
+        assert_eq!(
+            submitter.shared.next_final_sequence.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_durable_commit_does_not_advance_sequence_and_next_commit_can_reuse_it() {
+        let (_storage, writer) = temp_storage_writer("sequence-retry");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        let shared = InferenceShared::default();
+        let failed_sequence = shared.next_durable_sequence_candidate();
+        assert_eq!(
+            writer
+                .commit_final(FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: "segment-gap".to_owned(),
+                    sequence: failed_sequence + 1,
+                    revision: 1,
+                    text: "gap".to_owned(),
+                    started_at_ms: "0".to_owned(),
+                    ended_at_ms: "1".to_owned(),
+                })
+                .unwrap_err(),
+            "MVP_STORAGE_FINAL_SEQUENCE_GAP_OR_REORDER"
+        );
+        assert_eq!(shared.next_durable_sequence_candidate(), failed_sequence);
+        let ack = writer
+            .commit_final(FinalCandidate {
+                meeting_id: meeting.id,
+                segment_id: "segment-ok".to_owned(),
+                sequence: failed_sequence,
+                revision: 1,
+                text: "ok".to_owned(),
+                started_at_ms: "0".to_owned(),
+                ended_at_ms: "1".to_owned(),
+            })
+            .unwrap();
+        shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);
+        assert_eq!(ack.final_segment.sequence, failed_sequence);
+        assert_eq!(
+            shared.next_durable_sequence_candidate(),
+            failed_sequence + 1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_meeting_seed_resets_durable_sequence_to_one() {
+        let shared = InferenceShared::default();
+        shared.advance_durable_sequence_after_ack(7);
+        assert_eq!(shared.next_durable_sequence_candidate(), 8);
+        shared.seed_durable_sequence(0);
+        assert_eq!(shared.next_durable_sequence_candidate(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_failure_does_not_publish_saved_final() {
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.session_id = Some("meeting-test".to_owned());
+        apply_final_commit_result(
+            &mut snapshot,
+            Err("MVP_STORAGE_FINAL_SEQUENCE_GAP_OR_REORDER".to_owned()),
+        );
+        assert!(snapshot.finals.is_empty());
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("MVP_STORAGE_FINAL_SEQUENCE_GAP_OR_REORDER")
+        );
     }
 
     #[cfg(windows)]

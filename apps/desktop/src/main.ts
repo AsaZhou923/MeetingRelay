@@ -2,8 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 
 import {
   formatElapsed,
+  hasAllMvpExportFormats,
+  parseMvpExportResult,
   parseMvpSnapshot,
   type AudioSourceSnapshot,
+  type ExportArtifact,
+  type MvpExportResult,
   type MvpSnapshot,
 } from "./mvp-contract";
 import "./styles.css";
@@ -18,9 +22,9 @@ app.innerHTML = `
         <p class="kicker">LOCAL TRANSCRIPTION CONSOLE / MVP</p>
         <h1>Meeting<span>Relay</span></h1>
       </div>
-      <div class="privacy-stamp" aria-label="Privacy mode">
+      <div class="privacy-stamp" aria-label="Privacy and storage mode">
         <span class="privacy-dot"></span>
-        本地处理 · 临时会话
+        本地处理 · SQLite/WAL 持久保存
       </div>
     </header>
 
@@ -31,7 +35,7 @@ app.innerHTML = `
         <div id="source-system" class="source-card" data-status="booting">
           <div class="source-heading">
             <span class="source-glyph">SYS</span>
-            <div><strong>电脑播放声音</strong><small id="system-label">正在检测默认输出…</small></div>
+            <div><strong>电脑播放声音</strong><small id="system-label">正在检测默认输出</small></div>
           </div>
           <div class="level-track"><i id="system-level"></i></div>
           <div class="source-meta"><span id="system-status">检测中</span><span id="system-frames">0 frames</span></div>
@@ -39,7 +43,7 @@ app.innerHTML = `
         <div id="source-microphone" class="source-card" data-status="booting">
           <div class="source-heading">
             <span class="source-glyph">MIC</span>
-            <div><strong>默认麦克风</strong><small id="microphone-label">正在检测默认输入…</small></div>
+            <div><strong>默认麦克风</strong><small id="microphone-label">正在检测默认输入</small></div>
           </div>
           <div class="level-track"><i id="microphone-level"></i></div>
           <div class="source-meta"><span id="microphone-status">检测中</span><span id="microphone-frames">0 frames</span></div>
@@ -50,38 +54,67 @@ app.innerHTML = `
           <strong id="model-status">正在校验本地模型…</strong>
         </div>
 
+        <section class="storage-panel" aria-label="Durable storage">
+          <div class="rail-index">02 / STORAGE</div>
+          <div class="storage-row">
+            <span id="storage-indicator" class="storage-indicator" data-status="initializing"></span>
+            <div>
+              <strong id="storage-status">初始化本地持久化</strong>
+              <small id="storage-detail">final 片段只在 SQLite 提交成功后显示为已保存。</small>
+            </div>
+          </div>
+          <dl class="storage-metrics">
+            <div><dt>已保存</dt><dd id="saved-count">0</dd></div>
+            <div><dt>可见窗口</dt><dd id="visible-window">0 / 0</dd></div>
+            <div><dt>会议</dt><dd id="meeting-id">未打开</dd></div>
+          </dl>
+        </section>
+
         <label class="consent-row">
           <input id="consent" type="checkbox" />
-          <span>我确认本次会议允许录音转写</span>
+          <span>我确认本次会议允许录音转写，并同意转写文本以 SQLite/WAL 形式保存在本机应用数据目录。</span>
         </label>
 
         <div class="session-actions">
           <button id="start" class="start-button" type="button" disabled>
             <span class="record-mark"></span>开始实时转写
           </button>
-          <button id="stop" class="stop-button" type="button" disabled>停止并完成当前片段</button>
+          <button id="stop" class="stop-button" type="button" disabled>停止并完成当前会议</button>
         </div>
         <p id="error" class="error-line" role="alert"></p>
+
+        <section class="history-panel" aria-label="Recent meetings">
+          <div class="rail-index">03 / RECENT</div>
+          <button id="open-recent" class="secondary-button" type="button" disabled>重新打开最近会议</button>
+          <p id="recent-summary" class="recent-summary">暂无已打开会议。</p>
+        </section>
       </aside>
 
       <section class="transcript-stage" aria-labelledby="transcript-title">
         <div class="stage-heading">
           <div>
-            <div class="rail-index">02 / LIVE TRANSCRIPT</div>
+            <div class="rail-index">04 / LIVE TRANSCRIPT</div>
             <h2 id="transcript-title">实时文字</h2>
           </div>
           <div class="session-clock"><span id="lifecycle">BOOTING</span><strong id="elapsed">00:00:00</strong></div>
         </div>
         <div id="empty-state" class="empty-state">
           <div class="signal-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-          <p>声音就绪后，点击开始。文字仅保存在本次运行的内存中。</p>
+          <p>声音就绪后点击开始。interim 只显示在屏幕上；final 必须先提交到本地 SQLite，才会进入已保存列表和导出。</p>
         </div>
         <ol id="transcript" class="transcript-list" aria-live="polite"></ol>
-        <div id="interim" class="interim-line" hidden><span>LIVE</span><p></p></div>
+        <div id="interim" class="interim-line" hidden><span>INTERIM</span><p></p></div>
+        <section class="export-panel" aria-label="Exports">
+          <div class="export-actions">
+            <span>导出已保存会议</span>
+            <button id="export-all" class="secondary-button" type="button" disabled>导出 JSON / Markdown / TXT</button>
+          </div>
+          <ul id="export-results" class="export-results" aria-live="polite"></ul>
+        </section>
         <footer class="stage-footer">
           <span>队列 <strong id="queue-depth">0 / 8</strong></span>
           <span>固定语言 <strong>中文 · ZH</strong></span>
-          <span>保存 <strong>关闭</strong></span>
+          <span>存储 <strong id="footer-storage">初始化</strong></span>
         </footer>
       </section>
     </section>
@@ -107,14 +140,42 @@ const controls = {
   interim: element<HTMLElement>("#interim"),
   interimText: element<HTMLParagraphElement>("#interim p"),
   queue: element<HTMLElement>("#queue-depth"),
+  storageIndicator: element<HTMLElement>("#storage-indicator"),
+  storageStatus: element<HTMLElement>("#storage-status"),
+  storageDetail: element<HTMLElement>("#storage-detail"),
+  savedCount: element<HTMLElement>("#saved-count"),
+  visibleWindow: element<HTMLElement>("#visible-window"),
+  meetingId: element<HTMLElement>("#meeting-id"),
+  footerStorage: element<HTMLElement>("#footer-storage"),
+  openRecent: element<HTMLButtonElement>("#open-recent"),
+  recentSummary: element<HTMLElement>("#recent-summary"),
+  exportAll: element<HTMLButtonElement>("#export-all"),
+  exportResults: element<HTMLUListElement>("#export-results"),
 };
 
 let latest: MvpSnapshot | null = null;
+let lastExport: MvpExportResult | null = null;
 let pollTimer: number | null = null;
+const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 
 function message(error: unknown): string {
-  const text = error instanceof Error ? error.message : typeof error === "string" ? error : "未知错误";
+  const text =
+    error instanceof Error ? error.message : typeof error === "string" ? error : "未知错误";
   return text.trim().replace(/\s+/g, " ").slice(0, 220) || "未知错误";
+}
+
+function isActive(snapshot: MvpSnapshot): boolean {
+  return ["starting", "recording", "stopping"].includes(snapshot.lifecycle);
+}
+
+function canExport(snapshot: MvpSnapshot): boolean {
+  return (
+    snapshot.meetingId !== null &&
+    !isActive(snapshot) &&
+    ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus) &&
+    hasAllMvpExportFormats(snapshot.availableExports) &&
+    BigInt(snapshot.savedFinalCount) > 0n
+  );
 }
 
 function renderSource(source: AudioSourceSnapshot): void {
@@ -122,48 +183,140 @@ function renderSource(source: AudioSourceSnapshot): void {
   card.dataset.status = source.status;
   element<HTMLElement>(`#${source.id}-label`).textContent = source.label || "未找到设备";
   element<HTMLElement>(`#${source.id}-status`).textContent =
-    source.status === "capturing" ? "采集中" : source.status === "ready" ? "已就绪" : source.status === "degraded" ? "降级" : "异常";
+    source.status === "capturing"
+      ? "采集中"
+      : source.status === "ready"
+        ? "已就绪"
+        : source.status === "degraded"
+          ? "降级"
+          : "异常";
   element<HTMLElement>(`#${source.id}-frames`).textContent = `${source.frames} frames`;
   element<HTMLElement>(`#${source.id}-level`).style.transform = `scaleX(${source.peak})`;
 }
 
+function renderRecent(snapshot: MvpSnapshot): void {
+  controls.openRecent.disabled = snapshot.latestOpenedMeeting === null || isActive(snapshot);
+  controls.recentSummary.textContent =
+    snapshot.latestOpenedMeeting === null
+      ? "暂无已打开会议。"
+      : `最近会议：${snapshot.latestOpenedMeeting}`;
+}
+
+function renderExportArtifact(result: ExportArtifact): HTMLLIElement {
+  const item = document.createElement("li");
+  item.dataset.status = "saved";
+  const label = document.createElement("strong");
+  const detail = document.createElement("span");
+  label.textContent = result.format.toUpperCase();
+  detail.textContent = `${result.path} · ${result.byteLength} bytes`;
+  item.append(label, detail);
+  return item;
+}
+
+function renderExports(snapshot: MvpSnapshot): void {
+  controls.exportAll.disabled = !canExport(snapshot);
+  controls.exportResults.replaceChildren(
+    ...(lastExport?.artifacts.map(renderExportArtifact) ?? []),
+  );
+}
+
 function render(snapshot: MvpSnapshot): void {
   latest = snapshot;
-  const active = ["starting", "recording", "stopping"].includes(snapshot.lifecycle);
-  const ready = snapshot.lifecycle === "ready" && snapshot.modelReady && snapshot.system.ready && snapshot.microphone.ready;
+  const active = isActive(snapshot);
+  const ready =
+    snapshot.lifecycle === "ready" &&
+    snapshot.modelReady &&
+    snapshot.system.ready &&
+    snapshot.microphone.ready &&
+    ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus);
   controls.lifecycle.textContent = snapshot.lifecycle.toUpperCase();
   controls.lifecycle.dataset.state = snapshot.lifecycle;
   controls.elapsed.textContent = formatElapsed(snapshot.elapsedMs);
-  controls.model.textContent = snapshot.modelReady ? snapshot.modelLabel : `不可用 · ${snapshot.modelLabel}`;
+  controls.model.textContent = snapshot.modelReady
+    ? snapshot.modelLabel
+    : `不可用 · ${snapshot.modelLabel}`;
   controls.model.dataset.ready = String(snapshot.modelReady);
   controls.start.disabled = !ready || !controls.consent.checked;
   controls.stop.disabled = !active;
   controls.consent.disabled = active;
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
-  controls.error.textContent = snapshot.error ?? snapshot.system.error ?? snapshot.microphone.error ?? "";
+  controls.error.textContent =
+    snapshot.error ?? snapshot.system.error ?? snapshot.microphone.error ?? "";
+  controls.storageIndicator.dataset.status =
+    snapshot.durabilityStatus === "error" ? "error" : snapshot.durabilityStatus === "initializing" ? "initializing" : "ready";
+  controls.storageStatus.textContent =
+    snapshot.durabilityStatus === "error"
+      ? "本地持久化异常"
+      : snapshot.durabilityStatus === "initializing"
+        ? "初始化本地持久化"
+        : snapshot.durabilityStatus === "recording"
+          ? "本地持久化写入中"
+          : snapshot.durabilityStatus === "completed"
+            ? "会议已完成并持久保存"
+            : snapshot.durabilityStatus === "interrupted"
+              ? "已恢复中断会议"
+              : "本地持久化正常";
+  controls.storageDetail.textContent =
+    "SQLite/WAL · final 仅在 commit ACK 或 DB reopen 后标为已保存";
+  controls.savedCount.textContent = snapshot.savedFinalCount;
+  controls.visibleWindow.textContent = `${snapshot.finals.length} / ${snapshot.totalFinalCount}`;
+  controls.meetingId.textContent = snapshot.meetingId ?? "未打开";
+  controls.footerStorage.textContent =
+    snapshot.durabilityStatus === "error"
+      ? "异常"
+      : snapshot.durabilityStatus === "initializing"
+        ? "初始化"
+        : "SQLite 已开启";
   renderSource(snapshot.system);
   renderSource(snapshot.microphone);
 
   controls.transcript.replaceChildren(
-    ...snapshot.finals.map((segment, index) => {
+    ...snapshot.finals.map((segment) => {
       const item = document.createElement("li");
-      item.innerHTML = `<time>${String(index + 1).padStart(2, "0")}</time><p></p>`;
-      item.querySelector("p")!.textContent = segment.text;
+      const order = document.createElement("time");
+      const body = document.createElement("p");
+      const badge = document.createElement("span");
+      item.className = "saved-final";
+      order.textContent = segment.sequence?.padStart(2, "0") ?? "??";
+      body.textContent = segment.text;
+      badge.className = "saved-badge";
+      badge.textContent = "已保存";
+      item.append(order, body, badge);
       return item;
     }),
   );
   controls.empty.hidden = snapshot.finals.length > 0 || snapshot.interim !== null || active;
   controls.interim.hidden = snapshot.interim === null;
   controls.interimText.textContent = snapshot.interim?.text ?? "";
+  renderRecent(snapshot);
+  renderExports(snapshot);
 }
 
 async function call(command: string, args?: Record<string, unknown>): Promise<MvpSnapshot> {
   return parseMvpSnapshot(await invoke<unknown>(command, args));
 }
 
+async function openRecentMeeting(): Promise<void> {
+  render(await call("mvp_open_recent"));
+}
+
+async function exportMeeting(): Promise<void> {
+  const meetingId = latest?.meetingId;
+  if (meetingId === null || meetingId === undefined) {
+    throw new Error("MVP_EXPORT_MEETING_MISSING");
+  }
+  lastExport = parseMvpExportResult(
+    await invoke<unknown>("mvp_export_meeting", {
+      meetingId,
+      targetDir: MVP_EXPORT_TARGET_DIR,
+    }),
+  );
+  if (latest) render(latest);
+}
+
 function schedulePoll(): void {
   if (pollTimer !== null) window.clearTimeout(pollTimer);
-  if (!latest || !["starting", "recording", "stopping"].includes(latest.lifecycle)) return;
+  if (!latest || !isActive(latest)) return;
   pollTimer = window.setTimeout(async () => {
     try {
       render(await call("mvp_snapshot"));
@@ -182,6 +335,7 @@ controls.consent.addEventListener("change", () => {
 controls.start.addEventListener("click", async () => {
   controls.start.disabled = true;
   controls.error.textContent = "";
+  lastExport = null;
   try {
     render(await call("mvp_start", { consentAccepted: controls.consent.checked }));
     schedulePoll();
@@ -198,6 +352,28 @@ controls.stop.addEventListener("click", async () => {
     schedulePoll();
   } catch (error) {
     controls.error.textContent = `无法停止：${message(error)}`;
+  }
+});
+
+controls.openRecent.addEventListener("click", async () => {
+  controls.openRecent.disabled = true;
+  lastExport = null;
+  try {
+    await openRecentMeeting();
+  } catch (error) {
+    controls.error.textContent = `无法重新打开最近会议：${message(error)}`;
+  } finally {
+    if (latest) render(latest);
+  }
+});
+
+controls.exportAll.addEventListener("click", async () => {
+  controls.exportAll.disabled = true;
+  try {
+    await exportMeeting();
+  } catch (error) {
+    controls.error.textContent = `导出三种格式失败：${message(error)}`;
+    if (latest) render(latest);
   }
 });
 

@@ -83,7 +83,10 @@ fn with_bootstrap_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> taur
             mvp::mvp_preflight,
             mvp::mvp_start,
             mvp::mvp_stop,
-            mvp::mvp_snapshot
+            mvp::mvp_snapshot,
+            mvp::mvp_open_recent,
+            mvp::mvp_open_meeting,
+            mvp::mvp_export_meeting
         ])
 }
 
@@ -181,9 +184,9 @@ mod tests {
         let tauri::ipc::InvokeResponseBody::Json(body) = response else {
             panic!("MVP snapshot returned a raw IPC body");
         };
-        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.v1""#));
+        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.durable.v1""#));
         assert!(body.contains(r#""lifecycle":"booting""#));
-        assert!(body.contains(r#""localOnly":true,"memoryOnly":true"#));
+        assert!(body.contains(r#""localOnly":true,"memoryOnly":false"#));
     }
 
     #[test]

@@ -68,7 +68,25 @@ button:disabled { cursor: not-allowed; opacity: .32; }
 .start-button { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--acid); color: #10140d; }
 .record-mark { width: 8px; height: 8px; border-radius: 50%; background: #27340d; }
 .stop-button { border: 1px solid #3a4642; background: transparent; color: #bcc7c0; }
+.secondary-button { border: 1px solid #3a4642; background: #111917; color: #c7d1cb; font-size: 12px; }
 .error-line { min-height: 34px; margin: 12px 0 0; color: var(--danger); font-size: 11px; line-height: 1.5; }
+
+.storage-panel, .history-panel { margin: 18px 0; padding: 14px; border: 1px solid var(--line); background: rgb(11 17 15 / 70%); }
+.storage-row { display: flex; align-items: flex-start; gap: 11px; }
+.storage-row strong, .storage-row small { display: block; }
+.storage-row strong { color: #dfe9e2; font-size: 12px; font-weight: 580; }
+.storage-row small { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.storage-indicator { width: 9px; height: 9px; margin-top: 4px; border-radius: 50%; background: #6e7c75; box-shadow: 0 0 14px rgb(110 124 117 / 65%); }
+.storage-indicator[data-status="ready"] { background: var(--acid); box-shadow: 0 0 16px var(--acid); }
+.storage-indicator[data-status="degraded"] { background: #f7c95f; box-shadow: 0 0 16px rgb(247 201 95 / 55%); }
+.storage-indicator[data-status="error"] { background: var(--danger); box-shadow: 0 0 16px rgb(255 122 115 / 55%); }
+.storage-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 14px 0 0; }
+.storage-metrics div { min-width: 0; padding: 8px; border: 1px solid #25302c; background: #0d1311; }
+.storage-metrics dt { overflow: hidden; color: var(--muted); font-family: "Cascadia Code", Consolas, monospace; font-size: 8px; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.storage-metrics dd { overflow: hidden; margin: 5px 0 0; color: #e3ede6; font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.history-panel { display: grid; gap: 8px; }
+.export-results { margin: 0; padding: 0; list-style: none; }
+.recent-summary { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 
 .transcript-stage { position: relative; display: flex; min-width: 0; flex-direction: column; padding: 28px 4px 18px 32px; overflow: hidden; }
 .stage-heading { display: flex; align-items: start; justify-content: space-between; border-bottom: 1px solid var(--line); }
@@ -87,15 +105,25 @@ button:disabled { cursor: not-allowed; opacity: .32; }
 .signal-art i:nth-child(3), .signal-art i:nth-child(5) { animation-delay: -.55s; }
 .signal-art i:nth-child(4) { animation-delay: -.25s; }
 @keyframes idle-signal { 50% { height: 58px; background: #66756e; } }
-.transcript-list { min-height: 0; margin: 0; padding: 16px 0 100px; overflow-y: auto; list-style: none; scrollbar-color: #394640 transparent; }
-.transcript-list li { display: grid; grid-template-columns: 36px 1fr; gap: 12px; padding: 12px 8px 14px 0; border-bottom: 1px solid #202925; animation: reveal 180ms ease-out both; }
+.transcript-list { min-height: 0; margin: 0; padding: 16px 0 170px; overflow-y: auto; list-style: none; scrollbar-color: #394640 transparent; }
+.transcript-list li { display: grid; grid-template-columns: 44px 1fr auto; gap: 12px; padding: 12px 8px 14px 0; border-bottom: 1px solid #202925; animation: reveal 180ms ease-out both; }
 @keyframes reveal { from { opacity: 0; transform: translateY(6px); } }
 .transcript-list time { padding-top: 4px; color: #66736d; font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; }
 .transcript-list p { margin: 0; color: #e8eee9; font-size: clamp(15px, 1.6vw, 19px); line-height: 1.65; }
-.interim-line { position: absolute; right: 4px; bottom: 50px; left: 32px; display: grid; grid-template-columns: 42px 1fr; gap: 10px; padding: 13px 16px; border-left: 2px solid var(--acid); background: rgb(20 29 25 / 96%); box-shadow: 0 -18px 36px #090d0c; }
+.saved-badge { align-self: start; margin-top: 3px; padding: 3px 7px; border: 1px solid #526a37; color: var(--acid); font-family: "Cascadia Code", Consolas, monospace; font-size: 8px; text-transform: uppercase; }
+.interim-line { position: absolute; right: 4px; bottom: 118px; left: 32px; display: grid; grid-template-columns: 64px 1fr; gap: 10px; padding: 13px 16px; border-left: 2px solid var(--cyan); background: rgb(16 23 27 / 96%); box-shadow: 0 -18px 36px #090d0c; }
 .interim-line[hidden] { display: none; }
-.interim-line span { padding-top: 3px; color: var(--acid); font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; }
+.interim-line span { padding-top: 3px; color: var(--cyan); font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; }
 .interim-line p { margin: 0; color: #cbd5ce; line-height: 1.5; }
+.export-panel { position: absolute; right: 4px; bottom: 36px; left: 32px; padding: 11px 0 10px; border-top: 1px solid var(--line); background: rgb(9 13 12 / 96%); }
+.export-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.export-actions span { margin-right: auto; color: #7b8881; font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; text-transform: uppercase; }
+.export-actions button { min-height: 32px; padding: 0 12px; }
+.export-results { display: grid; gap: 4px; margin-top: 8px; }
+.export-results li { display: grid; grid-template-columns: 76px 1fr; gap: 8px; color: #9facA5; font-size: 10px; }
+.export-results li[data-status="saved"] strong { color: var(--acid); }
+.export-results li[data-status="failed"] strong, .export-results li[data-status="failed"] span { color: var(--danger); }
+.export-results span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stage-footer { position: absolute; right: 4px; bottom: 0; left: 32px; display: flex; justify-content: flex-end; gap: 24px; padding-top: 14px; border-top: 1px solid var(--line); color: #6f7d75; font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; text-transform: uppercase; }
 .stage-footer strong { color: #aeb9b2; font-weight: 400; }
 
