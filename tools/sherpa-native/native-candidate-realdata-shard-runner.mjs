@@ -480,7 +480,7 @@ function partitionSamples(samples, maxShardSamples) {
 }
 
 function sampleIdentitySha256(sample) {
-  return sha256(Buffer.from(encodeCanonicalJsonLine({
+  return sha256(Buffer.from(JSON.stringify({
     language: sample.language,
     pcm_sha256: sample.pcm_sha256,
     reference_sha256: sample.reference_sha256,
@@ -790,10 +790,19 @@ async function runShardProcess({ dependencies, input, policy, requests }) {
 }
 
 function validateHostResponse(response, request, sample, expected) {
+  if (
+    response === null || typeof response !== "object" || Array.isArray(response) ||
+    !Object.hasOwn(response, "authority")
+  ) fail("REALDATA_HOST_AUTHORITY");
   exactKeys(response, [
-    "candidate", "execution", "host", "kind", "resources", "rtf", "sample",
+    "authority", "candidate", "execution", "host", "kind", "resources", "rtf", "sample",
     "schema_version", "shard",
   ], "REALDATA_HOST_RESPONSE");
+  exactKeys(response.authority, ["formal_claims", "production_evidence"], "REALDATA_HOST_AUTHORITY");
+  if (
+    response.authority.formal_claims !== "none" ||
+    response.authority.production_evidence !== false
+  ) fail("REALDATA_HOST_AUTHORITY");
   exactKeys(response.execution, [
     "backend_execute_calls", "execute_elapsed_ns", "execute_finished_monotonic_ns",
     "execute_started_monotonic_ns", "final_transcript", "final_transcript_sha256",

@@ -57,7 +57,7 @@ function clone(value) {
 }
 
 function sampleIdentitySha256(sample) {
-  return sha256(Buffer.from(encodeCanonicalJsonLine({
+  return sha256(Buffer.from(JSON.stringify({
     language: sample.language,
     pcm_sha256: sample.pcm_sha256,
     reference_sha256: sample.reference_sha256,
@@ -372,7 +372,14 @@ function mockDependencies({ responses, hooks = {} } = {}) {
             ? (responses?.canaryDrift && invokeCalls > 1 ? "drifted canary" : "stable canary")
             : referenceFor(language);
           const transcriptBytes = Buffer.from(transcript, "utf8");
-          return encodeCanonicalJsonLine({
+          const response = {
+            authority: responses?.missingHostAuthority
+              ? undefined
+              : {
+                  formal_claims: responses?.hostAuthorityEscalation ? "quality-pass" : "none",
+                  production_evidence: responses?.hostAuthorityEscalation ? true : false,
+                  ...(responses?.extraHostAuthority ? { public_distribution: true } : {}),
+                },
             candidate: {
               asset_lock_sha256: startupIdentities.asset_lock_sha256,
               candidate_id: "sherpa-native-sensevoice-int8-2024-07-17-win-x64-cpu",
@@ -447,7 +454,9 @@ function mockDependencies({ responses, hooks = {} } = {}) {
               sample_index: String(index),
               total_pcm_bytes: "128",
             },
-          }).trimEnd();
+          };
+          if (responses?.missingHostAuthority) delete response.authority;
+          return encodeCanonicalJsonLine(response).trimEnd();
         }).filter(Boolean);
         if (responses?.duplicate) rows[1] = rows[0];
         return {
@@ -727,6 +736,9 @@ test("shard response omission duplicate reorder reset drift timeout and resource
     ["reference-sha", { badReferenceSha: true }, "REALDATA_HOST_RESPONSE"],
     ["canary-identity", { badCanaryIdentity: true }, "REALDATA_HOST_RESPONSE"],
     ["sample-identity", { badSampleIdentity: true }, "REALDATA_HOST_RESPONSE"],
+    ["missing-authority", { missingHostAuthority: true }, "REALDATA_HOST_AUTHORITY"],
+    ["extra-authority", { extraHostAuthority: true }, "REALDATA_HOST_AUTHORITY"],
+    ["escalated-authority", { hostAuthorityEscalation: true }, "REALDATA_HOST_AUTHORITY"],
   ]) {
     const { input } = await makeContext(t);
     const { dependencies } = mockDependencies({ responses });
@@ -736,6 +748,21 @@ test("shard response omission duplicate reorder reset drift timeout and resource
     );
     await assert.rejects(readFile(input.finalEvidencePath), { code: "ENOENT" }, caseName);
   }
+});
+
+test("host sample identity digest matches Rust compact JSON without trailing newline", () => {
+  const sample = {
+    language: "ja",
+    pcm_sha256: "1".repeat(64),
+    reference_sha256: "2".repeat(64),
+    sample_id: "mr-fleurs-0001",
+    wav_sha256: "3".repeat(64),
+    wav_size_bytes: 46,
+  };
+  const compactPreimage = "{\"language\":\"ja\",\"pcm_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"reference_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"sample_id\":\"mr-fleurs-0001\",\"wav_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"wav_size_bytes\":46}";
+  assert.equal(JSON.stringify(sample), compactPreimage);
+  assert.equal(sampleIdentitySha256(sample), sha256(Buffer.from(compactPreimage, "utf8")));
+  assert.notEqual(sampleIdentitySha256(sample), sha256(Buffer.from(`${compactPreimage}\n`, "utf8")));
 });
 
 test("source policy snapshot and final-publication drift fail closed without replacing competitors", async (t) => {
