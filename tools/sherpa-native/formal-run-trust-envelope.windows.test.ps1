@@ -251,6 +251,46 @@ try {
         throw "Controlled-root attestation fields or privacy boundary drifted"
     }
 
+    $stressRoot = Join-Path $testRoot "inventory-stack-stress"
+    New-Item -ItemType Directory -Path $stressRoot | Out-Null
+    Set-ExactControlledAcl -Path $stressRoot
+    $stressRetentionExpires = [DateTimeOffset]::UtcNow.AddDays(1).ToUnixTimeSeconds()
+    $stressRetentionText = ([string]$stressRetentionExpires) + "`n"
+    [IO.File]::WriteAllText(
+        (Join-Path $stressRoot ".meetingrelay-retention-v1"),
+        $stressRetentionText,
+        [Text.UTF8Encoding]::new($false)
+    )
+    $stressDirectoryDepth = 4
+    $stressLeafDirectory = $stressRoot
+    for ($level = 1; $level -le $stressDirectoryDepth; $level++) {
+        $stressLeafDirectory = Join-Path $stressLeafDirectory ("level-{0:D2}" -f $level)
+        New-Item -ItemType Directory -Path $stressLeafDirectory | Out-Null
+    }
+    $stressFileCount = 1967
+    for ($index = 0; $index -lt $stressFileCount; $index++) {
+        $stressEntry = Join-Path $stressLeafDirectory ("entry-{0:D4}.bin" -f $index)
+        [IO.File]::WriteAllBytes($stressEntry, [byte[]](0x5a))
+    }
+    $stressExpectedCount = 1 + $stressDirectoryDepth + $stressFileCount
+    $stressExpectedBytes = $stressFileCount + [Text.Encoding]::UTF8.GetByteCount($stressRetentionText)
+    $stressFirstResult = Invoke-Attestor -Argument @("attest", $stressRoot)
+    $stressSecondResult = Invoke-Attestor -Argument @("attest", $stressRoot)
+    if ($stressFirstResult.ExitCode -ne 0 -or $stressFirstResult.Stderr.Length -ne 0 -or
+        $stressSecondResult.ExitCode -ne 0 -or $stressSecondResult.Stderr.Length -ne 0) {
+        throw "Large recursive inventory did not attest successfully"
+    }
+    $stressFirst = ConvertFrom-ReceiptLine -Line $stressFirstResult.Stdout -ExpectedMarker "CONTROLLED_ROOT_ATTESTATION=PASS"
+    $stressSecond = ConvertFrom-ReceiptLine -Line $stressSecondResult.Stdout -ExpectedMarker "CONTROLLED_ROOT_ATTESTATION=PASS"
+    if ($stressFirst.inventory_count -cne [string]$stressExpectedCount -or
+        $stressFirst.inventory_bytes -cne [string]$stressExpectedBytes -or
+        $stressFirst.inventory_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        $stressSecond.inventory_count -cne $stressFirst.inventory_count -or
+        $stressSecond.inventory_bytes -cne $stressFirst.inventory_bytes -or
+        $stressSecond.inventory_sha256 -cne $stressFirst.inventory_sha256) {
+        throw "Large recursive inventory count, bytes, or digest drifted"
+    }
+
     $weakChildPath = Join-Path $controlledRoot "weak-child-acl.bin"
     [IO.File]::WriteAllBytes($weakChildPath, [byte[]](9, 9, 9))
     Set-ExactControlledAcl -Path $weakChildPath -AddUsersRead

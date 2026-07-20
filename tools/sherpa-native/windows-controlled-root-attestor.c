@@ -713,7 +713,10 @@ static BOOL scan_directory(
     struct crypto_hash *hash,
     uint64_t *count,
     uint64_t *bytes) {
-    wchar_t pattern[MAX_PATH_CHARS];
+    HANDLE process_heap = NULL;
+    wchar_t *pattern = NULL;
+    wchar_t *child_path = NULL;
+    wchar_t *relative_path = NULL;
     WIN32_FIND_DATAW find_data;
     HANDLE search = INVALID_HANDLE_VALUE;
     struct listed_entry *entries = NULL;
@@ -721,9 +724,32 @@ static BOOL scan_directory(
     size_t capacity = 0U;
     size_t index;
     BOOL ok = FALSE;
-    if (depth > MAX_INVENTORY_DEPTH ||
-        swprintf_s(pattern, MAX_PATH_CHARS, L"%ls\\*", directory_path) <= 0) {
+    if (depth > MAX_INVENTORY_DEPTH) {
         return FALSE;
+    }
+    process_heap = GetProcessHeap();
+    if (process_heap == NULL) {
+        return FALSE;
+    }
+    pattern = (wchar_t *)HeapAlloc(
+        process_heap,
+        HEAP_ZERO_MEMORY,
+        (SIZE_T)MAX_PATH_CHARS * sizeof(*pattern));
+    child_path = (wchar_t *)HeapAlloc(
+        process_heap,
+        HEAP_ZERO_MEMORY,
+        (SIZE_T)MAX_PATH_CHARS * sizeof(*child_path));
+    relative_path = (wchar_t *)HeapAlloc(
+        process_heap,
+        HEAP_ZERO_MEMORY,
+        (SIZE_T)MAX_PATH_CHARS * sizeof(*relative_path));
+    if (pattern == NULL || child_path == NULL || relative_path == NULL ||
+        swprintf_s(
+            pattern,
+            MAX_PATH_CHARS,
+            L"%ls\\*",
+            directory_path) <= 0) {
+        goto cleanup;
     }
     search = FindFirstFileExW(
         pattern,
@@ -733,7 +759,8 @@ static BOOL scan_directory(
         NULL,
         FIND_FIRST_EX_LARGE_FETCH);
     if (search == INVALID_HANDLE_VALUE) {
-        return GetLastError() == ERROR_FILE_NOT_FOUND;
+        ok = GetLastError() == ERROR_FILE_NOT_FOUND;
+        goto cleanup;
     }
     do {
         struct listed_entry *resized;
@@ -783,8 +810,6 @@ static BOOL scan_directory(
     qsort(entries, entry_count, sizeof(*entries), compare_listed_entries);
 
     for (index = 0U; index < entry_count; ++index) {
-        wchar_t child_path[MAX_PATH_CHARS];
-        wchar_t relative_path[MAX_PATH_CHARS];
         BOOL directory =
             (entries[index].attributes & FILE_ATTRIBUTE_DIRECTORY) != 0UL;
         HANDLE child;
@@ -882,7 +907,16 @@ cleanup:
         (void)FindClose(search);
     }
     if (entries != NULL) {
-        (void)HeapFree(GetProcessHeap(), 0UL, entries);
+        (void)HeapFree(process_heap, 0UL, entries);
+    }
+    if (relative_path != NULL) {
+        (void)HeapFree(process_heap, 0UL, relative_path);
+    }
+    if (child_path != NULL) {
+        (void)HeapFree(process_heap, 0UL, child_path);
+    }
+    if (pattern != NULL) {
+        (void)HeapFree(process_heap, 0UL, pattern);
     }
     return ok;
 }
