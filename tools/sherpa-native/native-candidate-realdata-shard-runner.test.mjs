@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -237,7 +237,7 @@ function controlledRootAttestationFor(readiness, overrides = {}) {
 }
 
 async function makeContext(t) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "meetingrelay-realdata-shard-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "meetingrelay-realdata-shard-")));
   t.after(() => rm(root, { force: true, recursive: true }));
   await mkdir(path.join(root, "controlled", "private"), { recursive: true });
   await mkdir(path.join(root, "controlled", "wav"), { recursive: true });
