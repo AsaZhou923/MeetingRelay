@@ -148,6 +148,7 @@ jobs:
       - name: Test and validate WP-0.4 FunASR sidecar package-lock attestation
         run: |
           pnpm phase0:funasr-sidecar-package-lock:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:funasr-sidecar-package-lock:validate
         timeout-minutes: 5
 

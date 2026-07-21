@@ -487,15 +487,16 @@ test("wheel paths reject traversal, UNC/device/drive syntax, symlink/junction, a
 
   await withPackageLockFixture(async (root, fixture) => {
     const { attestPackageLock } = await loadModule();
-    const link = path.join(root, "wheelhouse", "funasr-link.whl");
+    const linkDirectory = path.join(root, "wheelhouse-link");
+    const link = path.join(linkDirectory, "funasr-1.3.22-py3-none-any.whl");
+    await mkdir(linkDirectory, { recursive: true });
     try {
       await symlink(fixture.wheels.funasr.absolute, link);
     } catch (error) {
       if (process.platform === "win32" && error.code === "EPERM") return;
       throw error;
     }
-    fixture.lock.distributions[0].wheel.relative_path = "wheelhouse/funasr-link.whl";
-    fixture.lock.distributions[0].wheel.filename = "funasr-link.whl";
+    fixture.lock.distributions[0].wheel.relative_path = "wheelhouse-link/funasr-1.3.22-py3-none-any.whl";
     await writeFile(fixture.packageLockAbsolute, encodeCanonicalJson(fixture.lock), "utf8");
     const manifest = JSON.parse(readFileSync(fixture.manifestPath, "utf8"));
     const packageLock = manifest.files.find((entry) => entry.role === "package-lock");
