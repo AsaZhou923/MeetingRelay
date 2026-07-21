@@ -242,6 +242,29 @@ node tools/funasr-sidecar/sidecar-source-attestation.mjs --run-synthetic
 
 This is fixed-file-byte-match-only evidence, not Git provenance, CPython provenance, packaging authority, quality assessment, production evidence, or public distribution approval.
 
+### FunASR sidecar package-lock attestation
+
+WP-0.4.4e interprets the `package-lock` bytes already bound by the WP-0.4.4b candidate aggregate and verifies the byte identity of every referenced wheel under the same controlled root. The production CLI is:
+
+```powershell
+node tools/funasr-sidecar/sidecar-package-lock-attestation.mjs --attest `
+  <controlled-root> `
+  <canonical-4b-input-manifest.json> `
+  <expected-candidate-aggregate-sha256>
+```
+
+The lock is strict canonical UTF-8/NFC/LF JSON and fixes Windows AMD64 CPython 3.12 targeting, exact root pins, a closed dependency graph, wheel-only/offline materialization policy, resolver and expected-environment declarations, and bounded artifact identities. Referenced wheels are opened without following symlinks or junctions, rejected when hard-linked, and hashed with bounded streaming plus root/file postflight checks. Wheel filename distribution/version/tags must match the lock and be compatible with `cp312`/`win_amd64` or a universal Python 3 wheel. Declared audit origins are limited to the official PyPI artifact host and, for wheels, the official PyTorch artifact host; these URLs are provenance declarations, not network retrieval instructions.
+
+Public evidence fixes `measurement_status=package-lock-attestation-only`, `execution_status=lock-contract-and-wheel-byte-identity-only-no-install-no-import`, `packaging_authority=lock-contract-only`, and `source_build_authority=environment_materialization_authority=cpython_provenance_authority=package_metadata_authority=license_authority=import_authority=none`. It is path-free and text-free. METADATA, RECORD, license, import-map, resolver-report, expected-environment-report, source-archive, and build-attestation hashes remain declarations whose target bytes are not opened by this slice.
+
+The independent validator uses synthetic files only to exercise the contract and prints a strict evidence marker:
+
+```powershell
+node tools/funasr-sidecar/sidecar-package-lock-attestation.mjs --run-synthetic
+```
+
+Synthetic fixture bytes do not prove valid wheel structure, an installed environment, CPython provenance, FunASR import/model/audio/network execution, source-build provenance, package approval, quality, selection, production readiness, or distribution authority.
+
 ### Collector-only measured HW-REF
 
 WP-0.4.3f1 adds a Windows-native, privacy-whitelisted collector foundation. Before running it, independently measure or verify every operator fact; do not substitute guesses or values copied from a plumbing smoke. The output parent must already exist below this repository's ignored `target/` tree:
