@@ -102,6 +102,8 @@ pnpm phase0:resources:test
 pnpm phase0:resources:validate
 pnpm phase0:funasr-sidecar-preflight:test
 pnpm phase0:funasr-sidecar-preflight:validate
+pnpm phase0:funasr-sidecar-python-launch:test
+pnpm phase0:funasr-sidecar-python-launch:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 pnpm --dir apps/desktop test
@@ -189,6 +191,32 @@ node tools/funasr-sidecar/sidecar-candidate-preflight.mjs --preflight <controlle
 ```
 
 This command does not launch Python, import FunASR, load a model, process audio, access the network, download files, select a package form, rank candidates, mark a default, or grant public distribution authority.
+
+### FunASR sidecar Python-compatible launch probe
+
+WP-0.4.4c adds only a real process launch probe for the runtime file already bound by the WP-0.4.4b canonical manifest. The production CLI is:
+
+```powershell
+node tools/funasr-sidecar/sidecar-python-launch.mjs --launch `
+  <controlled-root> `
+  <canonical-4b-input-manifest.json> `
+  <absolute-python-executable> `
+  <expected-candidate-aggregate-sha256>
+```
+
+The launcher re-runs `preflightCandidate`, requires the expected candidate aggregate to match exactly, re-reads the canonical manifest and checks its SHA-256 against the preflight evidence, locates the exact `runtime` relative path, and requires the explicit absolute executable to resolve to that file. It records runtime logical ID hash, size, and hash before and after launch; validates the controlled-root identity before and after launch; rejects unsafe paths, symlinks, junctions, and special files where observable; and starts the direct child with `shell=false`, `windowsHide=true`, `detached=false`, cwd set to the controlled root, minimal environment, bounded stdin/stdout/stderr, timeout, and bounded direct-child cleanup.
+
+The only child arguments are the fixed Python-compatible probe contract: `-I -S -B -c <fixed probe source>`. The fixed source imports only Python stdlib `sys`, `struct`, and `json`, reads exactly one MRSW `hello` request, and emits exactly one canonical `hello_ok` response. This proves only that the caller-provided 4b-bound executable accepted the fixed Python isolation flags and completed the hello probe. A compatible executable can emulate that CLI, so the evidence does not prove CPython provenance, loaded-image identity, base DLLs, stdlib, site-packages, runtime packaging closure, materialization closure, or product distribution suitability.
+
+Public evidence is path-free and text-free and fixes `measurement_status=python-launch-probe-only`, `execution_status=interpreter-launched-no-funasr`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, `selection_authority=none`, and `packaging_authority=none`. It binds the schema SHA-256, launcher source SHA-256, 4b schema/source/evidence SHA-256, candidate aggregate, runtime role identity, fixed probe SHA-256, imported wire foundation source SHA-256, one-frame transcript SHA-256, fixed-argument/process contract, and direct-child close.
+
+The independent validator creates a temporary venv under the controlled root only as a fixture and prints a strict evidence marker:
+
+```powershell
+node tools/funasr-sidecar/sidecar-python-launch.mjs --run-synthetic
+```
+
+The venv fixture exists so Windows CI performs an actual positive Python-compatible process launch without a skip. It is test-fixture-only and is not a product packaging choice. Fault coverage uses deterministic injected child processes and does not broaden the production CLI. Pending work remains: FunASR import, model load, audio processing, network access, download, heartbeat/progress/restart, Job Object or grandchild containment, quality/performance/ranking/selection/default/distribution authority, parent closeout, and Phase 1 completion.
 
 ### Collector-only measured HW-REF
 
