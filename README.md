@@ -144,6 +144,29 @@ node tools/phase0-harness/validate-candidate-artifact-contract.mjs --existing <b
 
 The contract digest and every accepted license-text digest must come from an out-of-band approved run plan, legal record, or evidence ledger, not from the bundle being checked. Completed raw evidence still cannot declare a candidate eligible, selected, ranked, default, production-ready, or compliant with a formal `PERF-*`/SLO.
 
+### FunASR sidecar wire foundation
+
+WP-0.4.4a defines only the mock FunASR sidecar wire/fault foundation. It does not run Python, FunASR, a downloaded model, real audio, a network service, quality thresholds, ranking, default selection, publication, heartbeat/progress, restart scheduling, source/build attestation, Job Object containment, or grandchild-process containment.
+
+The binary frame format is `MRSW` magic bytes, version `1`, a 13-byte prelude, a big-endian `u32` canonical JSON header length, and a big-endian `u32` payload length. Headers are UTF-8 canonical JSON lines ending in exactly one LF; BOM, CR, NUL, non-UTF-8, empty headers, headers over 65,536 bytes, and payloads over 1,048,576 bytes are rejected. The Rust foundation in `crates/model-worker-contract/src/sidecar_wire.rs` preserves the same byte framing and stable `SIDECAR_WIRE_*` error codes for future native transports.
+
+The mock state sequence is fixed at five request/response pairs:
+
+1. `hello` -> `hello_ok`
+2. `prepare` -> `prepared`
+3. `audio` -> `audio_ok`
+4. `flush` -> `flushed`
+5. `shutdown` -> `shutdown_ok`
+
+The wire transcript digest uses the domain-separated preimage `meetingrelay.sidecar-wire.transcript.v1\n` once, then the ordered full encoded frames prefixed by `H` for core-to-worker frames and `W` for worker-to-core frames. The public evidence authority is intentionally narrow: `kind=meetingrelay-funasr-sidecar-wire-foundation-v1`, `measurement_status=wire-fault-foundation-only`, `execution_status=mock-sidecar-only`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, and `public_distribution=false`. The supervisor records only direct child process close under bounded cleanup.
+
+Run the foundation checks from the repository root:
+
+```powershell
+pnpm phase0:funasr-sidecar-wire:test
+pnpm phase0:funasr-sidecar-wire:validate
+```
+
 ### Collector-only measured HW-REF
 
 WP-0.4.3f1 adds a Windows-native, privacy-whitelisted collector foundation. Before running it, independently measure or verify every operator fact; do not substitute guesses or values copied from a plumbing smoke. The output parent must already exist below this repository's ignored `target/` tree:

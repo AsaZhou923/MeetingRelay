@@ -123,6 +123,10 @@ jobs:
         run: pnpm phase0:sherpa-formal-run-trust:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4 FunASR sidecar wire foundation (mock-sidecar only)
+        run: pnpm phase0:funasr-sidecar-wire:test
+        timeout-minutes: 5
+
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5

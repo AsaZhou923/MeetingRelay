@@ -9,6 +9,7 @@ mod error;
 mod fake;
 mod identity;
 mod protocol;
+mod sidecar_wire;
 
 pub use candidate_conformance::{
     CandidateConformanceError, NativeCandidateSemanticObservation,
@@ -35,4 +36,9 @@ pub use protocol::{
     HelloRequest, HelloResponse, MinorExtensionPolicy, NetworkPolicy, OperatingSystem, Platform,
     TransportKind, WORKER_PROTOCOL_NAME, WORKER_PROTOCOL_V1, WorkerLimits, WorkerManifest,
     WorkerProtocolVersion, WorkerRole,
+};
+pub use sidecar_wire::{
+    SIDECAR_WIRE_MAGIC, SIDECAR_WIRE_MAX_HEADER_LEN, SIDECAR_WIRE_PRELUDE_LEN,
+    SIDECAR_WIRE_VERSION, SidecarWireDirection, SidecarWireError, SidecarWireFrame,
+    build_sidecar_wire_transcript_preimage, decode_sidecar_wire_frame, encode_sidecar_wire_frame,
 };
