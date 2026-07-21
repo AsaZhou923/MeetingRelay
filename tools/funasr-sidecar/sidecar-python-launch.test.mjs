@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 
 import { encodeCanonicalJson } from "../phase0-harness/canonical-json.mjs";
 import { REQUIRED_ROLES, preflightCandidate, sha256Hex } from "./sidecar-candidate-preflight.mjs";
+import { BOUNDARY_SOURCE_PATH } from "./sidecar-python-probe-boundary.mjs";
 import {
   FIXED_ARGS,
   FIXED_PROBE_SHA256,
@@ -181,6 +182,8 @@ test("actual venv Python launch emits deterministic path-free public evidence", 
     assert.equal(left.public_distribution, false);
     assert.equal(left.selection_authority, "none");
     assert.equal(left.packaging_authority, "none");
+    assert.equal(left.schema_version, "1.1");
+    assert.equal(left.python_probe_boundary_source_sha256, sha256Hex(readFileSync(BOUNDARY_SOURCE_PATH)));
     assert.equal(left.probe.fixed_probe_sha256, FIXED_PROBE_SHA256);
     assert.equal(left.process_contract.shell, false);
     assert.equal(left.process_contract.windowsHide, true);
@@ -231,6 +234,18 @@ test("CLI launch emits strict marker and rejects usage drift", async () => {
 });
 
 test("aggregate, manifest hash, executable root, wrong path, and runtime drift fail closed", async () => {
+  await withSyntheticExecutableFixture(async (root, fixture) => {
+    await assert.rejects(
+      () =>
+        launchPythonCandidate(root, fixture.manifestPath, fixture.executablePath, fixture.aggregate, {
+          beforeRuntimeOpenForTest: async (absolute) => {
+            writeFileSync(absolute, Buffer.alloc(fixture.manifest.files.find((entry) => entry.role === "runtime").size_bytes, 0x44));
+          },
+          spawnImpl: () => fakeChild({ stdout: goodResponseBytes() }),
+        }),
+      /PYTHON_LAUNCH_RUNTIME_DRIFT/u,
+    );
+  });
   await withSyntheticExecutableFixture(async (root, fixture) => {
     await assert.rejects(() => launchPythonCandidate(root, fixture.manifestPath, fixture.executablePath, "f".repeat(64), { spawnImpl: () => fakeChild({ stdout: goodResponseBytes() }) }), /PYTHON_LAUNCH_AGGREGATE/u);
     const outsideRoot = await mkdtemp(path.join(tmpdir(), "meetingrelay-outside-python-"));
@@ -336,6 +351,8 @@ test("schema mirrors validator constants and evidence rejects overclaim or forbi
   const schema = JSON.parse(await readFile(PUBLIC_EVIDENCE_SCHEMA_PATH, "utf8"));
   assert.equal(schema.additionalProperties, false);
   assert.equal(schema.properties.kind.const, PUBLIC_EVIDENCE_KIND);
+  assert.equal(schema.properties.schema_version.const, "1.1");
+  assert.equal(schema.properties.python_probe_boundary_source_sha256.$ref, "#/$defs/sha256");
   assert.equal(schema.properties.measurement_status.const, "python-launch-probe-only");
   assert.equal(schema.properties.execution_status.const, "interpreter-launched-no-funasr");
   assert.equal(schema.properties.quality_gate_status.const, "not-assessed");

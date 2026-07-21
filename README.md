@@ -218,6 +218,30 @@ node tools/funasr-sidecar/sidecar-python-launch.mjs --run-synthetic
 
 The venv fixture exists so Windows CI performs an actual positive Python-compatible process launch without a skip. It is test-fixture-only and is not a product packaging choice. Fault coverage uses deterministic injected child processes and does not broaden the production CLI. Pending work remains: FunASR import, model load, audio processing, network access, download, heartbeat/progress/restart, Job Object or grandchild containment, quality/performance/ranking/selection/default/distribution authority, parent closeout, and Phase 1 completion.
 
+### FunASR sidecar source attestation
+
+WP-0.4.4d adds only source-attestation evidence for the `sidecar-source` file already bound by the WP-0.4.4b canonical manifest. The production CLI is:
+
+```powershell
+node tools/funasr-sidecar/sidecar-source-attestation.mjs --attest `
+  <controlled-root> `
+  <canonical-4b-input-manifest.json> `
+  <absolute-python-executable> `
+  <expected-candidate-aggregate-sha256>
+```
+
+The attestor re-runs the 4b preflight and exact aggregate check, binds the manifest `sidecar-source` size/hash to the fixed MeetingRelay reference file bytes read by the validator from `tools/funasr-sidecar/python/meetingrelay_funasr_sidecar.py`, enforces a strict source envelope, and sends only bounded candidate bytes to a fixed isolated auditor. The auditor runs as `-I -S -B -c <fixed auditor>`, parses with `ast.parse`, compiles with `compile`, and does not import, execute, eval, py_compile, compileall, runpy, importlib-load, or otherwise run the candidate source.
+
+Public evidence fixes `measurement_status=source-attestation-only`, `execution_status=source-parse-compile-only-no-import`, `source_binding_scope=fixed-file-byte-match-only`, `git_provenance_authority=none`, `cpython_provenance_authority=none`, `packaging_authority=none`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, and `selection_authority=none`. It is path-free and text-free, and binds only digests/sizes for the attestor, schema, shared boundary, fixed auditor, fixed reference source, 4b evidence, candidate aggregate, runtime identity, and stable parse/compile counts.
+
+The independent validator creates a temporary venv under the controlled root only as a fixture and prints a strict evidence marker:
+
+```powershell
+node tools/funasr-sidecar/sidecar-source-attestation.mjs --run-synthetic
+```
+
+This is fixed-file-byte-match-only evidence, not Git provenance, CPython provenance, packaging authority, quality assessment, production evidence, or public distribution approval.
+
 ### Collector-only measured HW-REF
 
 WP-0.4.3f1 adds a Windows-native, privacy-whitelisted collector foundation. Before running it, independently measure or verify every operator fact; do not substitute guesses or values copied from a plumbing smoke. The output parent must already exist below this repository's ignored `target/` tree:

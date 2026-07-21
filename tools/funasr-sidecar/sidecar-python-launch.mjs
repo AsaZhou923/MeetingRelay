@@ -1,12 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { TextDecoder } from "node:util";
 
 import { encodeCanonicalJson } from "../phase0-harness/canonical-json.mjs";
 import {
@@ -15,52 +13,40 @@ import {
   VALIDATOR_SOURCE_PATH as PREFLIGHT_SOURCE_PATH,
   preflightCandidate,
   sha256Hex,
-  validateRelativePath,
 } from "./sidecar-candidate-preflight.mjs";
 import {
-  DEFAULT_CLEANUP_TIMEOUT_MS,
-  DEFAULT_MAX_STDIO_BYTES,
-  DEFAULT_TIMEOUT_MS,
   MAX_HEADER_BYTES,
   WIRE_VERSION,
   WireProtocolError,
   computeWireTranscriptSha256,
-  decodeFrames,
   encodeFrame,
   sha256Hex as wireSha256Hex,
-  validateRequestHeader,
-  validateResponseHeader,
 } from "./sidecar-wire-foundation.mjs";
+import {
+  BOUNDARY_SOURCE_PATH,
+  FIXED_HELLO_PROBE_SHA256,
+  FIXED_HELLO_PROBE_SOURCE,
+  FIXED_PYTHON_ARGS,
+  bindExactManifestRuntime,
+  getBoundRuntimeSnapshot,
+  pathsEqualForPlatform,
+  postflightExactRuntimeRootIdentity,
+  runFixedHelloProbe,
+} from "./sidecar-python-probe-boundary.mjs";
 
 export const PUBLIC_EVIDENCE_KIND = "meetingrelay-funasr-sidecar-python-launch-v1";
-export const PUBLIC_EVIDENCE_SCHEMA_VERSION = "1.0";
+export const PUBLIC_EVIDENCE_SCHEMA_VERSION = "1.1";
 export const PUBLIC_EVIDENCE_SCHEMA_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "sidecar-python-launch.schema.json",
 );
 export const LAUNCHER_SOURCE_PATH = fileURLToPath(import.meta.url);
 export const WIRE_FOUNDATION_SOURCE_PATH = fileURLToPath(new URL("./sidecar-wire-foundation.mjs", import.meta.url));
-export const FIXED_PROBE_SOURCE = [
-  "import sys,struct,json",
-  "def read_exact(n):",
-  " b=sys.stdin.buffer.read(n)",
-  " if len(b)!=n: raise SystemExit(11)",
-  " return b",
-  "p=read_exact(13)",
-  "magic,version,hlen,plen=struct.unpack('>4sBII',p)",
-  "if magic!=b'MRSW' or version!=1 or hlen>65536 or plen!=0: raise SystemExit(12)",
-  "h=read_exact(hlen)",
-  "if not h.endswith(b'\\n') or b'\\r' in h or b'\\x00' in h: raise SystemExit(13)",
-  "req=json.loads(h.decode('utf-8'))",
-  "if req!={'role':'sidecar-candidate','sequence':1,'transport':'isolated-process','type':'hello'}: raise SystemExit(14)",
-  "resp={'role':'sidecar-candidate','sequence':1,'transport':'isolated-process','type':'hello_ok'}",
-  "out=(json.dumps(resp,sort_keys=True,separators=(',',':'))+'\\n').encode('utf-8')",
-  "sys.stdout.buffer.write(struct.pack('>4sBII',b'MRSW',1,len(out),0)+out)",
-].join("\n");
-export const FIXED_PROBE_SHA256 = sha256Hex(Buffer.from(FIXED_PROBE_SOURCE, "utf8"));
-export const FIXED_ARGS = Object.freeze(["-I", "-S", "-B", "-c"]);
+export const FIXED_PROBE_SOURCE = FIXED_HELLO_PROBE_SOURCE;
+export const FIXED_PROBE_SHA256 = FIXED_HELLO_PROBE_SHA256;
+export const FIXED_ARGS = FIXED_PYTHON_ARGS;
+export { pathsEqualForPlatform };
 
-const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const SHA256_RE = /^[0-9a-f]{64}$/u;
 const FORBIDDEN_PUBLIC_KEYS = new Set([
   "absolute_path",
@@ -134,170 +120,6 @@ function assertSha256(value, code, label) {
 
 function assertPositiveSize(value, code, label) {
   if (!Number.isSafeInteger(value) || value < 1) fail(code, `${label} must be a positive safe integer`);
-}
-
-function rejectUnsafeLocalPath(inputPath, code, label, options = {}) {
-  if (typeof inputPath !== "string" || inputPath.length === 0) fail(code, `${label} must be a non-empty local path`);
-  const parsed = path.win32.parse(inputPath);
-  const colonIndexes = [...inputPath.matchAll(/:/gu)].map((match) => match.index);
-  const hasOnlyAbsoluteDriveColon =
-    colonIndexes.length === 1 &&
-    colonIndexes[0] === 1 &&
-    parsed.root.length === 3 &&
-    /^[A-Za-z]:[\\/]/u.test(inputPath);
-  if (
-    inputPath.startsWith("\\\\") ||
-    inputPath.startsWith("//") ||
-    /^\\\\[.?]\\|^\/\/[.?]\//u.test(inputPath) ||
-    /^[A-Za-z]:(?![\\/])/u.test(inputPath) ||
-    (colonIndexes.length > 0 && !hasOnlyAbsoluteDriveColon) ||
-    inputPath.includes("\0") ||
-    /[\r\n]/u.test(inputPath) ||
-    (options.pathListElement === true && inputPath.includes(path.delimiter)) ||
-    (options.absolute === true && !path.isAbsolute(inputPath))
-  ) {
-    fail(code, `${label} must be local path syntax, not UNC/device/drive-relative/ADS syntax`);
-  }
-  return path.resolve(inputPath);
-}
-
-export function pathsEqualForPlatform(left, right, platform = process.platform) {
-  const leftResolved = path.resolve(left);
-  const rightResolved = path.resolve(right);
-  return platform === "win32" ? leftResolved.toLowerCase() === rightResolved.toLowerCase() : leftResolved === rightResolved;
-}
-
-function sameFileIdentity(left, right) {
-  return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.mode === right.mode
-  );
-}
-
-function resolveInsideRoot(controlledRoot, relativePath) {
-  validateRelativePath(relativePath);
-  const root = path.resolve(controlledRoot);
-  const absolute = path.resolve(root, ...relativePath.split("/"));
-  const rootPrefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
-  const comparableAbsolute = process.platform === "win32" ? absolute.toLowerCase() : absolute;
-  const comparableRootPrefix = process.platform === "win32" ? rootPrefix.toLowerCase() : rootPrefix;
-  if (!pathsEqualForPlatform(absolute, root) && !comparableAbsolute.startsWith(comparableRootPrefix)) {
-    fail("PYTHON_LAUNCH_ROOT_ESCAPE", "relative_path escaped controlled root");
-  }
-  return absolute;
-}
-
-async function assertPathChainHasNoLinks(absolutePath) {
-  const resolved = path.resolve(absolutePath);
-  const parsed = path.parse(resolved);
-  let current = parsed.root;
-  const relative = path.relative(parsed.root, resolved);
-  const segments = relative === "" ? [] : relative.split(path.sep);
-  for (const segment of segments) {
-    current = path.join(current, segment);
-    const link = await lstat(current, { bigint: true }).catch((error) => {
-      fail("PYTHON_LAUNCH_FILE_OPEN", error.message);
-    });
-    if (link.isSymbolicLink() || !link.isFile() && !link.isDirectory()) {
-      fail("PYTHON_LAUNCH_SPECIAL_FILE", "path chain must not contain a symlink, junction, or special file");
-    }
-  }
-}
-
-async function readBoundedCanonicalJson(filePath, code, label, maxBytes = 64 * 1024) {
-  const absolute = rejectUnsafeLocalPath(filePath, code, label);
-  await assertPathChainHasNoLinks(absolute);
-  const handle = await open(absolute, "r").catch((error) => fail(code, error.message));
-  try {
-    const stat = await handle.stat({ bigint: true });
-    if (!stat.isFile() || stat.size <= 0n || stat.size > BigInt(maxBytes)) {
-      fail(code, `${label} must be a bounded regular file`);
-    }
-    const bytes = await handle.readFile();
-    let text;
-    try {
-      text = UTF8_DECODER.decode(bytes);
-    } catch (error) {
-      fail(code, `${label} must be strict UTF-8: ${error.message}`);
-    }
-    if (!Buffer.from(text, "utf8").equals(bytes) || text.includes("\r") || !text.endsWith("\n")) {
-      fail(code, `${label} must be UTF-8 canonical JSON with LF`);
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (error) {
-      fail(code, `${label} must parse as JSON: ${error.message}`);
-    }
-    if (encodeCanonicalJson(parsed) !== text) fail(code, `${label} must be canonical indented JSON with one terminal LF`);
-    return { absolute, bytes, parsed, sha256: sha256Hex(bytes) };
-  } finally {
-    await handle.close();
-  }
-}
-
-async function statRegularFileNoLinks(filePath, expected = undefined) {
-  const absolute = path.resolve(filePath);
-  await assertPathChainHasNoLinks(absolute);
-  const before = await lstat(absolute, { bigint: true }).catch((error) => fail("PYTHON_LAUNCH_FILE_OPEN", error.message));
-  if (!before.isFile() || before.isSymbolicLink()) fail("PYTHON_LAUNCH_SPECIAL_FILE", "runtime must be a regular file");
-  const handle = await open(absolute, "r").catch((error) => fail("PYTHON_LAUNCH_FILE_OPEN", error.message));
-  try {
-    const current = await handle.stat({ bigint: true });
-    if (!current.isFile()) fail("PYTHON_LAUNCH_SPECIAL_FILE", "runtime handle must be a regular file");
-    const beforeIdentity = { dev: before.dev, ino: before.ino, birthtimeNs: before.birthtimeNs, mode: before.mode };
-    const currentIdentity = { dev: current.dev, ino: current.ino, birthtimeNs: current.birthtimeNs, mode: current.mode };
-    if (!sameFileIdentity(beforeIdentity, currentIdentity)) {
-      fail("PYTHON_LAUNCH_RUNTIME_DRIFT", "runtime file identity drifted while opening");
-    }
-    const hash = createHash("sha256");
-    for await (const chunk of handle.createReadStream()) {
-      hash.update(chunk);
-    }
-    const observed = {
-      size_bytes: Number(current.size),
-      sha256: hash.digest("hex"),
-      file_identity: currentIdentity,
-    };
-    if (
-      expected !== undefined &&
-      (observed.size_bytes !== expected.size_bytes ||
-        observed.sha256 !== expected.sha256 ||
-        expected.file_identity !== undefined && !sameFileIdentity(observed.file_identity, expected.file_identity))
-    ) {
-      fail("PYTHON_LAUNCH_RUNTIME_DRIFT", "runtime size or hash drifted");
-    }
-    return observed;
-  } finally {
-    await handle.close();
-  }
-}
-
-function minimalEnv(executablePath) {
-  if (process.platform === "win32") {
-    const systemRoot = rejectUnsafeLocalPath(
-      process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows",
-      "PYTHON_LAUNCH_ENV",
-      "SystemRoot",
-      { absolute: true, pathListElement: true },
-    );
-    const executableDirectory = rejectUnsafeLocalPath(path.dirname(executablePath), "PYTHON_LAUNCH_ENV", "runtime directory", {
-      absolute: true,
-      pathListElement: true,
-    });
-    return {
-      SystemRoot: systemRoot,
-      WINDIR: systemRoot,
-      PATH: `${executableDirectory};${systemRoot}\\System32`,
-    };
-  }
-  const executableDirectory = rejectUnsafeLocalPath(path.dirname(executablePath), "PYTHON_LAUNCH_ENV", "runtime directory", {
-    absolute: true,
-    pathListElement: true,
-  });
-  return { PATH: `${executableDirectory}:/usr/bin:/bin` };
 }
 
 async function runBoundedProcess(command, args, options = {}) {
@@ -431,107 +253,11 @@ function collectBounded(stream, maxBytes, label, reject) {
   };
 }
 
-async function launchProbe(executablePath, controlledRoot, options = {}) {
-  const requestFrames = [
-    { header: { type: "hello", sequence: 1, role: "sidecar-candidate", transport: "isolated-process" }, payload: Buffer.alloc(0) },
-  ];
-  validateRequestHeader(requestFrames[0].header, 1, requestFrames[0].payload);
-  const stdinBytes = encodeFrame(requestFrames[0].header, requestFrames[0].payload, { maxPayloadBytes: 0 });
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const cleanupTimeoutMs = options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS;
-  const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDIO_BYTES;
-  const maxStderrBytes = options.maxStderrBytes ?? 64 * 1024;
-  const spawnOptions = {
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: false,
-    windowsHide: true,
-    detached: false,
-    cwd: controlledRoot,
-    env: minimalEnv(executablePath),
-  };
-  const spawnImpl = options.spawnImpl ?? spawn;
-  const child = spawnImpl(executablePath, [...FIXED_ARGS, FIXED_PROBE_SOURCE], spawnOptions);
-  let timedOut = false;
-  let failureError;
-  let exitResult = { code: null, signal: null };
-  let closed = false;
-  let signalFailure;
-  const failureSignal = new Promise((resolveFailure) => {
-    signalFailure = resolveFailure;
-  });
-  const failChild = (error) => {
-    if (!failureError) {
-      failureError = error;
-      if (!child.killed) child.kill();
-      signalFailure();
-    }
-  };
-  const stdoutBuffer = collectBounded(child.stdout, maxStdoutBytes, "PYTHON_LAUNCH_STDOUT", failChild);
-  const stderrBuffer = collectBounded(child.stderr, maxStderrBytes, "PYTHON_LAUNCH_STDERR", failChild);
-  const close = new Promise((resolveClose) => {
-    child.on("error", (error) => failChild(new PythonLaunchError("PYTHON_LAUNCH_SPAWN_FAILED", error.message)));
-    child.on("exit", (code, signal) => {
-      exitResult = { code, signal };
-    });
-    child.on("close", () => {
-      closed = true;
-      resolveClose();
-    });
-  });
-  child.stdin.on("error", (error) => {
-    failChild(new PythonLaunchError("PYTHON_LAUNCH_STDIN_WRITE_FAILED", error.message));
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    failChild(new PythonLaunchError("PYTHON_LAUNCH_TIMEOUT", "python launch probe exceeded timeout"));
-  }, timeoutMs);
-  let cleanupTimedOut = false;
-  try {
-    child.stdin.end(stdinBytes, (error) => {
-      if (error) failChild(new PythonLaunchError("PYTHON_LAUNCH_STDIN_WRITE_FAILED", error.message));
-    });
-    await Promise.race([close, failureSignal]);
-  } finally {
-    clearTimeout(timer);
-    stdoutBuffer.stop();
-    stderrBuffer.stop();
-    if (!closed && !child.killed) child.kill();
-    if (!closed) {
-      const cleanupCompleted = await Promise.race([
-        close.then(() => true),
-        new Promise((resolveDelay) => setTimeout(() => resolveDelay(false), cleanupTimeoutMs)),
-      ]);
-      cleanupTimedOut = cleanupCompleted !== true;
-    }
-  }
-  if (cleanupTimedOut) fail("PYTHON_LAUNCH_DIRECT_CHILD_CLOSE_TIMEOUT", "direct child did not close within bounded cleanup");
-  if (timedOut && !failureError) failureError = new PythonLaunchError("PYTHON_LAUNCH_TIMEOUT", "python launch probe exceeded timeout");
-  if (failureError) throw failureError;
-  const stderr = stderrBuffer.read();
-  if (stderr.length !== 0) fail("PYTHON_LAUNCH_STDERR_NONEMPTY", "python launch probe stderr must be empty");
-  if (exitResult.code !== 0 || exitResult.signal !== null) fail("PYTHON_LAUNCH_NONZERO_EXIT", "python launch probe must exit cleanly");
-  const responseFrames = decodeFrames(stdoutBuffer.read(), { maxPayloadBytes: 0, maxFrames: 2 });
-  if (responseFrames.length !== 1) fail("PYTHON_LAUNCH_RESPONSE_COUNT", "python launch probe must return exactly one response frame");
-  if (responseFrames[0].payload.length !== 0) fail("PYTHON_LAUNCH_PAYLOAD_UNEXPECTED", "hello_ok must not carry payload");
-  validateResponseHeader(responseFrames[0].header, 1);
-  if (responseFrames[0].header.type !== "hello_ok") fail("PYTHON_LAUNCH_RESPONSE_ORDER", "python launch probe must return hello_ok");
-  return {
-    requestFrames,
-    responseFrames,
-    processContract: {
-      shell: spawnOptions.shell,
-      windowsHide: spawnOptions.windowsHide,
-      detached: spawnOptions.detached,
-      cwd_is_controlled_root: true,
-      minimal_environment: true,
-      root_before_after_identity_match: true,
-      path_entries: spawnOptions.env.PATH.split(process.platform === "win32" ? ";" : ":").length,
-      proxy_environment_forwarded: false,
-      fixed_argument_count: FIXED_ARGS.length + 1,
-      fixed_arguments_sha256: sha256Hex(Buffer.from(encodeCanonicalJson([...FIXED_ARGS, "<fixed-probe-source>"]), "utf8")),
-      direct_child_closed: true,
-    },
-  };
+function mapBoundaryError(error) {
+  if (typeof error.code !== "string" || !error.code.startsWith("PYTHON_PROBE_BOUNDARY_")) throw error;
+  const mappedCode = error.code.replace("PYTHON_PROBE_BOUNDARY_", "PYTHON_LAUNCH_");
+  const mappedMessage = error.message.replace(/^PYTHON_PROBE_BOUNDARY_[A-Z_]+: /u, "");
+  throw new PythonLaunchError(mappedCode, mappedMessage);
 }
 
 function scanForbiddenPublicEvidence(value, pathSegments = []) {
@@ -555,54 +281,20 @@ function scanForbiddenPublicEvidence(value, pathSegments = []) {
 
 export async function launchPythonCandidate(controlledRoot, inputManifestPath, pythonExecutablePath, expectedAggregateSha256, options = {}) {
   assertSha256(expectedAggregateSha256, "PYTHON_LAUNCH_AGGREGATE", "expected candidate aggregate");
-  const root = rejectUnsafeLocalPath(controlledRoot, "PYTHON_LAUNCH_ROOT", "controlled root", { absolute: true });
-  const executable = rejectUnsafeLocalPath(pythonExecutablePath, "PYTHON_LAUNCH_EXECUTABLE", "python executable", { absolute: true });
-  await assertPathChainHasNoLinks(root);
-  const rootStat = await lstat(root, { bigint: true }).catch((error) => fail("PYTHON_LAUNCH_ROOT", error.message));
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) fail("PYTHON_LAUNCH_ROOT", "controlled root must be a directory");
-
-  const preflightEvidence = await preflightCandidate(root, inputManifestPath);
-  if (preflightEvidence.candidate_descriptor.aggregate_sha256 !== expectedAggregateSha256) {
-    fail("PYTHON_LAUNCH_AGGREGATE", "expected candidate aggregate did not match preflight evidence");
+  let bound;
+  let probeRun;
+  let postflight;
+  try {
+    bound = await bindExactManifestRuntime(controlledRoot, inputManifestPath, pythonExecutablePath, expectedAggregateSha256, options);
+    probeRun = await runFixedHelloProbe(bound, options);
+    postflight = await postflightExactRuntimeRootIdentity(bound);
+  } catch (error) {
+    mapBoundaryError(error);
   }
-  const reread = await readBoundedCanonicalJson(inputManifestPath, "PYTHON_LAUNCH_MANIFEST", "input manifest");
-  if (reread.sha256 !== preflightEvidence.canonical_input_manifest_sha256) {
-    fail("PYTHON_LAUNCH_MANIFEST_DRIFT", "canonical manifest changed after preflight");
-  }
-  const runtimeManifest = reread.parsed.files.find((entry) => entry.role === "runtime");
-  if (!runtimeManifest) fail("PYTHON_LAUNCH_MANIFEST", "runtime role missing");
-  validateRelativePath(runtimeManifest.relative_path);
-  const runtimeAbsolute = resolveInsideRoot(root, runtimeManifest.relative_path);
-  if (!pathsEqualForPlatform(executable, runtimeAbsolute)) {
-    fail("PYTHON_LAUNCH_EXECUTABLE_MISMATCH", "explicit executable must be the manifest runtime file");
-  }
-  const [runtimeReal, executableReal] = await Promise.all([realpath(runtimeAbsolute), realpath(executable)]).catch((error) => {
-    fail("PYTHON_LAUNCH_EXECUTABLE", error.message);
-  });
-  if (!pathsEqualForPlatform(runtimeReal, executableReal)) {
-    fail("PYTHON_LAUNCH_EXECUTABLE_MISMATCH", "explicit executable must resolve to the manifest runtime file");
-  }
-  const expectedRuntime = {
-    size_bytes: runtimeManifest.size_bytes,
-    sha256: runtimeManifest.sha256,
-  };
-  const runtimeBefore = await statRegularFileNoLinks(runtimeAbsolute, expectedRuntime);
-  const explicitBefore = await statRegularFileNoLinks(executable, expectedRuntime);
-  if (!sameFileIdentity(runtimeBefore.file_identity, explicitBefore.file_identity)) {
-    fail("PYTHON_LAUNCH_EXECUTABLE_MISMATCH", "explicit executable must be the manifest runtime file identity");
-  }
-  const probeRun = await launchProbe(runtimeAbsolute, root, options);
-  const rootAfter = await lstat(root, { bigint: true }).catch((error) => fail("PYTHON_LAUNCH_ROOT", error.message));
-  if (
-    rootStat.dev !== rootAfter.dev ||
-    rootStat.ino !== rootAfter.ino ||
-    rootStat.birthtimeNs !== rootAfter.birthtimeNs ||
-    !rootAfter.isDirectory() ||
-    rootAfter.isSymbolicLink()
-  ) {
-    fail("PYTHON_LAUNCH_ROOT_DRIFT", "controlled root identity drifted during launch");
-  }
-  const runtimeAfter = await statRegularFileNoLinks(runtimeAbsolute, runtimeBefore);
+  const boundSnapshot = getBoundRuntimeSnapshot(bound);
+  const runtimeManifest = boundSnapshot.runtime_manifest;
+  const runtimeBefore = boundSnapshot.runtime_before;
+  const preflightEvidence = boundSnapshot.preflight_evidence;
   const schemaBytes = await readFile(PUBLIC_EVIDENCE_SCHEMA_PATH);
   JSON.parse(schemaBytes.toString("utf8"));
   const launcherBytes = await readFile(LAUNCHER_SOURCE_PATH);
@@ -612,6 +304,7 @@ export async function launchPythonCandidate(controlledRoot, inputManifestPath, p
     schema_version: PUBLIC_EVIDENCE_SCHEMA_VERSION,
     schema_file_sha256: sha256Hex(schemaBytes),
     launcher_source_sha256: sha256Hex(launcherBytes),
+    python_probe_boundary_source_sha256: sha256Hex(readFileSync(BOUNDARY_SOURCE_PATH)),
     preflight_schema_sha256: sha256Hex(readFileSync(PREFLIGHT_SCHEMA_PATH)),
     preflight_validator_source_sha256: sha256Hex(readFileSync(PREFLIGHT_SOURCE_PATH)),
     preflight_evidence_sha256: sha256Hex(Buffer.from(encodeCanonicalJson(preflightEvidence), "utf8")),
@@ -631,10 +324,7 @@ export async function launchPythonCandidate(controlledRoot, inputManifestPath, p
       logical_id_sha256: sha256Hex(Buffer.from(runtimeManifest.logical_id, "utf8")),
       size_bytes: runtimeBefore.size_bytes,
       sha256: runtimeBefore.sha256,
-      before_after_identity_match:
-        runtimeBefore.size_bytes === runtimeAfter.size_bytes &&
-        runtimeBefore.sha256 === runtimeAfter.sha256 &&
-        sameFileIdentity(runtimeBefore.file_identity, runtimeAfter.file_identity),
+      before_after_identity_match: postflight.runtime_before_after_identity_match,
     },
     probe: {
       fixed_probe_sha256: FIXED_PROBE_SHA256,
@@ -648,7 +338,11 @@ export async function launchPythonCandidate(controlledRoot, inputManifestPath, p
       request_frame_sha256: wireSha256Hex(encodeFrame(probeRun.requestFrames[0].header, probeRun.requestFrames[0].payload, { maxPayloadBytes: 0 })),
       response_frame_sha256: wireSha256Hex(encodeFrame(probeRun.responseFrames[0].header, probeRun.responseFrames[0].payload, { maxPayloadBytes: 0 })),
     },
-    process_contract: probeRun.processContract,
+    process_contract: {
+      ...probeRun.processContract,
+      fixed_argument_count: FIXED_ARGS.length + 1,
+      fixed_arguments_sha256: sha256Hex(Buffer.from(encodeCanonicalJson([...FIXED_ARGS, "<fixed-probe-source>"]), "utf8")),
+    },
     limitations: [...LIMITATIONS],
   };
   validatePublicEvidence(evidence);
@@ -664,6 +358,7 @@ export function validatePublicEvidence(evidence) {
       "schema_version",
       "schema_file_sha256",
       "launcher_source_sha256",
+      "python_probe_boundary_source_sha256",
       "preflight_schema_sha256",
       "preflight_validator_source_sha256",
       "preflight_evidence_sha256",
@@ -692,6 +387,7 @@ export function validatePublicEvidence(evidence) {
   for (const key of [
     "schema_file_sha256",
     "launcher_source_sha256",
+    "python_probe_boundary_source_sha256",
     "preflight_schema_sha256",
     "preflight_validator_source_sha256",
     "preflight_evidence_sha256",
@@ -703,6 +399,7 @@ export function validatePublicEvidence(evidence) {
   if (
     evidence.schema_file_sha256 !== sha256Hex(readFileSync(PUBLIC_EVIDENCE_SCHEMA_PATH)) ||
     evidence.launcher_source_sha256 !== sha256Hex(readFileSync(LAUNCHER_SOURCE_PATH)) ||
+    evidence.python_probe_boundary_source_sha256 !== sha256Hex(readFileSync(BOUNDARY_SOURCE_PATH)) ||
     evidence.preflight_schema_sha256 !== sha256Hex(readFileSync(PREFLIGHT_SCHEMA_PATH)) ||
     evidence.preflight_validator_source_sha256 !== sha256Hex(readFileSync(PREFLIGHT_SOURCE_PATH))
   ) {
