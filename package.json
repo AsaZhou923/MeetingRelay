@@ -40,6 +40,8 @@
     "phase0:sherpa-formal-run-trust:windows:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/sherpa-native/formal-run-trust-envelope.windows.test.ps1",
     "phase0:funasr-sidecar-wire:test": "node --test tools/funasr-sidecar/sidecar-wire-foundation.test.mjs",
     "phase0:funasr-sidecar-wire:validate": "node tools/funasr-sidecar/sidecar-wire-foundation.mjs --run",
+    "phase0:funasr-sidecar-preflight:test": "node --test tools/funasr-sidecar/sidecar-candidate-preflight.test.mjs",
+    "phase0:funasr-sidecar-preflight:validate": "node tools/funasr-sidecar/sidecar-candidate-preflight.mjs --run-synthetic",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",
     "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",

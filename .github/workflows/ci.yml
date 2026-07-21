@@ -127,6 +127,12 @@ jobs:
         run: pnpm phase0:funasr-sidecar-wire:test
         timeout-minutes: 5
 
+      - name: Test and validate WP-0.4 FunASR sidecar candidate preflight (identity bytes only)
+        run: |
+          pnpm phase0:funasr-sidecar-preflight:test
+          pnpm phase0:funasr-sidecar-preflight:validate
+        timeout-minutes: 5
+
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5

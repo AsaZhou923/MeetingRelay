@@ -100,6 +100,8 @@ pnpm phase0:clock:test
 pnpm phase0:clock:validate
 pnpm phase0:resources:test
 pnpm phase0:resources:validate
+pnpm phase0:funasr-sidecar-preflight:test
+pnpm phase0:funasr-sidecar-preflight:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 pnpm --dir apps/desktop test
@@ -166,6 +168,27 @@ Run the foundation checks from the repository root:
 pnpm phase0:funasr-sidecar-wire:test
 pnpm phase0:funasr-sidecar-wire:validate
 ```
+
+### FunASR sidecar candidate preflight
+
+WP-0.4.4b adds only a sidecar-candidate byte-identity preflight. It consumes a caller-supplied canonical JSON manifest and exactly one file for each role under one absolute local controlled root: `runtime`, `package-lock`, `model`, `model-manifest`, `parameters`, `sidecar-source`, and `license`. The validator rejects unsafe or non-NFC relative paths, duplicate or unordered roles, duplicate logical IDs, case-insensitive duplicate paths, empty files, files over 8 GiB, total expected input over 16 GiB, digest or size drift, symlinks/junctions/special files where Node can observe them, noncanonical JSON, unknown fields, and authority overclaims. Candidate files are hashed by streaming from already-open handles with fixed-size chunks; the bounded manifest file is read only after regular-file and identity checks.
+
+The public evidence is intentionally path-free and text-free. It binds the schema-file SHA-256, validator-source SHA-256, canonical input-manifest SHA-256, per-role file SHA-256/size, and a deterministic candidate descriptor/aggregate digest. Its authority is fixed to `measurement_status=identity-preflight-only`, `execution_status=not-executed`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, and `selection_authority=none`. Runtime packaging remains opaque and unselected; license bytes are not distribution approval.
+
+Run the offline synthetic checks from the repository root:
+
+```powershell
+pnpm phase0:funasr-sidecar-preflight:test
+pnpm phase0:funasr-sidecar-preflight:validate
+```
+
+To preflight real caller-provided bytes without executing them:
+
+```powershell
+node tools/funasr-sidecar/sidecar-candidate-preflight.mjs --preflight <controlled-root> <canonical-input-manifest.json>
+```
+
+This command does not launch Python, import FunASR, load a model, process audio, access the network, download files, select a package form, rank candidates, mark a default, or grant public distribution authority.
 
 ### Collector-only measured HW-REF
 

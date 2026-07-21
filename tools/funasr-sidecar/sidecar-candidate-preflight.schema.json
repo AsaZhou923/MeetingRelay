@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "meetingrelay-funasr-sidecar-candidate-preflight.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "schema_version",
+    "schema_file_sha256",
+    "validator_source_sha256",
+    "canonical_input_manifest_sha256",
+    "measurement_status",
+    "execution_status",
+    "quality_gate_status",
+    "formal_claims",
+    "production_evidence",
+    "public_distribution",
+    "selection_authority",
+    "worker_role",
+    "roles",
+    "candidate_descriptor",
+    "limitations"
+  ],
+  "properties": {
+    "kind": { "const": "meetingrelay-funasr-sidecar-candidate-preflight-v1" },
+    "schema_version": { "const": "1.0" },
+    "schema_file_sha256": { "$ref": "#/$defs/sha256" },
+    "validator_source_sha256": { "$ref": "#/$defs/sha256" },
+    "canonical_input_manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "measurement_status": { "const": "identity-preflight-only" },
+    "execution_status": { "const": "not-executed" },
+    "quality_gate_status": { "const": "not-assessed" },
+    "formal_claims": { "const": "none" },
+    "production_evidence": { "const": false },
+    "public_distribution": { "const": false },
+    "selection_authority": { "const": "none" },
+    "worker_role": { "const": "sidecar-candidate" },
+    "roles": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        { "$ref": "#/$defs/license_role" },
+        { "$ref": "#/$defs/model_role" },
+        { "$ref": "#/$defs/model_manifest_role" },
+        { "$ref": "#/$defs/package_lock_role" },
+        { "$ref": "#/$defs/parameters_role" },
+        { "$ref": "#/$defs/runtime_role" },
+        { "$ref": "#/$defs/sidecar_source_role" }
+      ],
+      "items": false
+    },
+    "candidate_descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptor_sha256", "aggregate_sha256", "preimage_domain", "role_count"],
+      "properties": {
+        "descriptor_sha256": { "$ref": "#/$defs/sha256" },
+        "aggregate_sha256": { "$ref": "#/$defs/sha256" },
+        "preimage_domain": { "const": "meetingrelay.funasr.sidecar-candidate.identity-preflight.v1" },
+        "role_count": { "const": 7 }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "const": "identity-preflight-only: bytes are hashed and joined, but no Python process, FunASR import, model load, audio, network, download, packaging selection, ranking, default, or public distribution authority is exercised"
+        },
+        {
+          "const": "runtime packaging form remains opaque and unselected; runtime bytes are only one caller-provided identity input"
+        },
+        {
+          "const": "license bytes are identified for review plumbing only; this is not legal approval, distribution approval, or publication authority"
+        },
+        {
+          "const": "public evidence intentionally omits filesystem paths, file contents, plaintext, secrets, environment values, timings, and host identity"
+        }
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": { "const": "0000000000000000000000000000000000000000000000000000000000000000" }
+    },
+    "role_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "logical_id_sha256", "sha256", "size_bytes"],
+      "properties": {
+        "role": { "type": "string" },
+        "logical_id_sha256": { "$ref": "#/$defs/sha256" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 8589934592 }
+      }
+    },
+    "license_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "license" } } }
+      ]
+    },
+    "model_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "model" } } }
+      ]
+    },
+    "model_manifest_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "model-manifest" } } }
+      ]
+    },
+    "package_lock_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "package-lock" } } }
+      ]
+    },
+    "parameters_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "parameters" } } }
+      ]
+    },
+    "runtime_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "runtime" } } }
+      ]
+    },
+    "sidecar_source_role": {
+      "allOf": [
+        { "$ref": "#/$defs/role_row" },
+        { "properties": { "role": { "const": "sidecar-source" } } }
+      ]
+    }
+  }
+}
