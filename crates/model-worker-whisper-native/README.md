@@ -57,3 +57,32 @@ Its authority ceiling is
 `selection_authority=none`, and `fallback_authority=none`. It does not launch
 a runtime, load a model, accept audio, transcribe, measure quality, select or
 rank a fallback, mark a default, or approve distribution/legal use.
+
+## WP-0.4.5c runtime version probe
+
+The crate now also exposes the default-off native binary
+`meetingrelay-whisper-runtime-version-probe`, gated by `native-whisper`. It
+accepts only `--meetingrelay-whisper-runtime-version-probe-v1`, calls
+`linked_whisper_cpp_version()`, and prints one bounded marker for the Node
+attestor in `tools/whisper-native/whisper-fallback-runtime-version-probe.mjs`.
+
+Build and run the native probe only on a host with CMake, libclang, and MSVC:
+
+```powershell
+cargo build -p meetingrelay-model-worker-whisper-native --bin meetingrelay-whisper-runtime-version-probe --no-default-features --features native-whisper --offline --locked
+target\debug\meetingrelay-whisper-runtime-version-probe.exe --meetingrelay-whisper-runtime-version-probe-v1
+```
+
+Its authority ceiling is
+`measurement_status=whisper-runtime-version-marker-path-observation-only`,
+`execution_status=runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription`,
+`launch_binding_status=preflight-prespawn-postflight-path-identity-observed-spawn-reopen-window-not-eliminated`,
+`loaded_image_attestation=false`, `network_isolation_authority=none`,
+`quality_gate_status=not-assessed`, `formal_claims=none`,
+`production_evidence=false`, `public_distribution=false`,
+`selection_authority=none`, and `fallback_authority=none`. It still does not
+load a model, accept audio, transcribe, implement `ModelBackend`, measure
+quality/performance, select/rank/default a fallback, or approve distribution.
+The Node supervisor performs preflight, immediate pre-spawn, and postflight
+path/file-identity checks, but its path-based `spawn` cannot eliminate the final
+reopen window or attest the loaded image.

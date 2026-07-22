@@ -14,5 +14,10 @@ native-whisper = ["dep:whisper-rs"]
 [dependencies]
 whisper-rs = { version = "=0.16.0", default-features = false, optional = true }
 
+[[bin]]
+name = "meetingrelay-whisper-runtime-version-probe"
+path = "src/bin/meetingrelay_whisper_runtime_version_probe.rs"
+required-features = ["native-whisper"]
+
 [lints]
 workspace = true

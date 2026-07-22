@@ -237,6 +237,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
+      - name: Test and validate WP-0.4.5c whisper fallback runtime version probe harness (synthetic only)
+        run: |
+          pnpm phase0:whisper-runtime-version-probe:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm phase0:whisper-runtime-version-probe:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 5
+
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5
@@ -407,6 +415,115 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p meetingrelay-model-worker-whisper-native --all-targets --no-default-features --features native-whisper --offline --locked -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 15
+
+      - name: Run WP-0.4.5c whisper native runtime version-marker path observation
+        shell: pwsh
+        run: |
+          $repositoryRoot = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $probeRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'target/whisper-native/runtime-version-probe'))
+          $targetPrefix = ([IO.Path]::GetFullPath((Join-Path $repositoryRoot 'target'))).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          if (-not $probeRoot.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "whisper runtime probe root escaped target"
+          }
+          if (Test-Path -LiteralPath $probeRoot) {
+            Remove-Item -LiteralPath $probeRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+
+          $messages = @(& cargo build `
+            -p meetingrelay-model-worker-whisper-native `
+            --bin meetingrelay-whisper-runtime-version-probe `
+            --no-default-features `
+            --features native-whisper `
+            --message-format=json `
+            --offline `
+            --locked | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($LASTEXITCODE -ne 0) { throw "cargo failed to build whisper runtime version probe" }
+          $executables = @($messages |
+            Where-Object {
+              $_.reason -eq 'compiler-artifact' -and
+              $_.target.name -eq 'meetingrelay-whisper-runtime-version-probe' -and
+              @($_.target.kind).Count -eq 1 -and
+              [string]$_.target.kind[0] -eq 'bin' -and
+              -not [string]::IsNullOrWhiteSpace([string]$_.executable)
+            } |
+            ForEach-Object { [IO.Path]::GetFullPath([string]$_.executable) } |
+            Sort-Object -Unique)
+          if ($executables.Count -ne 1) {
+            throw "expected exactly one whisper runtime version probe executable"
+          }
+          $probeExe = $executables[0]
+          $runtimeRelative = 'inputs/meetingrelay-whisper-runtime-version-probe.exe'
+          $inputsRoot = Join-Path $probeRoot 'inputs'
+          New-Item -ItemType Directory -Path $inputsRoot -Force | Out-Null
+          $runtimePath = [IO.Path]::GetFullPath((Join-Path $probeRoot $runtimeRelative))
+          Copy-Item -LiteralPath $probeExe -Destination $runtimePath
+
+          $roles = [ordered]@{
+            'adapter-source' = 'native adapter source identity bytes only'
+            'license' = 'native runtime license review identity bytes only'
+            'model' = 'opaque model identity placeholder bytes no model load'
+            'model-manifest' = '{"synthetic":true,"role":"model-manifest"}'
+            'package-lock' = '{"synthetic":true,"role":"package-lock"}'
+            'parameters' = '{"synthetic":true,"role":"parameters"}'
+          }
+          $files = @()
+          foreach ($role in $roles.Keys) {
+            $relative = "inputs/$role.bytes"
+            $absolute = [IO.Path]::GetFullPath((Join-Path $probeRoot $relative))
+            [IO.File]::WriteAllText($absolute, "$($roles[$role])`n", [Text.UTF8Encoding]::new($false))
+            $bytes = [IO.File]::ReadAllBytes($absolute)
+            $files += [ordered]@{
+              role = $role
+              logical_id = "ci-$role"
+              relative_path = $relative
+              sha256 = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
+              size_bytes = $bytes.Length
+            }
+          }
+          $runtimeBytes = [IO.File]::ReadAllBytes($runtimePath)
+          $files += [ordered]@{
+            role = 'runtime'
+            logical_id = 'ci-whisper-runtime-version-probe'
+            relative_path = $runtimeRelative
+            sha256 = (Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            size_bytes = $runtimeBytes.Length
+          }
+          $manifest = [ordered]@{
+            kind = 'meetingrelay-whisper-fallback-candidate-preflight-input-v1'
+            schema_version = '1.0'
+            worker_role = 'whisper-fallback-candidate'
+            measurement_status = 'whisper-fallback-identity-preflight-only'
+            execution_status = 'not-executed-no-model-no-transcription'
+            quality_gate_status = 'not-assessed'
+            formal_claims = 'none'
+            production_evidence = $false
+            public_distribution = $false
+            selection_authority = 'none'
+            fallback_authority = 'none'
+            files = $files
+          }
+          $manifestPath = [IO.Path]::GetFullPath((Join-Path $probeRoot 'input-manifest.raw.json'))
+          $canonicalManifestPath = [IO.Path]::GetFullPath((Join-Path $probeRoot 'input-manifest.json'))
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+          $aggregateOutput = @(node -e "import { readFile, writeFile } from 'node:fs/promises'; import { encodeCanonicalJson } from './tools/phase0-harness/canonical-json.mjs'; import { preflightWhisperFallbackCandidate } from './tools/whisper-native/whisper-fallback-candidate-preflight.mjs'; const root=process.argv[1], raw=process.argv[2], canonical=process.argv[3]; const manifest=JSON.parse(await readFile(raw,'utf8')); await writeFile(canonical, encodeCanonicalJson(manifest), 'utf8'); const evidence=await preflightWhisperFallbackCandidate(root, canonical); console.log(evidence.candidate_descriptor.aggregate_sha256);" $probeRoot $manifestPath $canonicalManifestPath)
+          if ($LASTEXITCODE -ne 0 -or $aggregateOutput.Count -ne 1 -or $aggregateOutput[0] -notmatch '^[0-9a-f]{64}$') {
+            throw "failed to calculate whisper runtime candidate aggregate"
+          }
+          $aggregate = [string]$aggregateOutput[0]
+          $output = @(& pnpm phase0:whisper-runtime-version-probe:run $probeRoot $canonicalManifestPath $runtimePath $aggregate)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "whisper runtime version probe validation failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^whisper-fallback-runtime-version-probe=verified evidence_sha256=[0-9a-f]{64} candidate_aggregate_sha256=[0-9a-f]{64} runtime_sha256=[0-9a-f]{64} stdout_marker_sha256=[0-9a-f]{64} linked_version_sha256=[0-9a-f]{64} measurement_status=whisper-runtime-version-marker-path-observation-only execution_status=runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription quality_gate_status=not-assessed formal_claims=none production_evidence=false public_distribution=false selection_authority=none fallback_authority=none launch_binding_status=preflight-prespawn-postflight-path-identity-observed-spawn-reopen-window-not-eliminated loaded_image_attestation=false network_isolation_authority=none$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "whisper runtime version probe marker is missing or duplicated"
+          }
+          if (@(git status --porcelain=v1 -- Cargo.lock).Count -ne 0) {
+            throw "whisper runtime version probe changed Cargo.lock"
+          }
         timeout-minutes: 15
 
       - name: Lint Rust workspace including desktop MVP and sherpa wrapper

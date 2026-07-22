@@ -108,6 +108,8 @@ pnpm phase0:funasr-sidecar-venv-materialization:test
 pnpm phase0:funasr-sidecar-venv-materialization:validate
 pnpm phase0:whisper-candidate-preflight:test
 pnpm phase0:whisper-candidate-preflight:validate
+pnpm phase0:whisper-runtime-version-probe:test
+pnpm phase0:whisper-runtime-version-probe:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 cargo test --package meetingrelay-model-worker-whisper-native --no-default-features --locked
@@ -217,6 +219,33 @@ node tools/whisper-native/whisper-fallback-candidate-preflight.mjs --preflight <
 ```
 
 This command does not launch a runtime, load a model, process audio, transcribe, access the network, download files, select a fallback, rank candidates, mark a default, or grant public distribution authority.
+
+### WP-0.4.5c whisper fallback runtime version probe
+
+WP-0.4.5c adds only a runtime version-marker path observation for the `runtime` role already attested by WP-0.4.5b. The Node attestor re-runs the 5b preflight, requires the caller-provided expected candidate aggregate, verifies the explicit runtime path by realpath, bounded streaming SHA-256, size, hardlink count, and stable file identity, repeats that check immediately before a direct path-based launch with one fixed argument, and re-checks root/runtime identity after exit.
+
+The dedicated native binary is `meetingrelay-whisper-runtime-version-probe`, gated by `native-whisper`. Its audited source accepts only `--meetingrelay-whisper-runtime-version-probe-v1` and emits one bounded marker from the linked whisper.cpp version API. The general CLI observes a caller-provided executable marker; it does not source-attest that executable. Public evidence remains path-free and text-free: it records schema/source/preflight digests, runtime role identity, stdout-marker SHA-256, linked-version SHA-256, and the process contract, but not filesystem paths, stdout text, the version string, model names, transcripts, timings, or environment values.
+
+Its authority is fixed to `measurement_status=whisper-runtime-version-marker-path-observation-only`, `execution_status=runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription`, `launch_binding_status=preflight-prespawn-postflight-path-identity-observed-spawn-reopen-window-not-eliminated`, `loaded_image_attestation=false`, `network_isolation_authority=none`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, `selection_authority=none`, and `fallback_authority=none`. Node path-based process creation reopens the executable path after verification, so this slice does not attest the loaded image or eliminate the final spawn window. Model selection/download/load, audio, transcription, quality/performance/resource claims, fallback eligibility/ranking/defaults, public distribution, legal approval, parent closeout, and Phase 1 remain pending.
+
+Run the synthetic harness from the repository root:
+
+```powershell
+pnpm phase0:whisper-runtime-version-probe:test
+pnpm phase0:whisper-runtime-version-probe:validate
+```
+
+Run against a caller-provided runtime path that matches the 5b manifest before launch:
+
+```powershell
+node tools/whisper-native/whisper-fallback-runtime-version-probe.mjs --probe `
+  <controlled-root> `
+  <canonical-input-manifest.json> `
+  <absolute-runtime-probe-executable> `
+  <expected-candidate-aggregate-sha256>
+```
+
+This command grants no model, audio, transcription, network-isolation, download, fallback-selection, ranking, default, or public-distribution authority. It forwards no proxy environment, but it does not enforce operating-system network isolation. Because Node cannot bind `spawn` to the already hashed file handle, pre-spawn and postflight identity matches are observations rather than loaded-image attestation.
 
 ### FunASR sidecar Python-compatible launch probe
 
