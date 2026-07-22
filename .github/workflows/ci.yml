@@ -181,6 +181,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
+      - name: Test and validate WP-0.4 FunASR sidecar artifact-pack attestation
+        run: |
+          pnpm phase0:funasr-sidecar-artifact-pack:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm phase0:funasr-sidecar-artifact-pack:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 5
+
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5

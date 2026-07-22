@@ -291,6 +291,30 @@ node tools/funasr-sidecar/sidecar-venv-materialization-attestation.mjs --run-syn
 
 Those CI wheels contain no real FunASR/PyTorch code and do not prove an actual FunASR environment, package quality, import behavior, model load, audio processing, OS-level network isolation, source-build replay, license approval, production readiness, selection, default status, or distribution authority.
 
+### FunASR sidecar artifact-pack attestation
+
+WP-0.4.4g starts from the WP-0.4.4b candidate aggregate and WP-0.4.4e package-lock/wheel byte identity, then verifies a private canonical artifact-pack manifest under the same controlled root. The production CLI is:
+
+```powershell
+node tools/funasr-sidecar/sidecar-artifact-pack-attestation.mjs --attest `
+  <controlled-root> `
+  <canonical-4b-input-manifest.json> `
+  <canonical-artifact-pack-manifest.json> `
+  <expected-candidate-aggregate-sha256>
+```
+
+The artifact-pack manifest binds target bytes for 77 license file sets, five source archives, five canonical build-record JSON files, a resolver report, an expected-environment projection, and a top-level import map for the fixed Windows AMD64 CPython 3.12 `cp312/win_amd64` CPU-baseline contract. Every referenced artifact must be a regular non-symlink, non-hardlink file inside the controlled root, with unique case-insensitive paths, stable identity before/after hashing, and exact size/SHA-256 matches against package-lock declarations. Build records must internally bind the locked source archive, wheel hash, package identity, and target, but builds are not replayed.
+
+Public evidence fixes `measurement_status=artifact-pack-target-byte-attestation-only`, `execution_status=artifact-target-bytes-verified-no-install-no-import`, `packaging_authority=artifact-pack-byte-identity-only`, `source_build_authority=source-archive-and-build-record-target-bytes-bound-only`, `license_authority=license-set-target-bytes-verified-not-legal-approval`, `resolver_report_authority=target-record-bytes-bound-only`, `environment_report_authority=expected-projection-target-bytes-bound-only`, and `import_map_authority=target-bytes-bound-no-import`. It keeps `package_metadata_authority=environment_materialization_authority=cpython_provenance_authority=import_authority=none`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, and `selection_authority=none`.
+
+The independent validator creates a synthetic artifact-pack fixture without venv installation:
+
+```powershell
+node tools/funasr-sidecar/sidecar-artifact-pack-attestation.mjs --run-synthetic
+```
+
+Those fixture bytes exercise artifact-pack binding only. They do not prove real FunASR/PyTorch source provenance, build replay, legal license approval, CPython provenance, installed metadata, environment materialization, FunASR import, model load, audio processing, quality/performance, production readiness, selection, default status, or distribution authority.
+
 ### Collector-only measured HW-REF
 
 WP-0.4.3f1 adds a Windows-native, privacy-whitelisted collector foundation. Before running it, independently measure or verify every operator fact; do not substitute guesses or values copied from a plumbing smoke. The output parent must already exist below this repository's ignored `target/` tree:
