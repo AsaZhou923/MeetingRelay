@@ -9,7 +9,9 @@
     "test": "node --test src/bootstrap-contract.test.mjs src/mvp-contract.test.mjs",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",
-    "tauri:build:ci": "tauri build --no-bundle -- --offline --locked"
+    "tauri:build:ci": "tauri build --no-bundle -- --offline --locked",
+    "release:personal": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../tools/mvp/release.ps1",
+    "release:personal:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../tools/mvp/release.test.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1"

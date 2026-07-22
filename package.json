@@ -7,6 +7,8 @@
     "desktop:dev": "pnpm --dir apps/desktop dev",
     "desktop:build": "pnpm --dir apps/desktop build",
     "desktop:typecheck": "pnpm --dir apps/desktop typecheck",
+    "mvp:release:personal": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/mvp/release.ps1",
+    "mvp:release:personal:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/mvp/release.test.ps1",
     "phase0:fixtures:generate": "node tools/phase0-harness/generate-fixtures.mjs",
     "phase0:fixtures:test": "node --test tools/phase0-harness/fixture-contract.test.mjs",
     "phase0:fixtures:validate": "node tools/phase0-harness/validate-fixtures.mjs",
