@@ -46,6 +46,38 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
 
+      - name: Resolve Windows whisper native build tools
+        shell: pwsh
+        run: |
+          $cmakeCandidates = @(Get-Command cmake.exe -CommandType Application -All -ErrorAction Stop |
+            ForEach-Object { [IO.Path]::GetFullPath($_.Source) } |
+            Sort-Object -Unique)
+          if ($cmakeCandidates.Count -lt 1) { throw "PATH does not expose cmake.exe" }
+          $cmakePath = $cmakeCandidates[0]
+          $clangCandidates = @(Get-Command clang.exe -CommandType Application -All -ErrorAction Stop |
+            ForEach-Object { [IO.Path]::GetFullPath($_.Source) } |
+            Sort-Object -Unique)
+          $llvmBins = @($clangCandidates |
+            ForEach-Object { Split-Path -Parent $_ } |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_ 'libclang.dll') -PathType Leaf } |
+            Sort-Object -Unique)
+          if ($llvmBins.Count -lt 1) {
+            throw "no PATH-visible clang.exe has a sibling libclang.dll"
+          }
+          $llvmBin = $llvmBins[0]
+          $clangPath = Join-Path $llvmBin 'clang.exe'
+          $libclangPath = Join-Path $llvmBin 'libclang.dll'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CMAKE=$cmakePath" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvmBin" -Encoding utf8
+          Write-Host "MEETINGRELAY_WHISPER_CMAKE=$cmakePath candidates=$($cmakeCandidates.Count)"
+          Write-Host "MEETINGRELAY_WHISPER_CLANG=$clangPath candidates=$($clangCandidates.Count)"
+          Write-Host "MEETINGRELAY_WHISPER_LIBCLANG=$libclangPath"
+          & $cmakePath --version
+          if ($LASTEXITCODE -ne 0) { throw "cmake version probe failed" }
+          & $clangPath --version
+          if ($LASTEXITCODE -ne 0) { throw "clang version probe failed" }
+        timeout-minutes: 5
+
       - name: Cache Rust dependencies and build outputs
         uses: actions/cache@v5
         with:
@@ -358,6 +390,16 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
         timeout-minutes: 5
+
+      - name: Test WP-0.4 whisper native link/version foundation (no model or transcription)
+        run: |
+          cargo test -p meetingrelay-model-worker-whisper-native --all-targets --no-default-features --offline --locked -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo tree -p meetingrelay-model-worker-whisper-native --features native-whisper --offline --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p meetingrelay-model-worker-whisper-native --all-targets --no-default-features --features native-whisper --offline --locked -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 15
 
       - name: Lint Rust workspace including desktop MVP and sherpa wrapper
         run: cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings

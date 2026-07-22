@@ -108,6 +108,7 @@ pnpm phase0:funasr-sidecar-venv-materialization:test
 pnpm phase0:funasr-sidecar-venv-materialization:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
+cargo test --package meetingrelay-model-worker-whisper-native --no-default-features --locked
 pnpm --dir apps/desktop test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -120,7 +121,7 @@ cargo build --package meetingrelay-desktop --release --locked
 pnpm --dir apps/desktop run tauri:build:ci
 ```
 
-Native-feature checks and the ignored real SenseVoice smoke require the sealed assets and pinned DLLs to be materialized and staged first. Follow [the sherpa asset instructions](tools/sherpa-native/README.md) and [the adapter smoke instructions](crates/model-worker-sherpa-native/README.md). The upstream build script's implicit network-download path is not an accepted project workflow.
+Sherpa native-feature checks and the ignored real SenseVoice smoke require the sealed assets and pinned DLLs to be materialized and staged first. Follow [the sherpa asset instructions](tools/sherpa-native/README.md) and [the adapter smoke instructions](crates/model-worker-sherpa-native/README.md). The upstream build script's implicit network-download path is not an accepted project workflow. The separate [WP-0.4.5a whisper native link smoke](crates/model-worker-whisper-native/README.md) requires CMake, libclang, and MSVC when its `native-whisper` feature is enabled and does not yet load a model or transcribe audio.
 
 IPC and ledger uint64/ns values use canonical unsigned decimal strings. The ledger validator runs two clean replays: `input-ledger.jsonl` and `decision-ledger.jsonl` must be byte-for-byte and SHA-256 identical; `observation-ledger.jsonl` intentionally preserves distinct run IDs and actual monotonic observations, so it is checked for canonical encoding, order, causation, source hashes, and join integrity instead of byte equality. Generated evidence stays under ignored `target/wp-0.3/ct-ledger-001/`.
 
