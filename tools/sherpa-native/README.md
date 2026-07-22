@@ -202,6 +202,18 @@ pnpm phase0:sherpa-realdata-shard:validate <absolute-final-evidence-path>
 
 CI exercises this lane only with offline fixtures and mock shard processes. It never downloads FLEURS, uploads private artifacts, publishes audio/transcripts, or claims a threshold. The actual controlled-root/materialized-corpus/shard-host run is an operator action after the source-bound shard-host attestation exists for the exact clean commit.
 
+## Same-machine dry-run schedule contract
+
+`same-machine-runner-schedule.mjs` is the WP-0.4.6b plan-only bridge between the existing input contracts and a future instrumented runner. It accepts explicit candidate and fixture identity bindings plus the same-condition contract, validates their exact keys and digests, then emits canonical UTF-8 JSON with a single trailing LF. The public record carries only IDs, digests, logical sequence fields, and fixed plan constraints; local paths from the same-condition input are represented only by its canonical SHA-256 join.
+
+The ledger uses `seeded-round-robin-v1` with fixed seed `42`, separates oracle-only candidates from the non-oracle scheduling lane, and fixes the stage order to `preflight`, `publishability`, `contract`, `quality`, `cold`, `warmup`, `warm`, `soak-fault`, and `postflight`. Cold `10`, warmup `1`, warm `30` per fixture/scenario, soak-duration, and final-event counts are planned constraints, not observations. The validator regenerates the full stage and ledger projection and rejects unknown fields, duplicate or omitted identities, count/order/clock drift, noncanonical bytes, authority escalation, and expected-input join drift.
+
+```powershell
+pnpm phase0:sherpa-same-machine-schedule:test
+```
+
+This contract is deliberately offline and pure: no filesystem, process, network, wall-clock, random source, audio, model, transcription, resource observation, statistic, confidence interval, quality result, ranking decision, selection/default/fallback, or production/public evidence is produced. `same_machine_runner_status=schedule-contract-validated` and `rotation_order_status=deterministic-dry-run-order-validated` describe validator coverage only; actual same-machine execution and all parent gates remain pending.
+
 ## Formal-run trust envelope
 
 `formal-run-trust-policy.json` is the externally pinned WP-0.4.3n policy (SHA-256 `2bc5219213567d9b8bebb5bbd3e52eba8d5c21a26533a7ec8042fa6505a6e160`, 1151 bytes). It requires a local fixed NTFS volume; an operator-owned protected root DACL whose only full-control principals are the operator token user, LOCAL_SYSTEM, and BUILTIN\Administrators; the same effective ACL closure on every descendant; no reparse tag; at most 4096 inventory entries; and a finite retention window no longer than 2,592,000 seconds (30 days). A readiness record is live only before its exact expiry.

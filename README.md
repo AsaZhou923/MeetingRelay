@@ -280,6 +280,16 @@ pnpm phase0:sherpa-realdata-shard:test
 
 The closeout authority for this slice—not a new field in the existing public evidence payload—is fixed to `measurement_status=resource-artifact-validator-contract-only`, `execution_status=offline-fixture-validation-only-existing-realdata-shard-evidence-no-new-model-run`, and `resource_artifact_validator_status=digest-count-authority-closure-verified`. It does not add a same-machine runner, rotation-order run, cold/warm samples, statistics, confidence intervals, a new model run, or a quality claim. Those statuses remain respectively `not-implemented`, `not-run`, `not-run`, `not-computed`, `not-computed`, and `not-assessed`; formal claims, selection/fallback/ranking/default, production evidence, public distribution, parent WP-0.4.6 closeout, and Phase 1 authority remain absent.
 
+### WP-0.4.6b same-machine dry-run schedule contract
+
+WP-0.4.6b adds only a deterministic, offline schedule builder and fail-closed validator. It binds sorted candidate and fixture identities, the canonical same-condition contract digest, `HW-REF`, fixed seed `42`, and the nine required stages (`preflight` through `postflight`) into a path-free canonical ledger. Cold `10`, warmup `1`, warm `30` per scenario, soak-duration, and final-event values are plan constraints only. Oracle-only candidates are kept in a separate logical lane; the other lane name is schedule topology and grants no ranking result.
+
+```powershell
+pnpm phase0:sherpa-same-machine-schedule:test
+```
+
+The authority ceiling is fixed to `measurement_status=same-machine-runner-plan-contract-only`, `execution_status=offline-dry-run-scheduler-validation-only-no-model-no-audio-no-transcription`, `same_machine_runner_status=schedule-contract-validated`, and `rotation_order_status=deterministic-dry-run-order-validated`. Cold/warm observations remain `planned-not-measured`; statistics and confidence intervals remain `not-computed`; quality remains `not-assessed`; formal claims, selection, ranking, default, fallback, production evidence, and public distribution remain none/false. This slice does not launch a process, read audio, load a model, transcribe, measure resources, or close parent WP-0.4.6, candidate selection, or Phase 1.
+
 ### FunASR sidecar Python-compatible launch probe
 
 WP-0.4.4c adds only a real process launch probe for the runtime file already bound by the WP-0.4.4b canonical manifest. The production CLI is:

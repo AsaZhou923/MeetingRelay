@@ -257,6 +257,10 @@ jobs:
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5
 
+      - name: Test WP-0.4.6b same-machine dry-run schedule contract (offline plan only)
+        run: pnpm phase0:sherpa-same-machine-schedule:test
+        timeout-minutes: 5
+
       - name: Exercise WP-0.4 Windows controlled-root and handle-bound cleanup contract
         shell: pwsh
         run: ./tools/sherpa-native/formal-run-trust-envelope.windows.test.ps1
