@@ -68,6 +68,8 @@ const REQUIRED_LOCK_PACKAGES = Object.freeze([
   }),
 ]);
 const OBSERVED_TOOL_NAMES = Object.freeze(["cargo", "rustc", "git", "cmake", "clang", "libclang"]);
+const CARGO_FAILURE_DIAGNOSTIC_MAX_BYTES = 16 * 1024;
+const CARGO_FAILURE_DIAGNOSTIC_MAX_CHARS = 8 * 1024;
 const CARGO_BUILD_ARGS = Object.freeze([
   "build",
   "--release",
@@ -484,11 +486,13 @@ export async function resolveConfiguredToolPath(toolName, envKey, repoRoot, opti
 export async function bindExecutionToolPaths(repoRoot, options = {}) {
   const cargoCommand = await resolveConfiguredToolPath("cargo", "MEETINGRELAY_WHISPER_CARGO_PATH", repoRoot, options);
   const gitCommand = await resolveConfiguredToolPath("git", "MEETINGRELAY_WHISPER_GIT_PATH", repoRoot, options);
+  const cmakeCommand = await resolveConfiguredToolPath("cmake", "MEETINGRELAY_WHISPER_CMAKE_PATH", repoRoot, options);
   return {
     ...options,
     cargoCommand,
+    cmakeCommand,
     gitCommand,
-    toolResolver: { ...options.toolResolver, cargo: cargoCommand, git: gitCommand },
+    toolResolver: { ...options.toolResolver, cargo: cargoCommand, cmake: cmakeCommand, git: gitCommand },
   };
 }
 
@@ -512,7 +516,7 @@ async function observeTools(repoRoot, options = {}) {
   return { tool_count: rows.length, tools: rows, aggregate_sha256: hashObject(rows), toolchain_provenance_authority: "observed-tool-bytes-only" };
 }
 
-function childEnv(targetRoot, env = process.env) {
+function childEnv(targetRoot, env = process.env, cmakeCommand) {
   const next = {};
   for (const [key, value] of Object.entries(env)) {
     const normalizedKey = key.toUpperCase();
@@ -525,20 +529,59 @@ function childEnv(targetRoot, env = process.env) {
     CARGO_INCREMENTAL: "0",
     CARGO_NET_OFFLINE: "true",
     CARGO_TARGET_DIR: targetRoot,
+    ...(cmakeCommand === undefined ? {} : { CMAKE: cmakeCommand }),
   };
 }
 
-async function runCargoBuild(repoRoot, targetRoot, options = {}) {
+function redactDiagnosticLiteral(value, literal, replacement) {
+  if (typeof literal !== "string" || literal.length === 0) return value;
+  const escaped = literal.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return value.replace(new RegExp(escaped, "giu"), replacement);
+}
+
+export function formatCargoFailureDiagnostic(stderr, repoRoot, targetRoot, env = process.env) {
+  const bytes = Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? "", "utf8");
+  let value = bytes.subarray(Math.max(0, bytes.length - CARGO_FAILURE_DIAGNOSTIC_MAX_BYTES)).toString("utf8");
+  value = value
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "");
+  for (const [literal, replacement] of [
+    [targetRoot, "<target>"],
+    [repoRoot, "<repo>"],
+    [env.USERPROFILE, "<user-profile>"],
+    [env.HOME, "<home>"],
+    [env.RUNNER_TEMP, "<runner-temp>"],
+  ]) {
+    value = redactDiagnosticLiteral(value, literal, replacement);
+  }
+  value = value.trim();
+  if (value.length === 0) return "<empty>";
+  return value.slice(-CARGO_FAILURE_DIAGNOSTIC_MAX_CHARS);
+}
+
+export async function runCargoBuild(repoRoot, targetRoot, options = {}) {
   const args = [...CARGO_BUILD_ARGS];
   if (options.cargoMessagesForTest) return { args, messages: options.cargoMessagesForTest, stderr_sha256: sha256Hex(Buffer.alloc(0)) };
-  const result = await runProcess(options.cargoCommand ?? "cargo", args, {
+  const processOptions = {
     cwd: repoRoot,
-    env: childEnv(targetRoot, options.env ?? process.env),
+    env: childEnv(targetRoot, options.env ?? process.env, options.cmakeCommand),
     timeoutMs: options.cargoTimeoutMs ?? 20 * 60_000,
     maxStdoutBytes: 64 * 1024 * 1024,
     maxStderrBytes: 8 * 1024 * 1024,
-  });
-  if (result.code !== 0 || result.signal !== null) fail("WHISPER_CI_ATTEST_CARGO_NONZERO", "cargo build failed");
+  };
+  const result = options.runCargoForTest
+    ? await options.runCargoForTest(options.cargoCommand ?? "cargo", args, processOptions)
+    : await runProcess(options.cargoCommand ?? "cargo", args, processOptions);
+  if (result.code !== 0 || result.signal !== null) {
+    const stdoutSha256 = sha256Hex(result.stdout);
+    const stderrSha256 = sha256Hex(result.stderr);
+    const stdoutDiagnostic = formatCargoFailureDiagnostic(result.stdout, repoRoot, targetRoot, options.env ?? process.env);
+    const stderrDiagnostic = formatCargoFailureDiagnostic(result.stderr, repoRoot, targetRoot, options.env ?? process.env);
+    fail(
+      "WHISPER_CI_ATTEST_CARGO_NONZERO",
+      `cargo build failed exit_code=${result.code ?? "none"} signal=${result.signal ?? "none"} stdout_sha256=${stdoutSha256} stderr_sha256=${stderrSha256}\nstdout_tail:\n${stdoutDiagnostic}\nstderr_tail:\n${stderrDiagnostic}`,
+    );
+  }
   const messages = [];
   for (const [index, line] of decodeUtf8(result.stdout, "WHISPER_CI_ATTEST_CARGO_JSON", "cargo stdout").split(/\r?\n/u).entries()) {
     if (line.length === 0) continue;

@@ -17,9 +17,11 @@ import {
   PUBLIC_EVIDENCE_SCHEMA_PATH,
   attestWhisperCiBuildOutputRuntimeIdentity,
   bindExecutionToolPaths,
+  formatCargoFailureDiagnostic,
   makeSyntheticPe,
   observeToolFileBytes,
   parsePe,
+  runCargoBuild,
   scanForbiddenPublicEvidence,
   selectCargoExecutable,
   sha256Hex,
@@ -239,20 +241,68 @@ test("tool-byte observation accepts rustup-style hardlinks", async () => {
   }
 });
 
-test("configured Cargo and Git paths are bound to both observation and execution", async () => {
+test("configured Cargo, CMake, and Git paths are bound to both observation and execution", async () => {
   const root = path.resolve(process.cwd());
   const cargo = path.join(root, "synthetic-tools", "cargo.exe");
+  const cmake = path.join(root, "synthetic-tools", "cmake.exe");
   const git = path.join(root, "synthetic-tools", "git.exe");
   const bound = await bindExecutionToolPaths(root, {
     env: {
       MEETINGRELAY_WHISPER_CARGO_PATH: cargo,
+      MEETINGRELAY_WHISPER_CMAKE_PATH: cmake,
       MEETINGRELAY_WHISPER_GIT_PATH: git,
     },
   });
   assert.equal(bound.cargoCommand, cargo);
+  assert.equal(bound.cmakeCommand, cmake);
   assert.equal(bound.gitCommand, git);
   assert.equal(bound.toolResolver.cargo, cargo);
+  assert.equal(bound.toolResolver.cmake, cmake);
   assert.equal(bound.toolResolver.git, git);
+});
+
+test("Cargo child reconstructs only the bound CMake path and reports bounded redacted failure context", async () => {
+  const root = path.resolve(process.cwd());
+  const targetRoot = path.join(root, "target", "synthetic-wp-0.4.5d");
+  const cmake = path.join(root, "synthetic-tools", "cmake.exe");
+  let observedOptions;
+  await assert.rejects(
+    () => runCargoBuild(root, targetRoot, {
+      cargoCommand: path.join(root, "synthetic-tools", "cargo.exe"),
+      cmakeCommand: cmake,
+      env: {
+        CARGO_INCREMENTAL: "0",
+        CARGO_NET_OFFLINE: "true",
+        HOME: path.join(root, "synthetic-home"),
+        MEETINGRELAY_WHISPER_CMAKE_PATH: cmake,
+        PATH: "synthetic-path",
+      },
+      runCargoForTest: async (_command, _args, processOptions) => {
+        observedOptions = processOptions;
+        return {
+          code: 101,
+          signal: null,
+          stdout: Buffer.from(`compiler-message under ${targetRoot}\n`, "utf8"),
+          stderr: Buffer.from(`\u001b[31merror\u001b[0m: failed under ${targetRoot} and ${root}\n`, "utf8"),
+        };
+      },
+    }),
+    (error) => {
+      assert.match(error.message, /WHISPER_CI_ATTEST_CARGO_NONZERO/u);
+      assert.match(error.message, /exit_code=101 signal=none stdout_sha256=[0-9a-f]{64} stderr_sha256=[0-9a-f]{64}/u);
+      assert.match(error.message, /stdout_tail:\ncompiler-message under <target>/u);
+      assert.match(error.message, /stderr_tail:\nerror: failed under <target> and <repo>/u);
+      assert.doesNotMatch(error.message, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
+      return true;
+    },
+  );
+  assert.equal(observedOptions.env.CMAKE, cmake);
+  assert.equal(observedOptions.env.CARGO_TARGET_DIR, targetRoot);
+  assert.equal(observedOptions.env.CARGO_INCREMENTAL, "0");
+  assert.equal(observedOptions.env.CARGO_NET_OFFLINE, "true");
+  assert.equal(Object.hasOwn(observedOptions.env, "MEETINGRELAY_WHISPER_CMAKE_PATH"), false);
+  assert.equal(formatCargoFailureDiagnostic(Buffer.alloc(0), root, targetRoot, {}), "<empty>");
+  assert.ok(formatCargoFailureDiagnostic(Buffer.alloc(32 * 1024, 0x61), root, targetRoot, {}).length <= 8 * 1024);
 });
 
 test("injected observations cannot request real Windows CI scope", async () => {
