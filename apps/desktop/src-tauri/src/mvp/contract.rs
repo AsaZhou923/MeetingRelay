@@ -11,6 +11,7 @@ pub enum Lifecycle {
     Ready,
     Starting,
     Recording,
+    Paused,
     Stopping,
     Error,
 }
@@ -201,5 +202,17 @@ mod tests {
         assert_eq!(snapshot.queue_depth, MAX_INFERENCE_QUEUE_DEPTH);
         assert_eq!(snapshot.system.peak, 1.0);
         assert_eq!(snapshot.microphone.peak, 0.0);
+    }
+
+    #[test]
+    fn paused_lifecycle_serializes_to_frontend_contract_shape() {
+        use tauri::ipc::{InvokeResponseBody, IpcResponse};
+
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.lifecycle = Lifecycle::Paused;
+        let InvokeResponseBody::Json(json) = snapshot.body().expect("serialize snapshot") else {
+            panic!("snapshot must use a JSON response body");
+        };
+        assert!(json.contains(r#""lifecycle":"paused""#));
     }
 }

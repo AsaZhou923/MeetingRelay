@@ -5,6 +5,7 @@ export const MVP_LIFECYCLES = [
   "ready",
   "starting",
   "recording",
+  "paused",
   "stopping",
   "error",
 ] as const;
@@ -20,6 +21,7 @@ export type DurabilityStatus =
   | "initializing"
   | "ready"
   | "recording"
+  | "paused"
   | "completed"
   | "interrupted"
   | "error";
@@ -116,6 +118,60 @@ export function hasAllMvpExportFormats(formats: readonly MvpExportFormat[]): boo
   return MVP_EXPORT_FORMATS.every((format) => available.has(format));
 }
 
+export function isMvpActiveLifecycle(lifecycle: MvpLifecycle): boolean {
+  return ["starting", "recording", "paused", "stopping"].includes(lifecycle);
+}
+
+export function isMvpActiveSession(snapshot: MvpSnapshot): boolean {
+  return isMvpActiveLifecycle(snapshot.lifecycle);
+}
+
+export function parseMvpTranscriptText(value: unknown): string {
+  return boundedString(value, "transcript text export", 8 * 1024 * 1024);
+}
+
+export function formatMvpErrorMessage(value: unknown): string {
+  const raw =
+    value instanceof Error ? value.message : typeof value === "string" ? value : "未知错误";
+  const normalized = raw.trim().replace(/\s+/g, " ").slice(0, 220) || "未知错误";
+  const known: ReadonlyArray<readonly [string, string]> = [
+    [
+      "AUDIO_STREAM_ERROR",
+      "音频设备连接已中断。请停止当前会议、重新选择设备后再开始；已经保存的文字不会丢失。",
+    ],
+    [
+      "ASR_WORKER_STOPPED",
+      "本地转写引擎已停止。请停止当前会议后重新开始，应用会自动重建引擎；已经保存的文字不会丢失。",
+    ],
+    [
+      "ASR_FINAL_OVERLOAD",
+      "本地转写队列已满。请停止后重新开始；已经提交到 SQLite 的文字仍然安全。",
+    ],
+    [
+      "SHERPA_REALTIME_RECOGNITION_UNAVAILABLE",
+      "本地转写引擎重试后仍不可用。请停止后重新开始；已经保存的文字不会丢失。",
+    ],
+    [
+      "SHERPA_ASSET_MISSING",
+      "本地模型或运行时路径无效。请检查个人 Release 启动器或模型路径配置。",
+    ],
+    [
+      "AUDIO_UNAVAILABLE",
+      "所选音频设备当前不可用。请重新选择系统输出和麦克风后再开始。",
+    ],
+    ["MVP_PAUSE_TIMEOUT", "暂停操作没有及时完成。请停止会议；已经保存的文字不会丢失。"],
+    ["MVP_RESUME_TIMEOUT", "继续操作没有及时完成。请停止会议后重新开始；已经保存的文字不会丢失。"],
+  ];
+  return known.find(([code]) => normalized.includes(code))?.[1] ?? normalized;
+}
+
+export function formatMvpSnapshotError(
+  snapshot: Pick<MvpSnapshot, "error" | "system" | "microphone">,
+): string {
+  const error = snapshot.error ?? snapshot.system.error ?? snapshot.microphone.error;
+  return error === null ? "" : formatMvpErrorMessage(error);
+}
+
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 const CANONICAL_UNSIGNED_DECIMAL = /^(?:0|[1-9][0-9]*)$/;
 const IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
@@ -125,6 +181,7 @@ const DURABILITY_STATUSES = [
   "initializing",
   "ready",
   "recording",
+  "paused",
   "completed",
   "interrupted",
   "error",

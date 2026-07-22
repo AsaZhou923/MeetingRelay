@@ -6,7 +6,7 @@ use std::sync::{
 use super::{
     audio::{AudioDeviceInventory, AudioDeviceSelection},
     contract::{AudioSourceSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus},
-    export::{ExportResult, export_meeting},
+    export::{ExportResult, export_meeting, transcript_text},
     storage::{
         DurableFinal, FinalCandidate, MvpStorage, MvpStorageWriter, segment_from_durable,
         visible_window_start_sequence,
@@ -30,7 +30,10 @@ use std::{
 };
 
 #[cfg(windows)]
-use meetingrelay_model_worker_sherpa_native::{LockedSherpaRealtime, LockedSherpaRealtimePaths};
+use meetingrelay_model_worker_sherpa_native::{
+    LOCKED_REALTIME_MAX_PCM16_BYTES, LockedSherpaRealtime, LockedSherpaRealtimeError,
+    LockedSherpaRealtimePaths,
+};
 
 #[cfg(windows)]
 use super::{
@@ -165,6 +168,28 @@ impl MvpService {
         }
     }
 
+    pub fn pause(&self) -> Result<MvpSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.pause_windows()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("MVP_WINDOWS_ONLY".to_owned())
+        }
+    }
+
+    pub fn resume(&self) -> Result<MvpSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.resume_windows()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("MVP_WINDOWS_ONLY".to_owned())
+        }
+    }
+
     pub fn open_recent(&self) -> Result<MvpSnapshot, String> {
         let storage = self
             .storage
@@ -202,6 +227,14 @@ impl MvpService {
             .as_ref()
             .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
         export_meeting(storage, writer, meeting_id, target_dir)
+    }
+
+    pub fn transcript_text(&self, meeting_id: &str) -> Result<String, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        transcript_text(storage, meeting_id)
     }
 
     pub fn shutdown_before(&self, deadline: std::time::Instant) -> Result<(), String> {
@@ -271,6 +304,37 @@ impl MvpService {
     }
 
     #[cfg(windows)]
+    fn prepare_inference_worker(&self) -> Result<InferenceWorker, String> {
+        let paths = resolve_model_paths().inspect_err(|error| self.fail(error))?;
+        InferenceWorker::prepare(
+            Arc::clone(&self.snapshot),
+            paths,
+            self.storage_writer.clone(),
+        )
+        .inspect_err(|error| self.fail(error))
+    }
+
+    #[cfg(windows)]
+    fn ensure_inference_worker(&self, inner: &mut ServiceInner) -> Result<(), String> {
+        if inner
+            .inference
+            .as_ref()
+            .is_some_and(InferenceWorker::is_finished)
+        {
+            inner.inference = None;
+            let mut snapshot = lock(&self.snapshot);
+            snapshot.model_ready = false;
+            if snapshot.error.as_deref() == Some("ASR_WORKER_STOPPED") {
+                snapshot.error = None;
+            }
+        }
+        if inner.inference.is_none() {
+            inner.inference = Some(self.prepare_inference_worker()?);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn preflight_windows(&self) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
@@ -299,16 +363,7 @@ impl MvpService {
             code
         })?;
 
-        if inner.inference.is_none() {
-            let paths = resolve_model_paths().inspect_err(|error| self.fail(error))?;
-            let worker = InferenceWorker::prepare(
-                Arc::clone(&self.snapshot),
-                paths,
-                self.storage_writer.clone(),
-            )
-            .inspect_err(|error| self.fail(error))?;
-            inner.inference = Some(worker);
-        }
+        self.ensure_inference_worker(&mut inner)?;
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
@@ -334,9 +389,10 @@ impl MvpService {
             .storage_writer
             .as_ref()
             .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
-        if inner.inference.is_none() || lock(&self.snapshot).lifecycle != Lifecycle::Ready {
+        if lock(&self.snapshot).lifecycle != Lifecycle::Ready {
             return Err("MVP_NOT_READY".to_owned());
         }
+        self.ensure_inference_worker(&mut inner)?;
         let meeting = writer.start_meeting(true, "SenseVoice · zh · CPU · local")?;
 
         if let Some(inference) = inner.inference.as_ref() {
@@ -377,6 +433,7 @@ impl MvpService {
             .expect("inference readiness was checked above")
             .submitter();
         let stop = Arc::new(AtomicBool::new(false));
+        let pause_gate = Arc::new(PauseGate::default());
         let errors = Arc::new(RuntimeErrors::default());
         let metrics = output.metrics.clone();
         let preflight = output.preflight.clone();
@@ -385,6 +442,7 @@ impl MvpService {
             submitter,
             session_id.clone(),
             Arc::clone(&stop),
+            Arc::clone(&pause_gate),
             Arc::clone(&errors),
         ) {
             Ok(coordinator) => coordinator,
@@ -400,6 +458,7 @@ impl MvpService {
             capture,
             coordinator: Some(coordinator),
             stop,
+            pause_gate,
             metrics,
             errors,
             started: Instant::now(),
@@ -412,6 +471,93 @@ impl MvpService {
         snapshot.meeting_id = Some(meeting.id);
         snapshot.system = capturing_source(SourceId::System, &preflight.system_output);
         snapshot.microphone = capturing_source(SourceId::Microphone, &preflight.microphone);
+        snapshot.error = None;
+        Ok(public_snapshot(
+            &mut snapshot,
+            inner.inference.as_ref().map(|worker| &worker.submitter),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn pause_windows(&self) -> Result<MvpSnapshot, String> {
+        let deadline = Instant::now() + MVP_SHUTDOWN_TIMEOUT;
+        let (pause_gate, submitter) = {
+            let inner = lock(&self.inner);
+            let Some(session) = inner.session.as_ref() else {
+                return Err("SESSION_NOT_RUNNING".to_owned());
+            };
+            if lock(&self.snapshot).lifecycle == Lifecycle::Paused {
+                return Ok(self.snapshot_locked(&inner));
+            }
+            (
+                Arc::clone(&session.pause_gate),
+                inner.inference.as_ref().map(InferenceWorker::submitter),
+            )
+        };
+
+        let epoch = pause_gate.request_pause();
+        if let Err(error) = pause_gate.wait_pause_ack_before(epoch, deadline) {
+            set_public_error(&mut lock(&self.snapshot), &error);
+            return Err(error);
+        }
+        if let Some(submitter) = submitter.as_ref()
+            && let Err(error) = submitter.barrier_before(deadline)
+        {
+            let inner = lock(&self.inner);
+            if inner.session.is_some() {
+                apply_paused_snapshot(&mut lock(&self.snapshot), Some(&error));
+            }
+            return Err(error);
+        }
+
+        let inner = lock(&self.inner);
+        let Some(session) = inner.session.as_ref() else {
+            return Ok(self.snapshot_locked(&inner));
+        };
+        self.refresh_from_session(session, false);
+        let mut snapshot = lock(&self.snapshot);
+        apply_paused_snapshot(&mut snapshot, None);
+        Ok(public_snapshot(
+            &mut snapshot,
+            inner.inference.as_ref().map(|worker| &worker.submitter),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn resume_windows(&self) -> Result<MvpSnapshot, String> {
+        let deadline = Instant::now() + MVP_SHUTDOWN_TIMEOUT;
+        let pause_gate = {
+            let inner = lock(&self.inner);
+            let Some(session) = inner.session.as_ref() else {
+                return Err("SESSION_NOT_RUNNING".to_owned());
+            };
+            if lock(&self.snapshot).lifecycle == Lifecycle::Recording {
+                return Ok(self.snapshot_locked(&inner));
+            }
+            Arc::clone(&session.pause_gate)
+        };
+        let epoch = pause_gate.request_resume();
+        if let Err(error) = pause_gate.wait_resume_ack_before(epoch, deadline) {
+            set_public_error(&mut lock(&self.snapshot), &error);
+            return Err(error);
+        }
+
+        let inner = lock(&self.inner);
+        let Some(session) = inner.session.as_ref() else {
+            return Ok(self.snapshot_locked(&inner));
+        };
+        self.refresh_from_session(session, false);
+        let mut snapshot = lock(&self.snapshot);
+        snapshot.lifecycle = Lifecycle::Recording;
+        snapshot.durability_status = "recording".to_owned();
+        snapshot.system.active = true;
+        snapshot.microphone.active = true;
+        if snapshot.system.error.is_none() {
+            snapshot.system.status = SourceStatus::Capturing;
+        }
+        if snapshot.microphone.error.is_none() {
+            snapshot.microphone.status = SourceStatus::Capturing;
+        }
         snapshot.error = None;
         Ok(public_snapshot(
             &mut snapshot,
@@ -509,8 +655,9 @@ impl MvpService {
         let stream_error = system.stream_errors > 0 || microphone.stream_errors > 0;
         let mut snapshot = lock(&self.snapshot);
         snapshot.elapsed_ms = session.started.elapsed().as_millis().to_string();
-        apply_source_stats(&mut snapshot.system, system, !stopping);
-        apply_source_stats(&mut snapshot.microphone, microphone, !stopping);
+        let active = !stopping && !session.pause_gate.is_paused();
+        apply_source_stats(&mut snapshot.system, system, active);
+        apply_source_stats(&mut snapshot.microphone, microphone, active);
         if stream_error {
             set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
         }
@@ -598,10 +745,77 @@ struct RunningSession {
     capture: AudioCapture,
     coordinator: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    pause_gate: Arc<PauseGate>,
     metrics: AudioCaptureMetrics,
     errors: Arc<RuntimeErrors>,
     started: Instant,
     meeting_id: String,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct PauseGate {
+    paused: AtomicBool,
+    pause_requested: AtomicU64,
+    pause_acknowledged: AtomicU64,
+    resume_requested: AtomicU64,
+    resume_acknowledged: AtomicU64,
+}
+
+#[cfg(windows)]
+impl PauseGate {
+    fn request_pause(&self) -> u64 {
+        self.paused.store(true, Ordering::Release);
+        self.pause_requested.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn request_resume(&self) -> u64 {
+        self.resume_requested.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn acknowledge_resume(&self, epoch: u64) {
+        self.resume_acknowledged.fetch_max(epoch, Ordering::AcqRel);
+        self.paused.store(false, Ordering::Release);
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    fn pending_pause_epoch(&self) -> Option<u64> {
+        let requested = self.pause_requested.load(Ordering::Acquire);
+        (requested > self.pause_acknowledged.load(Ordering::Acquire)).then_some(requested)
+    }
+
+    fn pending_resume_epoch(&self) -> Option<u64> {
+        let requested = self.resume_requested.load(Ordering::Acquire);
+        (self.is_paused() && requested > self.resume_acknowledged.load(Ordering::Acquire))
+            .then_some(requested)
+    }
+
+    fn acknowledge_pause(&self, epoch: u64) {
+        self.pause_acknowledged.fetch_max(epoch, Ordering::AcqRel);
+    }
+
+    fn wait_pause_ack_before(&self, epoch: u64, deadline: Instant) -> Result<(), String> {
+        while self.pause_acknowledged.load(Ordering::Acquire) < epoch {
+            if Instant::now() >= deadline {
+                return Err("MVP_PAUSE_TIMEOUT".to_owned());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
+    fn wait_resume_ack_before(&self, epoch: u64, deadline: Instant) -> Result<(), String> {
+        while self.resume_acknowledged.load(Ordering::Acquire) < epoch {
+            if Instant::now() >= deadline {
+                return Err("MVP_RESUME_TIMEOUT".to_owned());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -652,6 +866,28 @@ fn apply_source_stats(source: &mut AudioSourceSnapshot, stats: AudioSourceStats,
 }
 
 #[cfg(windows)]
+fn apply_paused_source(source: &mut AudioSourceSnapshot) {
+    source.active = false;
+    source.peak = 0.0;
+    if source.error.is_none() {
+        source.status = SourceStatus::Ready;
+    }
+}
+
+#[cfg(windows)]
+fn apply_paused_snapshot(snapshot: &mut MvpSnapshot, error: Option<&str>) {
+    snapshot.lifecycle = Lifecycle::Paused;
+    snapshot.durability_status = "paused".to_owned();
+    apply_paused_source(&mut snapshot.system);
+    apply_paused_source(&mut snapshot.microphone);
+    if let Some(error) = error {
+        set_public_error(snapshot, error);
+    } else if snapshot.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+        snapshot.error = None;
+    }
+}
+
+#[cfg(windows)]
 fn public_audio_error(detail: &str) -> String {
     let normalized = detail
         .chars()
@@ -682,13 +918,21 @@ fn resolve_model_paths() -> Result<LockedSherpaRealtimePaths, String> {
             "MEETINGRELAY_SHERPA_LOCK",
             root.join("tools/sherpa-native/assets.lock.json"),
         )?,
-        package_lock_path: canonical_asset(root.join("Cargo.lock"))?,
+        package_lock_path: canonical_env_or("MEETINGRELAY_PACKAGE_LOCK", root.join("Cargo.lock"))?,
     })
 }
 
 #[cfg(windows)]
 fn canonical_env_or(name: &str, fallback: PathBuf) -> Result<PathBuf, String> {
-    canonical_asset(env::var_os(name).map_or(fallback, PathBuf::from))
+    canonical_env_or_value(env::var_os(name), fallback)
+}
+
+#[cfg(windows)]
+fn canonical_env_or_value(
+    value: Option<std::ffi::OsString>,
+    fallback: PathBuf,
+) -> Result<PathBuf, String> {
+    canonical_asset(value.map_or(fallback, PathBuf::from))
 }
 
 #[cfg(windows)]
@@ -848,6 +1092,7 @@ impl InferenceWorker {
         let (finals, final_receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
         let shared = Arc::new(InferenceShared::default());
         let worker_shared = Arc::clone(&shared);
+        let worker_paths = paths.clone();
         let join = thread::Builder::new()
             .name("meetingrelay-asr".to_owned())
             .spawn(move || {
@@ -858,6 +1103,7 @@ impl InferenceWorker {
                 if let Ok(mut recognizer) = recognizer {
                     inference_loop(
                         &mut recognizer,
+                        worker_paths,
                         final_receiver,
                         worker_shared,
                         snapshot,
@@ -887,6 +1133,10 @@ impl InferenceWorker {
 
     fn queue_depth(&self) -> usize {
         self.submitter.queue_depth()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     fn shutdown_before(mut self, deadline: Instant) -> Result<(), String> {
@@ -922,6 +1172,7 @@ struct InferenceTask {
 #[cfg(windows)]
 fn inference_loop(
     recognizer: &mut LockedSherpaRealtime,
+    paths: LockedSherpaRealtimePaths,
     finals: Receiver<InferenceTask>,
     shared: Arc<InferenceShared>,
     snapshot: Arc<Mutex<MvpSnapshot>>,
@@ -937,6 +1188,7 @@ fn inference_loop(
         if let Some((interim_generation, task)) = scheduled {
             process_inference_task(
                 recognizer,
+                &paths,
                 &shared,
                 &snapshot,
                 storage_writer.as_deref(),
@@ -954,8 +1206,55 @@ fn inference_loop(
 }
 
 #[cfg(windows)]
+fn transcribe_with_recovery(
+    recognizer: &mut LockedSherpaRealtime,
+    paths: &LockedSherpaRealtimePaths,
+    task: &InferenceTask,
+) -> Result<String, LockedSherpaRealtimeError> {
+    let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
+    let result = if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| should_retry_transcription(*error, task))
+    {
+        *recognizer = LockedSherpaRealtime::prepare_local_mvp(paths.clone())?;
+        recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples))
+    } else {
+        result
+    };
+    result.map(|result| result.original_transcript.as_str().trim().to_owned())
+}
+
+#[cfg(windows)]
+fn should_retry_transcription(error: LockedSherpaRealtimeError, task: &InferenceTask) -> bool {
+    is_recoverable_transcription_error(error) && is_replayable_inference_task(task)
+}
+
+#[cfg(windows)]
+fn is_recoverable_transcription_error(error: LockedSherpaRealtimeError) -> bool {
+    matches!(
+        error,
+        LockedSherpaRealtimeError::RecognitionUnavailable | LockedSherpaRealtimeError::NotPrepared
+    )
+}
+
+#[cfg(windows)]
+fn is_replayable_inference_task(task: &InferenceTask) -> bool {
+    is_replayable_sample_count(task.samples.len())
+}
+
+#[cfg(windows)]
+fn is_replayable_sample_count(sample_count: usize) -> bool {
+    let Ok(samples) = u64::try_from(sample_count) else {
+        return false;
+    };
+    samples != 0 && samples.saturating_mul(2) <= LOCKED_REALTIME_MAX_PCM16_BYTES
+}
+
+#[cfg(windows)]
 fn process_inference_task(
     recognizer: &mut LockedSherpaRealtime,
+    paths: &LockedSherpaRealtimePaths,
     shared: &InferenceShared,
     snapshot: &Mutex<MvpSnapshot>,
     storage_writer: Option<&MvpStorageWriter>,
@@ -968,11 +1267,10 @@ fn process_inference_task(
         return;
     }
 
-    let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
+    let result = transcribe_with_recovery(recognizer, paths, &task);
     let session_id = task.session_id.clone();
     let durable_final = match result {
-        Ok(result) => {
-            let text = result.original_transcript.as_str().trim().to_owned();
+        Ok(text) => {
             if !is_meaningful_transcript(&text) {
                 return;
             }
@@ -1123,11 +1421,12 @@ fn spawn_coordinator(
     submitter: InferenceSubmitter,
     session_id: String,
     stop: Arc<AtomicBool>,
+    pause_gate: Arc<PauseGate>,
     errors: Arc<RuntimeErrors>,
 ) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("meetingrelay-audio".to_owned())
-        .spawn(move || coordinator_loop(output, submitter, session_id, stop, errors))
+        .spawn(move || coordinator_loop(output, submitter, session_id, stop, pause_gate, errors))
         .map_err(|_| "AUDIO_COORDINATOR_START_FAILED".to_owned())
 }
 
@@ -1148,6 +1447,7 @@ fn coordinator_loop(
     submitter: InferenceSubmitter,
     session_id: String,
     stop: Arc<AtomicBool>,
+    pause_gate: Arc<PauseGate>,
     errors: Arc<RuntimeErrors>,
 ) {
     let AudioCaptureOutput {
@@ -1166,6 +1466,30 @@ fn coordinator_loop(
     let mut identity = SegmentIdentity::default();
 
     while !stop.load(Ordering::Acquire) {
+        if let Some(epoch) = pause_gate.pending_pause_epoch() {
+            finalize_pause_boundary(
+                &mut system,
+                &mut microphone,
+                &mut endpoint,
+                &mut identity,
+                &submitter,
+                &errors,
+                &session_id,
+            );
+            pause_gate.acknowledge_pause(epoch);
+        }
+        if pause_gate.is_paused() {
+            if let Some(epoch) = pause_gate.pending_resume_epoch() {
+                discard_paused_packets(&packets);
+                reset_resume_boundary(&mut system, &mut microphone, &mut endpoint, &mut identity);
+                pause_gate.acknowledge_resume(epoch);
+                continue;
+            }
+            match packets.recv_timeout(Duration::from_millis(20)) {
+                Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
         let timed_out = match packets.recv_timeout(Duration::from_millis(20)) {
             Ok(packet) => {
                 route_packet(packet, &mut system, &mut microphone);
@@ -1186,8 +1510,63 @@ fn coordinator_loop(
         );
     }
 
-    while let Ok(packet) = packets.try_recv() {
-        route_packet(packet, &mut system, &mut microphone);
+    if !pause_gate.is_paused() {
+        while let Ok(packet) = packets.try_recv() {
+            route_packet(packet, &mut system, &mut microphone);
+        }
+        if let Some(block) = system.packetizer.flush_padded() {
+            system.blocks.push_back(block);
+        }
+        if let Some(block) = microphone.packetizer.flush_padded() {
+            microphone.blocks.push_back(block);
+        }
+        drain_all_mixed(
+            &mut system.blocks,
+            &mut microphone.blocks,
+            &mut endpoint,
+            &mut identity,
+            &submitter,
+            &errors,
+            &session_id,
+        );
+        if let Some(event) = endpoint.flush_stop() {
+            submit_segment(event, &mut identity, &submitter, &errors, &session_id);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn finalize_pause_boundary(
+    system: &mut SourcePipeline,
+    microphone: &mut SourcePipeline,
+    endpoint: &mut EnergyEndpointSegmenter,
+    identity: &mut SegmentIdentity,
+    submitter: &InferenceSubmitter,
+    errors: &RuntimeErrors,
+    session_id: &str,
+) {
+    while let Some(block) = system.blocks.pop_front() {
+        process_pair(
+            Some(block),
+            microphone.blocks.pop_front(),
+            endpoint,
+            identity,
+            submitter,
+            errors,
+            session_id,
+        );
+    }
+    while let Some(block) = microphone.blocks.pop_front() {
+        process_pair(
+            None,
+            Some(block),
+            endpoint,
+            identity,
+            submitter,
+            errors,
+            session_id,
+        );
     }
     if let Some(block) = system.packetizer.flush_padded() {
         system.blocks.push_back(block);
@@ -1198,15 +1577,33 @@ fn coordinator_loop(
     drain_all_mixed(
         &mut system.blocks,
         &mut microphone.blocks,
-        &mut endpoint,
-        &mut identity,
-        &submitter,
-        &errors,
-        &session_id,
+        endpoint,
+        identity,
+        submitter,
+        errors,
+        session_id,
     );
     if let Some(event) = endpoint.flush_stop() {
-        submit_segment(event, &mut identity, &submitter, &errors, &session_id);
+        submit_segment(event, identity, submitter, errors, session_id);
     }
+}
+
+#[cfg(windows)]
+fn discard_paused_packets(packets: &Receiver<RawAudioPacket>) {
+    while packets.try_recv().is_ok() {}
+}
+
+#[cfg(windows)]
+fn reset_resume_boundary(
+    system: &mut SourcePipeline,
+    microphone: &mut SourcePipeline,
+    endpoint: &mut EnergyEndpointSegmenter,
+    identity: &mut SegmentIdentity,
+) {
+    system.reset_after_pause();
+    microphone.reset_after_pause();
+    endpoint.reset();
+    identity.clear_active();
 }
 
 #[cfg(windows)]
@@ -1253,6 +1650,12 @@ impl SourcePipeline {
             self.packetizer.push(&mono, &mut blocks);
             self.blocks.extend(blocks);
         }
+    }
+
+    fn reset_after_pause(&mut self) {
+        self.resampler.reset();
+        self.packetizer.reset();
+        self.blocks.clear();
     }
 }
 
@@ -1405,6 +1808,10 @@ impl SegmentIdentity {
         }
         (format!("segment-{id}"), revision)
     }
+
+    fn clear_active(&mut self) {
+        self.active = None;
+    }
 }
 
 #[cfg(windows)]
@@ -1475,6 +1882,12 @@ fn is_meaningful_transcript(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    use crate::mvp::{
+        audio::AudioSampleFormat,
+        dsp::{BLOCK_SAMPLES, SPEECH_START_BLOCKS},
+    };
 
     #[cfg(windows)]
     fn temp_storage_writer(test_name: &str) -> (MvpStorage, MvpStorageWriter) {
@@ -1601,6 +2014,127 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn pause_gate_uses_distinct_pause_and_resume_acknowledgements() {
+        let gate = Arc::new(PauseGate::default());
+        let pause_epoch = gate.request_pause();
+        assert!(gate.is_paused());
+        assert_eq!(gate.pending_pause_epoch(), Some(pause_epoch));
+
+        gate.acknowledge_pause(pause_epoch);
+        assert_eq!(
+            gate.wait_pause_ack_before(pause_epoch, Instant::now() + Duration::from_millis(50)),
+            Ok(())
+        );
+        assert_eq!(gate.pending_pause_epoch(), None);
+
+        let resume_epoch = gate.request_resume();
+        assert!(
+            gate.is_paused(),
+            "resume request must not open the gate before coordinator ack"
+        );
+        assert_eq!(gate.pending_resume_epoch(), Some(resume_epoch));
+
+        gate.acknowledge_resume(resume_epoch);
+        assert_eq!(
+            gate.wait_resume_ack_before(resume_epoch, Instant::now() + Duration::from_millis(50)),
+            Ok(())
+        );
+        assert_eq!(gate.pending_resume_epoch(), None);
+        assert!(!gate.is_paused());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pause_barrier_failure_keeps_the_running_session_stoppable() {
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.lifecycle = Lifecycle::Recording;
+        snapshot.durability_status = "recording".to_owned();
+        snapshot.system.active = true;
+        snapshot.microphone.active = true;
+
+        apply_paused_snapshot(&mut snapshot, Some("ASR_WORKER_STOPPED"));
+
+        assert_eq!(snapshot.lifecycle, Lifecycle::Paused);
+        assert_eq!(snapshot.durability_status, "paused");
+        assert!(!snapshot.system.active);
+        assert!(!snapshot.microphone.active);
+        assert_eq!(snapshot.error.as_deref(), Some("ASR_WORKER_STOPPED"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resume_transition_discards_paused_backlog_and_resets_processing_boundary() {
+        let (sender, receiver) = sync_channel(8);
+        sender
+            .send(RawAudioPacket {
+                source: AudioSourceId::SystemOutput,
+                sample_rate: TARGET_SAMPLE_RATE_HZ,
+                channels: 1,
+                samples: vec![0.5; 16],
+            })
+            .unwrap();
+        sender
+            .send(RawAudioPacket {
+                source: AudioSourceId::Microphone,
+                sample_rate: TARGET_SAMPLE_RATE_HZ,
+                channels: 1,
+                samples: vec![0.5; 16],
+            })
+            .unwrap();
+        discard_paused_packets(&receiver);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        let preflight = AudioDevicePreflight {
+            source: AudioSourceId::SystemOutput,
+            device_id: "test-device".to_owned(),
+            name: "test device".to_owned(),
+            sample_rate: TARGET_SAMPLE_RATE_HZ,
+            channels: 1,
+            sample_format: AudioSampleFormat::F32,
+        };
+        let mut system = SourcePipeline::new(&preflight).unwrap();
+        let mut microphone = SourcePipeline::new(&AudioDevicePreflight {
+            source: AudioSourceId::Microphone,
+            ..preflight
+        })
+        .unwrap();
+        system.push(RawAudioPacket {
+            source: AudioSourceId::SystemOutput,
+            sample_rate: TARGET_SAMPLE_RATE_HZ,
+            channels: 1,
+            samples: vec![0.5; 16],
+        });
+        microphone.push(RawAudioPacket {
+            source: AudioSourceId::Microphone,
+            sample_rate: TARGET_SAMPLE_RATE_HZ,
+            channels: 1,
+            samples: vec![0.5; 16],
+        });
+
+        let mut endpoint = EnergyEndpointSegmenter::new();
+        for _ in 0..SPEECH_START_BLOCKS {
+            let _ = endpoint.push_block(&[1.0; BLOCK_SAMPLES]);
+        }
+        assert!(endpoint.is_active());
+        let mut identity = SegmentIdentity::default();
+        let (_segment_id, _revision) = identity.metadata(false);
+        assert!(identity.active.is_some());
+
+        reset_resume_boundary(&mut system, &mut microphone, &mut endpoint, &mut identity);
+
+        assert_eq!(system.packetizer.pending_samples(), 0);
+        assert!(system.blocks.is_empty());
+        assert_eq!(system.resampler.output_samples(), 0);
+        assert_eq!(microphone.packetizer.pending_samples(), 0);
+        assert!(microphone.blocks.is_empty());
+        assert_eq!(microphone.resampler.output_samples(), 0);
+        assert!(!endpoint.is_active());
+        assert_eq!(endpoint.processed_samples(), 0);
+        assert!(identity.active.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn inference_submission_is_latest_wins_and_final_priority() {
         let (submitter, finals) = test_submitter();
         submitter.submit(queued_task(1, false)).unwrap();
@@ -1711,6 +2245,71 @@ mod tests {
         set_public_error(&mut snapshot, take_runtime_error(&errors).unwrap());
         set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
         assert_eq!(snapshot.error.as_deref(), Some("ASR_FINAL_OVERLOAD"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transcription_retry_classifier_only_retries_recoverable_replayable_tasks() {
+        let task = queued_task(1, false);
+        assert!(should_retry_transcription(
+            LockedSherpaRealtimeError::RecognitionUnavailable,
+            &task
+        ));
+        assert!(should_retry_transcription(
+            LockedSherpaRealtimeError::NotPrepared,
+            &task
+        ));
+        assert!(!should_retry_transcription(
+            LockedSherpaRealtimeError::EmptySegment,
+            &task
+        ));
+        assert!(!should_retry_transcription(
+            LockedSherpaRealtimeError::SegmentTooLarge,
+            &task
+        ));
+        assert!(!should_retry_transcription(
+            LockedSherpaRealtimeError::InvalidAudio,
+            &task
+        ));
+
+        let empty = InferenceTask {
+            samples: Arc::<[i16]>::from([]),
+            ..queued_task(1, false)
+        };
+        assert!(!should_retry_transcription(
+            LockedSherpaRealtimeError::RecognitionUnavailable,
+            &empty
+        ));
+        assert!(!is_replayable_sample_count(0));
+        assert!(is_replayable_sample_count(
+            usize::try_from(LOCKED_REALTIME_MAX_PCM16_BYTES / 2).unwrap()
+        ));
+        assert!(!is_replayable_sample_count(
+            usize::try_from(LOCKED_REALTIME_MAX_PCM16_BYTES / 2 + 1).unwrap()
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_env_or_value_prefers_canonical_override_and_falls_back() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-service-env-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fallback = root.join("Cargo.lock");
+        let override_lock = root.join("package-lock.json");
+        std::fs::write(&fallback, "fallback").unwrap();
+        std::fs::write(&override_lock, "override").unwrap();
+
+        assert_eq!(
+            canonical_env_or_value(None, fallback.clone()).unwrap(),
+            fallback.canonicalize().unwrap()
+        );
+        assert_eq!(
+            canonical_env_or_value(Some(override_lock.clone().into_os_string()), fallback).unwrap(),
+            override_lock.canonicalize().unwrap()
+        );
     }
 
     #[cfg(windows)]

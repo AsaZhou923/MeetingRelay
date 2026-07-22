@@ -53,6 +53,7 @@ h2 { margin: 0 0 20px; font-size: 18px; font-weight: 560; letter-spacing: -.02em
 
 .source-card { margin-bottom: 10px; padding: 14px; border: 1px solid var(--line); background: rgb(16 22 21 / 88%); transition: border-color 180ms ease, background 180ms ease; }
 .source-card[data-status="capturing"] { border-color: #66852e; background: #141c14; }
+.source-card[data-status="paused"] { border-color: #665f2e; background: #1b1911; }
 .source-card[data-status="error"] { border-color: #743a37; }
 .source-heading { display: flex; align-items: center; gap: 12px; }
 .source-glyph { display: grid; width: 36px; height: 36px; place-items: center; border: 1px solid #42504b; color: var(--cyan); font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; }
@@ -78,6 +79,8 @@ button:disabled { cursor: not-allowed; opacity: .32; }
 .start-button { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--acid); color: #10140d; }
 .record-mark { width: 8px; height: 8px; border-radius: 50%; background: #27340d; }
 .stop-button { border: 1px solid #3a4642; background: transparent; color: #bcc7c0; }
+.pause-button { border: 1px solid #4a5339; background: #161b13; color: #d5decf; }
+.pause-button[data-state="paused"] { border-color: #7b7337; color: #f1df82; }
 .secondary-button { border: 1px solid #3a4642; background: #111917; color: #c7d1cb; font-size: 12px; }
 .error-line { min-height: 34px; margin: 12px 0 0; color: var(--danger); font-size: 11px; line-height: 1.5; }
 
@@ -88,6 +91,7 @@ button:disabled { cursor: not-allowed; opacity: .32; }
 .storage-row small { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .storage-indicator { width: 9px; height: 9px; margin-top: 4px; border-radius: 50%; background: #6e7c75; box-shadow: 0 0 14px rgb(110 124 117 / 65%); }
 .storage-indicator[data-status="ready"] { background: var(--acid); box-shadow: 0 0 16px var(--acid); }
+.storage-indicator[data-status="paused"] { background: #f1df82; box-shadow: 0 0 16px rgb(241 223 130 / 55%); }
 .storage-indicator[data-status="degraded"] { background: #f7c95f; box-shadow: 0 0 16px rgb(247 201 95 / 55%); }
 .storage-indicator[data-status="error"] { background: var(--danger); box-shadow: 0 0 16px rgb(255 122 115 / 55%); }
 .storage-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 14px 0 0; }
@@ -104,6 +108,7 @@ button:disabled { cursor: not-allowed; opacity: .32; }
 .session-clock { display: flex; align-items: baseline; gap: 18px; }
 .session-clock span { color: var(--muted); font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; letter-spacing: .12em; }
 .session-clock span[data-state="recording"] { color: var(--acid); }
+.session-clock span[data-state="paused"] { color: #f1df82; }
 .session-clock span[data-state="error"] { color: var(--danger); }
 .session-clock strong { font-family: "Cascadia Code", Consolas, monospace; font-size: 18px; font-weight: 400; font-variant-numeric: tabular-nums; }
 .empty-state { display: grid; min-height: 0; flex: 1; place-content: center; justify-items: center; color: var(--muted); text-align: center; }
@@ -129,6 +134,11 @@ button:disabled { cursor: not-allowed; opacity: .32; }
 .export-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .export-actions span { margin-right: auto; color: #7b8881; font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; text-transform: uppercase; }
 .export-actions button { min-height: 32px; padding: 0 12px; }
+.copy-status { min-height: 15px; margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.copy-status[data-status="success"] { color: var(--acid); }
+.copy-status[data-status="error"] { color: var(--danger); }
+.copy-fallback { width: 100%; height: 72px; margin-top: 7px; padding: 8px; resize: vertical; border: 1px solid #3a4642; background: #0d1311; color: #dce5df; font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; line-height: 1.4; }
+.copy-fallback[hidden] { display: none; }
 .export-results { display: grid; gap: 4px; margin-top: 8px; }
 .export-results li { display: grid; grid-template-columns: 76px 1fr; gap: 8px; color: #9facA5; font-size: 10px; }
 .export-results li[data-status="saved"] strong { color: var(--acid); }

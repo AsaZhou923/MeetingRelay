@@ -29,6 +29,21 @@ pub struct ExportResult {
     pub artifacts: Vec<ExportArtifact>,
 }
 
+/// Returns a complete, storage-backed transcript suitable for the clipboard.
+///
+/// Unlike the bounded public snapshot used by the live UI, this reads every
+/// committed final from SQLite so a long meeting is never copied partially.
+pub fn transcript_text(storage: &MvpStorage, meeting_id: &str) -> Result<String, String> {
+    let snapshot = storage.snapshot(meeting_id)?;
+    if snapshot.meeting.state == "recording" {
+        return Err("MVP_COPY_RECORDING_NOT_ALLOWED".to_owned());
+    }
+    if snapshot.finals.is_empty() {
+        return Err("MVP_COPY_EMPTY".to_owned());
+    }
+    Ok(render_transcript_text(&snapshot))
+}
+
 pub fn export_meeting(
     storage: &MvpStorage,
     writer: &MvpStorageWriter,
@@ -722,6 +737,21 @@ fn render_txt(snapshot: &MeetingSnapshot) -> String {
     output
 }
 
+fn render_transcript_text(snapshot: &MeetingSnapshot) -> String {
+    let mut output = String::new();
+    output.push_str("MeetingRelay 转写记录\n");
+    output.push_str(&format!("会议 ID: {}\n", snapshot.meeting.id));
+    output.push_str(&format!("状态: {}\n", snapshot.meeting.state));
+    output.push_str(&format!("已保存片段: {}\n\n", snapshot.finals.len()));
+    for final_segment in &snapshot.finals {
+        output.push_str(&format!(
+            "[{}] {}\n",
+            final_segment.sequence, final_segment.text
+        ));
+    }
+    output
+}
+
 fn json_string(value: &str) -> String {
     let mut output = String::from("\"");
     for character in value.chars() {
@@ -883,6 +913,51 @@ mod tests {
         assert_eq!(
             export_meeting(&storage, &writer, &meeting.id, "out").unwrap_err(),
             "MVP_EXPORT_RECORDING_NOT_ALLOWED"
+        );
+    }
+
+    #[test]
+    fn clipboard_text_reads_every_committed_final_from_storage() {
+        let root = temp_root("clipboard-complete");
+        let storage = MvpStorage::open_at(root.join("db.sqlite3")).unwrap();
+        let writer = MvpStorageWriter::start(storage.clone()).unwrap();
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        for sequence in 1..=70 {
+            writer
+                .commit_final(FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: format!("segment-{sequence}"),
+                    sequence,
+                    revision: 1,
+                    text: format!("完整片段 {sequence}"),
+                    started_at_ms: sequence.to_string(),
+                    ended_at_ms: (sequence + 1).to_string(),
+                })
+                .unwrap();
+        }
+        writer.complete_meeting(&meeting.id).unwrap();
+
+        let text = transcript_text(&storage, &meeting.id).unwrap();
+
+        assert!(text.contains("已保存片段: 70"));
+        assert!(text.contains("[1] 完整片段 1"));
+        assert!(text.contains("[70] 完整片段 70"));
+    }
+
+    #[test]
+    fn clipboard_text_rejects_recording_and_empty_meetings() {
+        let root = temp_root("clipboard-invalid");
+        let storage = MvpStorage::open_at(root.join("db.sqlite3")).unwrap();
+        let writer = MvpStorageWriter::start(storage.clone()).unwrap();
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        assert_eq!(
+            transcript_text(&storage, &meeting.id).unwrap_err(),
+            "MVP_COPY_RECORDING_NOT_ALLOWED"
+        );
+        writer.complete_meeting(&meeting.id).unwrap();
+        assert_eq!(
+            transcript_text(&storage, &meeting.id).unwrap_err(),
+            "MVP_COPY_EMPTY"
         );
     }
 

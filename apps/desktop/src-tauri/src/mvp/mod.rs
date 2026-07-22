@@ -47,6 +47,16 @@ pub fn mvp_stop(service: tauri::State<'_, MvpService>) -> Result<MvpSnapshot, St
     service.stop()
 }
 
+#[tauri::command(async)]
+pub fn mvp_pause(service: tauri::State<'_, MvpService>) -> Result<MvpSnapshot, String> {
+    service.pause()
+}
+
+#[tauri::command(async)]
+pub fn mvp_resume(service: tauri::State<'_, MvpService>) -> Result<MvpSnapshot, String> {
+    service.resume()
+}
+
 #[tauri::command]
 pub fn mvp_snapshot(service: tauri::State<'_, MvpService>) -> MvpSnapshot {
     service.snapshot()
@@ -72,4 +82,12 @@ pub fn mvp_export_meeting(
     target_dir: String,
 ) -> Result<ExportResult, String> {
     service.export_meeting(&meeting_id, target_dir)
+}
+
+#[tauri::command]
+pub fn mvp_transcript_text(
+    service: tauri::State<'_, MvpService>,
+    meeting_id: String,
+) -> Result<String, String> {
+    service.transcript_text(&meeting_id)
 }

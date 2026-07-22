@@ -3,12 +3,17 @@ import test from "node:test";
 
 import {
   MVP_CONTRACT_VERSION,
+  formatMvpErrorMessage,
+  formatMvpSnapshotError,
   formatElapsed,
   hasAllMvpExportFormats,
+  isMvpActiveLifecycle,
+  isMvpActiveSession,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
   parseMvpExportResult,
   parseMvpSnapshot,
+  parseMvpTranscriptText,
   resolveAudioDeviceSelection,
 } from "./mvp-contract.ts";
 
@@ -178,6 +183,45 @@ test("requires the full JSON Markdown TXT export capability set for UI export", 
   assert.equal(hasAllMvpExportFormats(["txt", "json", "markdown"]), true);
   assert.equal(hasAllMvpExportFormats(["json", "markdown"]), false);
   assert.equal(hasAllMvpExportFormats(["json", "json", "txt"]), false);
+});
+
+test("parses paused snapshots and treats paused as an active session", () => {
+  const parsed = parseMvpSnapshot({
+    ...snapshot,
+    lifecycle: "paused",
+    durabilityStatus: "paused",
+  });
+
+  assert.equal(parsed.lifecycle, "paused");
+  assert.equal(parsed.durabilityStatus, "paused");
+  assert.equal(isMvpActiveSession(parsed), true);
+  assert.equal(isMvpActiveLifecycle("paused"), true);
+});
+
+test("reports inactive completed lifecycle states for UI lock decisions", () => {
+  assert.equal(isMvpActiveSession(snapshot), false);
+  assert.equal(isMvpActiveLifecycle("ready"), false);
+  assert.equal(isMvpActiveLifecycle("error"), false);
+});
+
+test("parses full backend transcript text for clipboard copy", () => {
+  assert.equal(parseMvpTranscriptText("full transcript\nsecond line"), "full transcript\nsecond line");
+  assert.throws(() => parseMvpTranscriptText(123), /transcript text export/);
+});
+
+test("turns recoverable runtime error codes into actionable product messages", () => {
+  assert.match(formatMvpErrorMessage("AUDIO_STREAM_ERROR"), /停止当前会议/);
+  assert.match(formatMvpErrorMessage(new Error("ASR_WORKER_STOPPED")), /自动重建引擎/);
+  assert.match(formatMvpErrorMessage("SHERPA_ASSET_MISSING"), /模型或运行时路径/);
+  assert.match(formatMvpErrorMessage("MVP_RESUME_TIMEOUT"), /停止会议后重新开始/);
+  assert.equal(formatMvpErrorMessage("CUSTOM_FAILURE"), "CUSTOM_FAILURE");
+  assert.match(
+    formatMvpSnapshotError({
+      ...snapshot,
+      error: "ASR_WORKER_STOPPED",
+    }),
+    /自动重建引擎/,
+  );
 });
 
 test("parses selectable devices without collapsing duplicate display names", () => {

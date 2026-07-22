@@ -84,10 +84,13 @@ fn with_bootstrap_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> taur
             mvp::mvp_audio_devices,
             mvp::mvp_start,
             mvp::mvp_stop,
+            mvp::mvp_pause,
+            mvp::mvp_resume,
             mvp::mvp_snapshot,
             mvp::mvp_open_recent,
             mvp::mvp_open_meeting,
-            mvp::mvp_export_meeting
+            mvp::mvp_export_meeting,
+            mvp::mvp_transcript_text
         ])
 }
 
@@ -252,5 +255,39 @@ mod tests {
         .expect_err("missing consent must be rejected before device access");
 
         assert!(error.to_string().contains("CONSENT_REQUIRED"));
+    }
+
+    #[test]
+    fn mvp_pause_and_resume_ipc_are_registered() {
+        let app = with_bootstrap_handler(tauri::test::mock_builder())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock Tauri app");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("failed to build mock webview window");
+
+        for command in ["mvp_pause", "mvp_resume"] {
+            let error = tauri::test::get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: command.to_owned(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost"
+                        .parse()
+                        .expect("mock invoke URL must be valid"),
+                    body: tauri::ipc::InvokeBody::default(),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+            .expect_err("pause/resume require an active Windows session");
+
+            let error = error.to_string();
+            assert!(
+                error.contains("MVP_WINDOWS_ONLY") || error.contains("SESSION_NOT_RUNNING"),
+                "{command} returned unexpected error: {error}"
+            );
+        }
     }
 }

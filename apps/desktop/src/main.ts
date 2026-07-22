@@ -2,8 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 
 import {
   AUDIO_DEVICE_PREFERENCE_KEY,
+  formatMvpErrorMessage,
+  formatMvpSnapshotError,
   formatElapsed,
   hasAllMvpExportFormats,
+  isMvpActiveSession,
+  parseMvpTranscriptText,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
   parseMvpExportResult,
@@ -99,6 +103,7 @@ app.innerHTML = `
           <button id="start" class="start-button" type="button" disabled>
             <span class="record-mark"></span>开始实时转写
           </button>
+          <button id="pause-resume" class="pause-button" type="button" disabled>暂停转写</button>
           <button id="stop" class="stop-button" type="button" disabled>停止并完成当前会议</button>
         </div>
         <p id="error" class="error-line" role="alert"></p>
@@ -127,8 +132,11 @@ app.innerHTML = `
         <section class="export-panel" aria-label="Exports">
           <div class="export-actions">
             <span>导出已保存会议</span>
+            <button id="copy-transcript" class="secondary-button" type="button" disabled>复制全部转写</button>
             <button id="export-all" class="secondary-button" type="button" disabled>导出 JSON / Markdown / TXT</button>
           </div>
+          <p id="copy-status" class="copy-status" aria-live="polite"></p>
+          <textarea id="copy-fallback" class="copy-fallback" readonly hidden aria-label="已准备的转写文本"></textarea>
           <ul id="export-results" class="export-results" aria-live="polite"></ul>
         </section>
         <footer class="stage-footer">
@@ -153,6 +161,7 @@ const controls = {
   deviceStatus: element<HTMLParagraphElement>("#device-status"),
   consent: element<HTMLInputElement>("#consent"),
   start: element<HTMLButtonElement>("#start"),
+  pauseResume: element<HTMLButtonElement>("#pause-resume"),
   stop: element<HTMLButtonElement>("#stop"),
   error: element<HTMLParagraphElement>("#error"),
   lifecycle: element<HTMLSpanElement>("#lifecycle"),
@@ -172,6 +181,9 @@ const controls = {
   footerStorage: element<HTMLElement>("#footer-storage"),
   openRecent: element<HTMLButtonElement>("#open-recent"),
   recentSummary: element<HTMLElement>("#recent-summary"),
+  copyTranscript: element<HTMLButtonElement>("#copy-transcript"),
+  copyStatus: element<HTMLParagraphElement>("#copy-status"),
+  copyFallback: element<HTMLTextAreaElement>("#copy-fallback"),
   exportAll: element<HTMLButtonElement>("#export-all"),
   exportResults: element<HTMLUListElement>("#export-results"),
 };
@@ -181,16 +193,15 @@ let lastExport: MvpExportResult | null = null;
 let pollTimer: number | null = null;
 let audioDevices: AudioDeviceInventory | null = null;
 let audioDeviceLoadError: string | null = null;
+let lastClipboardText: string | null = null;
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 
 function message(error: unknown): string {
-  const text =
-    error instanceof Error ? error.message : typeof error === "string" ? error : "未知错误";
-  return text.trim().replace(/\s+/g, " ").slice(0, 220) || "未知错误";
+  return formatMvpErrorMessage(error);
 }
 
 function isActive(snapshot: MvpSnapshot): boolean {
-  return ["starting", "recording", "stopping"].includes(snapshot.lifecycle);
+  return isMvpActiveSession(snapshot);
 }
 
 function currentAudioDeviceSelection(): {
@@ -320,12 +331,23 @@ function canExport(snapshot: MvpSnapshot): boolean {
   );
 }
 
-function renderSource(source: AudioSourceSnapshot): void {
+function canCopyTranscript(snapshot: MvpSnapshot): boolean {
+  return (
+    snapshot.meetingId !== null &&
+    !isActive(snapshot) &&
+    ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus) &&
+    BigInt(snapshot.savedFinalCount) > 0n
+  );
+}
+
+function renderSource(source: AudioSourceSnapshot, paused: boolean): void {
   const card = element<HTMLElement>(`#source-${source.id}`);
-  card.dataset.status = source.status;
+  card.dataset.status = paused ? "paused" : source.status;
   element<HTMLElement>(`#${source.id}-label`).textContent = source.label || "未找到设备";
   element<HTMLElement>(`#${source.id}-status`).textContent =
-    source.status === "capturing"
+    paused
+      ? "已暂停"
+      : source.status === "capturing"
       ? "采集中"
       : source.status === "ready"
         ? "已就绪"
@@ -356,15 +378,29 @@ function renderExportArtifact(result: ExportArtifact): HTMLLIElement {
 }
 
 function renderExports(snapshot: MvpSnapshot): void {
+  controls.copyTranscript.disabled = !canCopyTranscript(snapshot);
+  if (!canCopyTranscript(snapshot)) {
+    lastClipboardText = null;
+    controls.copyFallback.value = "";
+    controls.copyFallback.hidden = true;
+  }
   controls.exportAll.disabled = !canExport(snapshot);
   controls.exportResults.replaceChildren(
     ...(lastExport?.artifacts.map(renderExportArtifact) ?? []),
   );
 }
 
+async function writeClipboardText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText === undefined) {
+    throw new Error("当前窗口无法访问剪贴板 API");
+  }
+  await navigator.clipboard.writeText(text);
+}
+
 function render(snapshot: MvpSnapshot): void {
   latest = snapshot;
   const active = isActive(snapshot);
+  const paused = snapshot.lifecycle === "paused";
   const ready =
     snapshot.lifecycle === "ready" &&
     snapshot.modelReady &&
@@ -380,14 +416,23 @@ function render(snapshot: MvpSnapshot): void {
   controls.model.dataset.ready = String(snapshot.modelReady);
   controls.start.disabled =
     !ready || !controls.consent.checked || currentAudioDeviceSelection() === null;
+  controls.pauseResume.disabled = !["recording", "paused"].includes(snapshot.lifecycle);
+  controls.pauseResume.textContent = paused ? "继续转写" : "暂停转写";
+  controls.pauseResume.dataset.state =
+    paused ? "paused" : snapshot.lifecycle === "recording" ? "recording" : "idle";
   controls.stop.disabled = !active;
   controls.consent.disabled = active;
   renderAudioDeviceControls(active);
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
-  controls.error.textContent =
-    snapshot.error ?? snapshot.system.error ?? snapshot.microphone.error ?? "";
+  controls.error.textContent = formatMvpSnapshotError(snapshot);
   controls.storageIndicator.dataset.status =
-    snapshot.durabilityStatus === "error" ? "error" : snapshot.durabilityStatus === "initializing" ? "initializing" : "ready";
+    snapshot.durabilityStatus === "error"
+      ? "error"
+      : snapshot.durabilityStatus === "initializing"
+        ? "initializing"
+        : snapshot.durabilityStatus === "paused"
+          ? "paused"
+          : "ready";
   controls.storageStatus.textContent =
     snapshot.durabilityStatus === "error"
       ? "本地持久化异常"
@@ -395,13 +440,17 @@ function render(snapshot: MvpSnapshot): void {
         ? "初始化本地持久化"
         : snapshot.durabilityStatus === "recording"
           ? "本地持久化写入中"
-          : snapshot.durabilityStatus === "completed"
-            ? "会议已完成并持久保存"
-            : snapshot.durabilityStatus === "interrupted"
-              ? "已恢复中断会议"
-              : "本地持久化正常";
+          : snapshot.durabilityStatus === "paused"
+            ? "本地持久化已暂停"
+            : snapshot.durabilityStatus === "completed"
+              ? "会议已完成并持久保存"
+              : snapshot.durabilityStatus === "interrupted"
+                ? "已恢复中断会议"
+                : "本地持久化正常";
   controls.storageDetail.textContent =
-    "SQLite/WAL · final 仅在 commit ACK 或 DB reopen 后标为已保存";
+    snapshot.durabilityStatus === "paused"
+      ? "SQLite/WAL · 暂停期间音频不进入转写，已提交 final 保持可恢复"
+      : "SQLite/WAL · final 仅在 commit ACK 或 DB reopen 后标为已保存";
   controls.savedCount.textContent = snapshot.savedFinalCount;
   controls.visibleWindow.textContent = `${snapshot.finals.length} / ${snapshot.totalFinalCount}`;
   controls.meetingId.textContent = snapshot.meetingId ?? "未打开";
@@ -410,9 +459,11 @@ function render(snapshot: MvpSnapshot): void {
       ? "异常"
       : snapshot.durabilityStatus === "initializing"
         ? "初始化"
-        : "SQLite 已开启";
-  renderSource(snapshot.system);
-  renderSource(snapshot.microphone);
+        : snapshot.durabilityStatus === "paused"
+          ? "已暂停"
+          : "SQLite 已开启";
+  renderSource(snapshot.system, paused);
+  renderSource(snapshot.microphone, paused);
 
   controls.transcript.replaceChildren(
     ...snapshot.finals.map((segment) => {
@@ -458,6 +509,14 @@ async function exportMeeting(): Promise<void> {
   if (latest) render(latest);
 }
 
+async function transcriptTextForMeeting(meetingId: string): Promise<string> {
+  return parseMvpTranscriptText(
+    await invoke<unknown>("mvp_transcript_text", {
+      meetingId,
+    }),
+  );
+}
+
 function schedulePoll(): void {
   if (pollTimer !== null) window.clearTimeout(pollTimer);
   if (!latest || !isActive(latest)) return;
@@ -491,6 +550,10 @@ controls.start.addEventListener("click", async () => {
   controls.start.disabled = true;
   controls.error.textContent = "";
   lastExport = null;
+  lastClipboardText = null;
+  controls.copyStatus.textContent = "";
+  controls.copyFallback.value = "";
+  controls.copyFallback.hidden = true;
   try {
     const selection = currentAudioDeviceSelection();
     if (selection === null) throw new Error("请选择当前可用的系统输出和麦克风");
@@ -518,9 +581,30 @@ controls.stop.addEventListener("click", async () => {
   }
 });
 
+controls.pauseResume.addEventListener("click", async () => {
+  const snapshot = latest;
+  if (snapshot === null || !["recording", "paused"].includes(snapshot.lifecycle)) return;
+  controls.pauseResume.disabled = true;
+  try {
+    render(await call(snapshot.lifecycle === "paused" ? "mvp_resume" : "mvp_pause"));
+    schedulePoll();
+  } catch (error) {
+    controls.pauseResume.disabled =
+      latest === null || !["recording", "paused"].includes(latest.lifecycle);
+    controls.error.textContent =
+      snapshot.lifecycle === "paused"
+        ? `无法继续转写：${message(error)}`
+        : `无法暂停转写：${message(error)}`;
+  }
+});
+
 controls.openRecent.addEventListener("click", async () => {
   controls.openRecent.disabled = true;
   lastExport = null;
+  lastClipboardText = null;
+  controls.copyStatus.textContent = "";
+  controls.copyFallback.value = "";
+  controls.copyFallback.hidden = true;
   try {
     await openRecentMeeting();
   } catch (error) {
@@ -537,6 +621,43 @@ controls.exportAll.addEventListener("click", async () => {
   } catch (error) {
     controls.error.textContent = `导出三种格式失败：${message(error)}`;
     if (latest) render(latest);
+  }
+});
+
+controls.copyTranscript.addEventListener("click", async () => {
+  const snapshot = latest;
+  if (snapshot === null || !canCopyTranscript(snapshot)) return;
+  const meetingId = snapshot.meetingId;
+  if (meetingId === null) return;
+  controls.copyTranscript.disabled = true;
+  controls.copyStatus.dataset.status = "loading";
+  controls.copyStatus.textContent = "正在准备完整转写文本...";
+  controls.copyFallback.value = "";
+  controls.copyFallback.hidden = true;
+  try {
+    lastClipboardText = await transcriptTextForMeeting(meetingId);
+  } catch (error) {
+    lastClipboardText = null;
+    controls.copyStatus.dataset.status = "error";
+    controls.copyStatus.textContent = `无法读取完整转写文本：${message(error)}`;
+    controls.error.textContent = "复制失败：无法从本地数据库读取完整转写文本。";
+    controls.copyTranscript.disabled = latest === null || !canCopyTranscript(latest);
+    return;
+  }
+  controls.copyStatus.textContent = "正在写入剪贴板...";
+  try {
+    await writeClipboardText(lastClipboardText);
+    controls.copyStatus.dataset.status = "success";
+    controls.copyStatus.textContent = "已复制全部转写文本。";
+  } catch (error) {
+    controls.copyFallback.value = lastClipboardText;
+    controls.copyFallback.hidden = false;
+    controls.copyFallback.select();
+    controls.copyStatus.dataset.status = "error";
+    controls.copyStatus.textContent = `剪贴板写入失败：${message(error)}。完整文本已保留在下方。`;
+    controls.error.textContent = "复制失败：完整转写文本已保留，可手动复制。";
+  } finally {
+    controls.copyTranscript.disabled = latest === null || !canCopyTranscript(latest);
   }
 });
 
