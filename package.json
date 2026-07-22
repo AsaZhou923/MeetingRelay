@@ -48,6 +48,8 @@
     "phase0:funasr-sidecar-source:validate": "node tools/funasr-sidecar/sidecar-source-attestation.mjs --run-synthetic",
     "phase0:funasr-sidecar-package-lock:test": "node --test tools/funasr-sidecar/sidecar-package-lock-attestation.test.mjs",
     "phase0:funasr-sidecar-package-lock:validate": "node tools/funasr-sidecar/sidecar-package-lock-attestation.mjs --run-synthetic",
+    "phase0:funasr-sidecar-venv-materialization:test": "node --test tools/funasr-sidecar/sidecar-venv-materialization-attestation.test.mjs",
+    "phase0:funasr-sidecar-venv-materialization:validate": "node tools/funasr-sidecar/sidecar-venv-materialization-attestation.mjs --run-synthetic",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",
     "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",

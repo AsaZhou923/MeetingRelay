@@ -104,6 +104,8 @@ pnpm phase0:funasr-sidecar-preflight:test
 pnpm phase0:funasr-sidecar-preflight:validate
 pnpm phase0:funasr-sidecar-python-launch:test
 pnpm phase0:funasr-sidecar-python-launch:validate
+pnpm phase0:funasr-sidecar-venv-materialization:test
+pnpm phase0:funasr-sidecar-venv-materialization:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 pnpm --dir apps/desktop test
@@ -264,6 +266,30 @@ node tools/funasr-sidecar/sidecar-package-lock-attestation.mjs --run-synthetic
 ```
 
 Synthetic fixture bytes do not prove valid wheel structure, an installed environment, CPython provenance, FunASR import/model/audio/network execution, source-build provenance, package approval, quality, selection, production readiness, or distribution authority.
+
+### FunASR sidecar venv materialization attestation
+
+WP-0.4.4f starts from the WP-0.4.4b-bound runtime and WP-0.4.4e-bound package-lock/wheelhouse. The production CLI is:
+
+```powershell
+node tools/funasr-sidecar/sidecar-venv-materialization-attestation.mjs --attest `
+  <controlled-root> `
+  <canonical-4b-input-manifest.json> `
+  <absolute-venv-python> `
+  <expected-candidate-aggregate-sha256>
+```
+
+The caller-supplied venv Python must be the exact `runtime` role path already bound by the 4b manifest, with matching bytes and stable file identity before and after materialization. It must self-report CPython 3.12 on 64-bit Windows AMD64 with the `win-amd64` platform, but this slice does not create the interpreter or prove its origin, signature, or CPython provenance. It installs the locked wheelhouse into that existing venv using pip with `--no-index`, `--find-links`, `--only-binary :all:`, `--no-deps`, `--require-hashes`, `--isolated`, `--require-virtualenv`, `--no-compile`, controlled cwd, and root-local temp directories. The attestor verifies bootstrap-only pre-state, resolver pip version against the lock declaration, `pip check`, a canonical path-free `pip inspect` projection against the lock's expected environment report declaration, the installed distribution set, installed `METADATA`, installed `RECORD`, and RECORD-listed file hashes/sizes/path boundaries. RECORD entries outside `site-packages`, including console-script or alternate data-scheme paths, fail closed in this scoped slice and require a later allowlisted extension before real target closure.
+
+Public evidence fixes `measurement_status=controlled-wheelhouse-and-venv-materialized-only`, `execution_status=offline-install-pip-check-inspect-no-funasr-import`, `packaging_authority=controlled-wheelhouse-and-offline-venv-only`, `environment_materialization_authority=offline-venv-materialized`, and `package_metadata_authority=installed-dist-info-record-verified-only`. It keeps `source_build_authority=license_authority=cpython_provenance_authority=import_authority=none`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, and `selection_authority=none`. The evidence is path-free and text-free.
+
+The independent validator creates a synthetic 4b-bound venv fixture and 77 tiny valid wheels only to exercise the offline materialization mechanism:
+
+```powershell
+node tools/funasr-sidecar/sidecar-venv-materialization-attestation.mjs --run-synthetic
+```
+
+Those CI wheels contain no real FunASR/PyTorch code and do not prove an actual FunASR environment, package quality, import behavior, model load, audio processing, OS-level network isolation, source-build replay, license approval, production readiness, selection, default status, or distribution authority.
 
 ### Collector-only measured HW-REF
 

@@ -35,6 +35,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      - name: Set up CPython for FunASR sidecar venv materialization contracts
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,19 +73,25 @@ jobs:
       - name: Validate desktop frontend MVP contract, types, and production bundle
         run: |
           pnpm --dir apps/desktop test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm desktop:build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 10
 
       - name: Test and validate Phase 0 fixtures
         run: |
           pnpm phase0:fixtures:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:fixtures:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate WP-0.4 candidate artifact contract
         run: |
           pnpm phase0:candidate-artifacts:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:candidate-artifacts:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test WP-0.4 measured HW-REF collector foundation
@@ -91,8 +102,11 @@ jobs:
         shell: pwsh
         run: |
           pnpm phase0:sherpa-assets:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:sherpa-assets:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:sherpa-provenance:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test WP-0.4 sherpa candidate-input pure planner
@@ -130,19 +144,25 @@ jobs:
       - name: Test and validate WP-0.4 FunASR sidecar candidate preflight (identity bytes only)
         run: |
           pnpm phase0:funasr-sidecar-preflight:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:funasr-sidecar-preflight:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate WP-0.4 FunASR sidecar Python-compatible launch probe
         run: |
           pnpm phase0:funasr-sidecar-python-launch:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:funasr-sidecar-python-launch:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate WP-0.4 FunASR sidecar source attestation
         run: |
           pnpm phase0:funasr-sidecar-source:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:funasr-sidecar-source:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate WP-0.4 FunASR sidecar package-lock attestation
@@ -150,6 +170,15 @@ jobs:
           pnpm phase0:funasr-sidecar-package-lock:test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:funasr-sidecar-package-lock:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 5
+
+      - name: Test and validate WP-0.4 FunASR sidecar venv materialization attestation
+        run: |
+          pnpm phase0:funasr-sidecar-venv-materialization:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm phase0:funasr-sidecar-venv-materialization:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
@@ -176,25 +205,33 @@ jobs:
       - name: Test and validate Phase 0 replay ledgers
         run: |
           pnpm phase0:ledgers:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:ledgers:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate Phase 0 provider harness
         run: |
           pnpm phase0:provider:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:provider:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate Phase 0 clock calibration
         run: |
           pnpm phase0:clock:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:clock:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Test and validate Phase 0 queue and resource harness
         run: |
           pnpm phase0:resources:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm phase0:resources:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
       - name: Materialize pinned sherpa runtime and model assets
@@ -261,7 +298,9 @@ jobs:
       - name: Build and test WP-0.4 quality shard host contract (no real data)
         run: |
           cargo build -p meetingrelay-model-worker-sherpa-native --bin meetingrelay-sherpa-candidate-quality-shard-host --release --no-default-features --features native-quality-shard --offline --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p meetingrelay-model-worker-sherpa-native --test candidate_quality_shard_host_cli --no-default-features --features native-quality-shard --offline --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 10
 
       - name: Test sherpa path hardening against materialized assets
@@ -311,7 +350,9 @@ jobs:
       - name: Lint and test sherpa adapter without the native feature
         run: |
           cargo clippy -p meetingrelay-model-worker-sherpa-native --all-targets --no-default-features --offline --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p meetingrelay-model-worker-sherpa-native --all-targets --no-default-features --offline --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 10
 
       - name: Check Rust workspace including desktop MVP and sherpa wrapper

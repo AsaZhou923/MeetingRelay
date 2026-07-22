@@ -98,6 +98,14 @@ export class PackageLockAttestationError extends Error {
   }
 }
 
+export function readPackageLockFromCanonicalBytes(bytes) {
+  return assertCanonicalLockBytes(bytes);
+}
+
+export function normalizePackageName(name) {
+  return normalizeName(name);
+}
+
 function fail(code, message) {
   throw new PackageLockAttestationError(code, message);
 }
