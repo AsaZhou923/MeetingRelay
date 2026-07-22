@@ -89,15 +89,40 @@ jobs:
       - name: Materialize locked local ASR assets
         shell: pwsh
         run: |
+          $gitCommands = @(Get-Command git.exe -CommandType Application -All -ErrorAction Stop)
+          $gitRoots = @($gitCommands | ForEach-Object {
+            $directory = [IO.DirectoryInfo](Split-Path -Parent ([IO.Path]::GetFullPath($_.Source)))
+            while ($null -ne $directory) {
+              $tarCandidate = Join-Path $directory.FullName 'usr\bin\tar.exe'
+              $bzip2Candidate = Join-Path $directory.FullName 'usr\bin\bzip2.exe'
+              if ((Test-Path -LiteralPath $tarCandidate -PathType Leaf) -and
+                  (Test-Path -LiteralPath $bzip2Candidate -PathType Leaf)) {
+                $directory.FullName
+                break
+              }
+              $directory = $directory.Parent
+            }
+          } | Sort-Object -Unique)
+          if ($gitRoots.Count -ne 1) {
+            throw "expected exactly one complete Git for Windows installation"
+          }
+          Write-Host "MEETINGRELAY_ARCHIVE_TOOLS root=$($gitRoots[0])"
+          $archiveTar = Join-Path $gitRoots[0] 'usr\bin\tar.exe'
+          $archiveBzip2 = Join-Path $gitRoots[0] 'usr\bin\bzip2.exe'
+
           & ./tools/sherpa-native/materialize.ps1 `
             -CacheRoot target/sherpa-native `
             -AssetSet All `
+            -ArchiveTarPath $archiveTar `
+            -ArchiveBzip2Path $archiveBzip2 `
             -AllowDownload
           if ($LASTEXITCODE -ne 0) { throw "sherpa asset materialization failed" }
 
           $assetEnvironment = @(& ./tools/sherpa-native/materialize.ps1 `
             -CacheRoot target/sherpa-native `
-            -AssetSet All)
+            -AssetSet All `
+            -ArchiveTarPath $archiveTar `
+            -ArchiveBzip2Path $archiveBzip2)
           $assetEnvironment | Write-Output
           if ($LASTEXITCODE -ne 0) { throw "offline sherpa asset validation failed" }
 
