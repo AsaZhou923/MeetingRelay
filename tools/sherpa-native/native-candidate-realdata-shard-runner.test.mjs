@@ -857,6 +857,26 @@ test("strict final validator rejects quality authority escalation and selected/d
   const { dependencies } = mockDependencies();
   await __runNativeCandidateRealdataShardEvaluationForTest(input, dependencies);
   const baseline = JSON.parse(await readFile(input.finalEvidencePath, "utf8"));
+  const baselineResourceObservationsSha256 = sha256(Buffer.from(
+    encodeCanonicalJsonLine(baseline.resource_observations),
+    "utf8",
+  ));
+  assert.equal(baseline.execution.run_resource_observations_sha256, baselineResourceObservationsSha256);
+  assert.equal(baseline.ledger_identity.hardware_evidence_sha256, baselineResourceObservationsSha256);
+  assert.equal(
+    baseline.resource_observations.sample_count,
+    baseline.execution.sample_count + baseline.execution.canary_count,
+  );
+  assert.equal(
+    baseline.resource_observations.status_counts.observed +
+      baseline.resource_observations.status_counts.unavailable,
+    baseline.resource_observations.sample_count,
+  );
+  assert.equal(
+    baseline.resource_observations.supervisor_process_status_counts.available +
+      baseline.resource_observations.supervisor_process_status_counts.unavailable,
+    baseline.execution.shard_count,
+  );
   for (const mutate of [
     (record) => { record.authority.formal_claims = "quality-pass"; },
     (record) => { record.quality_gate_status = "passed"; },
@@ -867,7 +887,15 @@ test("strict final validator rejects quality authority escalation and selected/d
     (record) => { record.execution.canary_transcript_sha256_by_language.en = "0".repeat(64); },
     (record) => { record.execution.shards[0].resource_observation.extra = true; },
     (record) => { record.resource_observations.status_counts.available = 1; },
+    (record) => { record.resource_observations.status_counts.observed -= 1; },
     (record) => { record.resource_observations.supervisor_process_status_counts.observed = 1; },
+    (record) => { record.resource_observations.supervisor_process_status_counts.available += 1; },
+    (record) => { record.resource_observations.sample_count = record.execution.sample_count; },
+    (record) => { record.execution.canary_count += 1; record.execution.shards[0].canary_count += 1; },
+    (record) => {
+      record.execution.run_resource_observations_sha256 = "a".repeat(64);
+      record.ledger_identity.hardware_evidence_sha256 = "a".repeat(64);
+    },
     (record) => { record.ledger_identity.hardware_evidence_sha256 = "a".repeat(64); },
     (record) => { record.host_identity = null; },
     (record) => { record.ledger_identity = null; },

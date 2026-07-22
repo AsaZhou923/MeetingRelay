@@ -961,12 +961,15 @@ function computeCandidateIdentityJoinSha256(candidateIdentityByLanguage, paramet
 function validateStatusCountMap(value, allowed, code) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(code);
   exactKeys(value, allowed, code);
+  let total = 0;
   for (const [key, count] of Object.entries(value)) {
     if (!allowed.includes(key) || !Number.isSafeInteger(count) || count < 0) fail(code);
+    total += count;
   }
+  return total;
 }
 
-function validateResourceObservationSummary(value) {
+function validateResourceObservationSummary(value, executionTotals) {
   exactKeys(value, [
     "host_peak_ram_bytes_max", "sample_count", "status_counts",
     "supervisor_process_peak_working_set64_max", "supervisor_process_status_counts",
@@ -979,8 +982,19 @@ function validateResourceObservationSummary(value) {
       (!Number.isSafeInteger(value.supervisor_process_peak_working_set64_max) ||
         value.supervisor_process_peak_working_set64_max < 0))
   ) fail("REALDATA_RESOURCE");
-  validateStatusCountMap(value.status_counts, ["observed", "unavailable"], "REALDATA_RESOURCE");
-  validateStatusCountMap(value.supervisor_process_status_counts, ["available", "unavailable"], "REALDATA_RESOURCE");
+  const hostStatusCount = validateStatusCountMap(value.status_counts, ["observed", "unavailable"], "REALDATA_RESOURCE");
+  const supervisorStatusCount = validateStatusCountMap(
+    value.supervisor_process_status_counts,
+    ["available", "unavailable"],
+    "REALDATA_RESOURCE",
+  );
+  if (
+    hostStatusCount !== value.sample_count ||
+    (executionTotals !== undefined && (
+      value.sample_count !== executionTotals.sampleCount + executionTotals.canaryCount ||
+      supervisorStatusCount !== executionTotals.shardCount
+    ))
+  ) fail("REALDATA_RESOURCE");
 }
 
 function validateAggregateRate(rate, { allowUnavailable = true, utterance = false } = {}) {
@@ -1129,6 +1143,11 @@ function validateFinalExecution(value) {
     canaries += shard.canary_count;
   }
   if (scored !== SAMPLE_COUNT || canaries !== value.canary_count) fail("REALDATA_EVIDENCE");
+  return {
+    canaryCount: canaries,
+    sampleCount: scored,
+    shardCount: value.shard_count,
+  };
 }
 
 function validateEvidenceRecord(record) {
@@ -1152,8 +1171,8 @@ function validateEvidenceRecord(record) {
     record.execution.sample_count !== SAMPLE_COUNT
   ) fail("REALDATA_EVIDENCE");
   validatePublicAggregate(record.aggregate, record.scorer_identity);
-  validateFinalExecution(record.execution);
-  validateResourceObservationSummary(record.resource_observations);
+  const executionTotals = validateFinalExecution(record.execution);
+  validateResourceObservationSummary(record.resource_observations, executionTotals);
   exactKeys(record.ledger_identity, [
     "candidate_identity_join_sha256", "entry_count", "hardware_evidence_sha256",
     "projection_sha256", "seal_sha256", "sha256",
@@ -1174,7 +1193,13 @@ function validateEvidenceRecord(record) {
   ) {
     fail("REALDATA_HOST_IDENTITY");
   }
-  if (record.ledger_identity.hardware_evidence_sha256 !== record.execution.run_resource_observations_sha256) {
+  const expectedResourceObservationsSha256 = sha256(
+    Buffer.from(encodeCanonicalJsonLine(record.resource_observations), "utf8"),
+  );
+  if (
+    record.execution.run_resource_observations_sha256 !== expectedResourceObservationsSha256 ||
+    record.ledger_identity.hardware_evidence_sha256 !== expectedResourceObservationsSha256
+  ) {
     fail("REALDATA_RESOURCE");
   }
   assertNoForbiddenAuthority(record);

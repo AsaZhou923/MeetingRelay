@@ -253,7 +253,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
-      - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
+      - name: Test WP-0.4.6a resource artifact digest/count closure and real-data shard contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5
 

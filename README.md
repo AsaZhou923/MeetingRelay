@@ -268,6 +268,18 @@ pnpm phase0:whisper-ci-build-output-runtime-identity:run <expected-head> <absolu
 
 Public evidence includes `observation_scope=synthetic-injected-harness` for the local unit harness and `observation_scope=windows-ci-clean-exact-head-build-output` for the real CI path, so synthetic evidence cannot masquerade as a real build-output observation. Its authority is fixed to `measurement_status=whisper-ci-build-output-runtime-identity-attestation-only`, `execution_status=ci-built-runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription`, `build_output_identity_attestation=true`, `source_build_provenance_authority=none`, `registry_source_byte_closure=false`, `toolchain_provenance_authority=observed-tool-bytes-only`, `loaded_image_attestation=false`, and `network_isolation_authority=none`. This is not source-build provenance, not reproducible-build proof, not registry source byte closure, and not model/license selection or approval. It creates no model load, audio, transcription, `ModelBackend`, quality/performance/resource, fallback/ranking/default, legal/distribution, parent WP-0.4.5, CT-WORKER-CANDIDATE-001, or Phase 1 authority.
 
+### WP-0.4.6a resource artifact digest/count closure
+
+WP-0.4.6a tightens only the public validator for the existing Sherpa real-data shard evidence. It recomputes SHA-256 over the canonical JSON line of `resource_observations` and requires the result to match both `execution.run_resource_observations_sha256` and `ledger_identity.hardware_evidence_sha256`. It also closes three count joins: host resource status counts must sum to the resource observation sample count, that sample count must equal scored samples plus canaries, and supervisor resource status counts must sum to the shard count.
+
+The offline fixture suite exercises the positive contract and independent mutations of every digest/count join:
+
+```powershell
+pnpm phase0:sherpa-realdata-shard:test
+```
+
+The closeout authority for this slice—not a new field in the existing public evidence payload—is fixed to `measurement_status=resource-artifact-validator-contract-only`, `execution_status=offline-fixture-validation-only-existing-realdata-shard-evidence-no-new-model-run`, and `resource_artifact_validator_status=digest-count-authority-closure-verified`. It does not add a same-machine runner, rotation-order run, cold/warm samples, statistics, confidence intervals, a new model run, or a quality claim. Those statuses remain respectively `not-implemented`, `not-run`, `not-run`, `not-computed`, `not-computed`, and `not-assessed`; formal claims, selection/fallback/ranking/default, production evidence, public distribution, parent WP-0.4.6 closeout, and Phase 1 authority remain absent.
+
 ### FunASR sidecar Python-compatible launch probe
 
 WP-0.4.4c adds only a real process launch probe for the runtime file already bound by the WP-0.4.4b canonical manifest. The production CLI is:
