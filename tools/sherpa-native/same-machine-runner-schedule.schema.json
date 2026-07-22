@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meetingrelay.invalid/schemas/same-machine-runner-schedule-v1.schema.json",
+  "title": "MeetingRelay same-machine offline dry-run schedule v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authority",
+    "contract",
+    "kind",
+    "ledger",
+    "sampling",
+    "schema_version",
+    "stages"
+  ],
+  "properties": {
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cold_warm_sample_status",
+        "confidence_interval",
+        "default",
+        "execution_status",
+        "fallback",
+        "formal_claims",
+        "measurement_status",
+        "production_evidence",
+        "public_distribution",
+        "quality",
+        "ranking",
+        "rotation_order_status",
+        "same_machine_runner_status",
+        "selection",
+        "statistics"
+      ],
+      "properties": {
+        "cold_warm_sample_status": { "const": "planned-not-measured" },
+        "confidence_interval": { "const": "not-computed" },
+        "default": { "const": "none" },
+        "execution_status": {
+          "const": "offline-dry-run-scheduler-validation-only-no-model-no-audio-no-transcription"
+        },
+        "fallback": { "const": "none" },
+        "formal_claims": { "const": "none" },
+        "measurement_status": {
+          "const": "same-machine-runner-plan-contract-only"
+        },
+        "production_evidence": { "const": false },
+        "public_distribution": { "const": false },
+        "quality": { "const": "not-assessed" },
+        "ranking": { "const": "none" },
+        "rotation_order_status": {
+          "const": "deterministic-dry-run-order-validated"
+        },
+        "same_machine_runner_status": {
+          "const": "schedule-contract-validated"
+        },
+        "selection": { "const": "none" },
+        "statistics": { "const": "not-computed" }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_bindings",
+        "clock_domain",
+        "fixture_bindings",
+        "hw_ref_id",
+        "network_policy",
+        "order_policy",
+        "same_condition_contract_sha256",
+        "seed"
+      ],
+      "properties": {
+        "candidate_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/candidateBinding" }
+        },
+        "clock_domain": { "const": "logical-dry-run-sequence-v1" },
+        "fixture_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/fixtureBinding" }
+        },
+        "hw_ref_id": { "const": "hw-ref-contract-fixture-001" },
+        "network_policy": { "const": "offline-only" },
+        "order_policy": { "const": "seeded-round-robin-v1" },
+        "same_condition_contract_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "seed": { "const": "42" }
+      }
+    },
+    "kind": {
+      "const": "meetingrelay-sherpa-same-machine-runner-schedule-v1"
+    },
+    "ledger": {
+      "type": "array",
+      "minItems": 47,
+      "maxItems": 24064,
+      "items": { "$ref": "#/$defs/ledgerEntry" }
+    },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cold_runs",
+        "final_event_count",
+        "soak_durations_seconds",
+        "warm_samples_per_scenario",
+        "warmup_runs"
+      ],
+      "properties": {
+        "cold_runs": { "const": "10" },
+        "final_event_count": { "const": "10000" },
+        "soak_durations_seconds": {
+          "const": ["1800", "7200", "14400"]
+        },
+        "warm_samples_per_scenario": { "const": "30" },
+        "warmup_runs": { "const": "1" }
+      }
+    },
+    "schema_version": { "const": "1.0" },
+    "stages": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "prefixItems": [
+        { "$ref": "#/$defs/preflightStage" },
+        { "$ref": "#/$defs/publishabilityStage" },
+        { "$ref": "#/$defs/contractStage" },
+        { "$ref": "#/$defs/qualityStage" },
+        { "$ref": "#/$defs/coldStage" },
+        { "$ref": "#/$defs/warmupStage" },
+        { "$ref": "#/$defs/warmStage" },
+        { "$ref": "#/$defs/soakFaultStage" },
+        { "$ref": "#/$defs/postflightStage" }
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "candidateBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "candidate_manifest_sha256",
+        "role"
+      ],
+      "properties": {
+        "candidate_id": { "$ref": "#/$defs/identifier" },
+        "candidate_manifest_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "role": {
+          "enum": [
+            "fallback-candidate",
+            "native-candidate",
+            "oracle-only",
+            "sidecar-candidate"
+          ]
+        }
+      }
+    },
+    "fixtureBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "audio_sha256",
+        "fixture_id",
+        "pcm_sha256",
+        "reference_sha256",
+        "scenario_id"
+      ],
+      "properties": {
+        "audio_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "fixture_id": { "$ref": "#/$defs/identifier" },
+        "pcm_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "reference_sha256": { "$ref": "#/$defs/nonzeroSha256" },
+        "scenario_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "ledgerEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "clock_domain",
+        "fixture_id",
+        "lane",
+        "planned_sample_index",
+        "scenario_id",
+        "sequence",
+        "stage",
+        "stage_sequence"
+      ],
+      "properties": {
+        "candidate_id": { "$ref": "#/$defs/identifier" },
+        "clock_domain": { "const": "logical-dry-run-sequence-v1" },
+        "fixture_id": { "$ref": "#/$defs/identifier" },
+        "lane": { "enum": ["oracle", "ranking"] },
+        "planned_sample_index": { "$ref": "#/$defs/positiveDecimal" },
+        "scenario_id": { "$ref": "#/$defs/identifier" },
+        "sequence": { "$ref": "#/$defs/positiveDecimal" },
+        "stage": {
+          "enum": [
+            "preflight",
+            "publishability",
+            "contract",
+            "quality",
+            "cold",
+            "warmup",
+            "warm",
+            "soak-fault",
+            "postflight"
+          ]
+        },
+        "stage_sequence": {
+          "type": "string",
+          "pattern": "^[1-9]$"
+        }
+      }
+    },
+    "stageBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "planned_entry_count", "sequence"],
+      "properties": {
+        "kind": { "type": "string" },
+        "planned_entry_count": { "$ref": "#/$defs/positiveDecimal" },
+        "sequence": { "type": "string", "pattern": "^[1-9]$" }
+      }
+    },
+    "preflightStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "preflight" }, "sequence": { "const": "1" } } }
+      ]
+    },
+    "publishabilityStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "publishability" }, "sequence": { "const": "2" } } }
+      ]
+    },
+    "contractStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "contract" }, "sequence": { "const": "3" } } }
+      ]
+    },
+    "qualityStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "quality" }, "sequence": { "const": "4" } } }
+      ]
+    },
+    "coldStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "cold" }, "sequence": { "const": "5" } } }
+      ]
+    },
+    "warmupStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "warmup" }, "sequence": { "const": "6" } } }
+      ]
+    },
+    "warmStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "warm" }, "sequence": { "const": "7" } } }
+      ]
+    },
+    "soakFaultStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "soak-fault" }, "sequence": { "const": "8" } } }
+      ]
+    },
+    "postflightStage": {
+      "allOf": [
+        { "$ref": "#/$defs/stageBase" },
+        { "properties": { "kind": { "const": "postflight" }, "sequence": { "const": "9" } } }
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "nonzeroSha256": {
+      "type": "string",
+      "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+    },
+    "positiveDecimal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    }
+  }
+}
