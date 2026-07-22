@@ -52,6 +52,8 @@
     "phase0:funasr-sidecar-venv-materialization:validate": "node tools/funasr-sidecar/sidecar-venv-materialization-attestation.mjs --run-synthetic",
     "phase0:funasr-sidecar-artifact-pack:test": "node --test tools/funasr-sidecar/sidecar-artifact-pack-attestation.test.mjs",
     "phase0:funasr-sidecar-artifact-pack:validate": "node tools/funasr-sidecar/sidecar-artifact-pack-attestation.mjs --run-synthetic",
+    "phase0:funasr-sidecar-install-scheme-record:test": "node --test tools/funasr-sidecar/sidecar-install-scheme-record-attestation.test.mjs",
+    "phase0:funasr-sidecar-install-scheme-record:validate": "node tools/funasr-sidecar/sidecar-install-scheme-record-attestation.mjs --run-synthetic",
     "phase0:sherpa-provenance:test": "node --test tools/sherpa-native/worker-provenance.test.mjs",
     "phase0:ledgers:test": "node --test tools/phase0-harness/ledger-contract.test.mjs",
     "phase0:ledgers:validate": "node tools/phase0-harness/validate-ledger-replays.mjs",

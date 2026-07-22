@@ -315,6 +315,31 @@ node tools/funasr-sidecar/sidecar-artifact-pack-attestation.mjs --run-synthetic
 
 Those fixture bytes exercise artifact-pack binding only. They do not prove real FunASR/PyTorch source provenance, build replay, legal license approval, CPython provenance, installed metadata, environment materialization, FunASR import, model load, audio processing, quality/performance, production readiness, selection, default status, or distribution authority.
 
+### FunASR sidecar install-scheme RECORD attestation
+
+WP-0.4.4h starts from the WP-0.4.4g artifact-pack byte closure and a caller-supplied existing venv, then verifies direct wheel-spread installed RECORD entries and allowlisted install-scheme files under the bound runtime scheme. The production CLI is:
+
+```powershell
+node tools/funasr-sidecar/sidecar-install-scheme-record-attestation.mjs --attest `
+  <controlled-root> `
+  <canonical-4b-input-manifest.json> `
+  <canonical-artifact-pack-manifest.json> `
+  <absolute-venv-python> `
+  <expected-candidate-aggregate-sha256>
+```
+
+This slice is intentionally a synthetic direct wheel-spread contract for RECORD closure. It may exercise purelib/platlib deduplication plus constrained `scripts` and `data` scheme records, but it does not grant authority for generated launchers, real artifact-pack contents, real package approval, FunASR import, model load, audio processing, network isolation, source-build replay, legal approval, quality, selection, default status, production readiness, or public distribution.
+
+Public evidence fixes `measurement_status=controlled-wheelhouse-install-scheme-record-closure-only`, `execution_status=offline-install-pip-check-inspect-record-closure-no-funasr-import`, `packaging_authority=artifact-pack-and-install-scheme-byte-closure-only`, `package_metadata_authority=installed-dist-info-record-and-allowlisted-scheme-files-verified-only`, `environment_materialization_authority=offline-venv-materialized`, and `install_scheme_authority=bound-runtime-sysconfig-observed-only`. It preserves the WP-0.4.4g target-byte authority strings for source, license, resolver report, expected environment report, and import map, and keeps `cpython_provenance_authority=import_authority=none`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, and `selection_authority=none`. The public evidence is path-free and text-free.
+
+The independent validator creates a synthetic direct wheel-spread fixture only:
+
+```powershell
+node tools/funasr-sidecar/sidecar-install-scheme-record-attestation.mjs --run-synthetic
+```
+
+Those fixture bytes exercise install-scheme RECORD path resolution and hash/size closure only. They do not prove generated launcher behavior, a real artifact pack, a real FunASR environment, import behavior, model load, audio processing, OS-level network isolation, source-build replay, legal approval, package quality, product readiness, selection, default status, or distribution authority.
+
 ### Collector-only measured HW-REF
 
 WP-0.4.3f1 adds a Windows-native, privacy-whitelisted collector foundation. Before running it, independently measure or verify every operator fact; do not substitute guesses or values copied from a plumbing smoke. The output parent must already exist below this repository's ignored `target/` tree:
