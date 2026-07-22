@@ -1,0 +1,160 @@
+name: Personal MVP CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  personal-mvp:
+    name: Windows personal MVP
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4.4.0
+        with:
+          version: 9.15.9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.13.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/release
+          key: ${{ runner.os }}-personal-mvp-rust-1.95.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'tools/sherpa-native/assets.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-personal-mvp-rust-1.95.0-
+
+      - name: Cache locked sherpa runtime and model
+        uses: actions/cache@v5
+        with:
+          path: target/sherpa-native
+          key: ${{ runner.os }}-personal-mvp-sherpa-${{ hashFiles('tools/sherpa-native/assets.lock.json', 'tools/sherpa-native/assets.lock.sha256') }}
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "pnpm install failed" }
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo fetch --locked failed" }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_NET_OFFLINE=true' -Encoding utf8
+        timeout-minutes: 10
+
+      - name: Validate frontend and personal launch contracts
+        shell: pwsh
+        run: |
+          pnpm --dir apps/desktop test
+          if ($LASTEXITCODE -ne 0) { throw "desktop frontend tests failed" }
+          pnpm --dir apps/desktop typecheck
+          if ($LASTEXITCODE -ne 0) { throw "desktop typecheck failed" }
+          & ./tools/mvp/start.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw "personal start contract tests failed" }
+          pnpm mvp:release:personal:test
+          if ($LASTEXITCODE -ne 0) { throw "personal release contract tests failed" }
+        timeout-minutes: 10
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Materialize locked local ASR assets
+        shell: pwsh
+        run: |
+          & ./tools/sherpa-native/materialize.ps1 `
+            -CacheRoot target/sherpa-native `
+            -AssetSet All `
+            -AllowDownload
+          if ($LASTEXITCODE -ne 0) { throw "sherpa asset materialization failed" }
+
+          $assetEnvironment = @(& ./tools/sherpa-native/materialize.ps1 `
+            -CacheRoot target/sherpa-native `
+            -AssetSet All)
+          $assetEnvironment | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "offline sherpa asset validation failed" }
+
+          $keys = @(
+            'MEETINGRELAY_SHERPA_LOCK',
+            'MEETINGRELAY_SHERPA_LOCK_SHA256',
+            'MEETINGRELAY_SHERPA_PARAMETER_SHA256',
+            'MEETINGRELAY_SHERPA_MODEL',
+            'MEETINGRELAY_SHERPA_MODEL_SHA256',
+            'MEETINGRELAY_SHERPA_TOKENS',
+            'MEETINGRELAY_SHERPA_TOKENS_SHA256',
+            'MEETINGRELAY_SHERPA_WAV',
+            'SHERPA_ONNX_LIB_DIR'
+          )
+          foreach ($key in $keys) {
+            $matches = @($assetEnvironment | Where-Object { $_ -like "$key=*" })
+            if ($matches.Count -ne 1) {
+              throw "materializer did not emit exactly one $key"
+            }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $matches[0] -Encoding utf8
+          }
+
+          $libDir = @($assetEnvironment | Where-Object { $_ -like 'SHERPA_ONNX_LIB_DIR=*' })[0].Substring('SHERPA_ONNX_LIB_DIR='.Length)
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $libDir -Encoding utf8
+        timeout-minutes: 25
+
+      - name: Lint and test the Rust product workspace
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --offline --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed" }
+          cargo test --workspace --all-targets --offline --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+        timeout-minutes: 20
+
+      - name: Build the package-local personal release
+        shell: pwsh
+        run: |
+          & ./tools/mvp/release.ps1
+          if ($LASTEXITCODE -ne 0) { throw "personal release build failed" }
+
+          $releaseRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target/mvp/personal-release'))
+          foreach ($relativePath in @(
+            'MeetingRelay.exe',
+            'MeetingRelay.same-machine.ps1',
+            'model/model.int8.onnx',
+            'model/tokens.txt',
+            'locks/assets.lock.json',
+            'locks/Cargo.lock',
+            'runtime/lib/sherpa-onnx-c-api.lib',
+            'sherpa-onnx-c-api.dll',
+            'onnxruntime.dll'
+          )) {
+            $path = Join-Path $releaseRoot $relativePath
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "personal release output is missing: $relativePath"
+            }
+          }
+          Write-Output "PERSONAL_MVP_RELEASE=PASS root=$releaseRoot"
+        timeout-minutes: 20

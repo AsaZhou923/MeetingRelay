@@ -446,7 +446,10 @@ test("source, package scripts, workflow, and READMEs stay within runtime-version
   assert.match(workflow, /phase0:whisper-runtime-version-probe:test/u);
   assert.match(workflow, /meetingrelay-whisper-runtime-version-probe/u);
   const rootReadme = await readFile("README.md", "utf8");
-  assert.match(rootReadme, /WP-0\.4\.5c whisper fallback runtime version probe/u);
+  assert.match(rootReadme, /README\.phase0-archive\.md/u);
+  assert.match(rootReadme, /Optional Hardening \/ Archived Phase 0/u);
+  const archivedReadme = await readFile("README.phase0-archive.md", "utf8");
+  assert.match(archivedReadme, /WP-0\.4\.5c whisper fallback runtime version probe/u);
   const crateReadme = await readFile("crates/model-worker-whisper-native/README.md", "utf8");
   assert.match(crateReadme, /meetingrelay-whisper-runtime-version-probe/u);
   assert.equal(sha256Hex(Buffer.from("abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");

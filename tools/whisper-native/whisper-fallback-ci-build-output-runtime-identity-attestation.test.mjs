@@ -467,7 +467,10 @@ test("source, package scripts, workflow, and READMEs stay within 5d authority", 
   assert.match(workflow, /phase0:whisper-ci-build-output-runtime-identity:run \$env:GITHUB_SHA \$repositoryRoot/u);
   assert.match(workflow, /observation_scope=windows-ci-clean-exact-head-build-output/u);
   const rootReadme = await readFile("README.md", "utf8");
-  assert.match(rootReadme, /WP-0\.4\.5d whisper fallback CI build-output runtime identity attestation/u);
+  assert.match(rootReadme, /README\.phase0-archive\.md/u);
+  assert.match(rootReadme, /Optional Hardening \/ Archived Phase 0/u);
+  const archivedReadme = await readFile("README.phase0-archive.md", "utf8");
+  assert.match(archivedReadme, /WP-0\.4\.5d whisper fallback CI build-output runtime identity attestation/u);
   const toolsReadme = await readFile("tools/whisper-native/README.md", "utf8");
   assert.match(toolsReadme, /WP-0\.4\.5d whisper fallback CI build-output runtime identity attestation/u);
   const crateReadme = await readFile("crates/model-worker-whisper-native/README.md", "utf8");

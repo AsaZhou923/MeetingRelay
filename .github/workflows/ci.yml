@@ -1,10 +1,7 @@
-name: Phase 0 Contract CI
+name: Optional Phase 0 Hardening
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
