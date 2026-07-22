@@ -266,6 +266,8 @@ test("runtime sysconfig target and drift checks are statically wired", async () 
   assert.match(source, /caller venv python must be the 4b-bound runtime role/u);
   assert.match(source, /venv must disable system site packages/u);
   assert.match(source, /INSTALL_SCHEME_RUNTIME_ROLE_DRIFT/u);
+  assert.match(source, /dist_info_basename/u);
+  assert.match(source, /relative_to\(site\)/u);
 });
 
 test("public evidence validator rejects overclaims and leaks", async () => {

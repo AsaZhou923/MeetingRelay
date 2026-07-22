@@ -579,7 +579,10 @@ async function queryInstalledDistInfo(venvPython, lock, purelib, options = {}) {
     "for d in m.distributions(path=[str(site)]):",
     " key=re.sub(r'[-_.]+','-',d.metadata['Name']).lower()",
     " if key in names:",
-    "  found[key]={'name':d.metadata['Name'],'version':d.version,'path':str(pathlib.Path(d._path).resolve())}",
+    "  try: relative=pathlib.Path(d._path).resolve().relative_to(site)",
+    "  except ValueError: raise RuntimeError('locked dist-info escaped purelib')",
+    "  if len(relative.parts)!=1: raise RuntimeError('locked dist-info must be a direct purelib child')",
+    "  found[key]={'name':d.metadata['Name'],'version':d.version,'dist_info_basename':relative.parts[0]}",
     "out=[]",
     "for name in names:",
     " if name not in found: raise RuntimeError('locked distribution missing')",
@@ -609,7 +612,11 @@ async function verifyInstalledSchemeRecords(controlledRoot, lock, venvPythonPath
   for (const [index, info] of distInfos.entries()) {
     const expected = lock.distributions[index];
     if (normalizePackageName(info.name) !== normalizePackageName(expected.name) || info.version !== expected.version) fail("INSTALL_SCHEME_DIST_INFO_SET", "installed dist-info identity mismatch");
-    const distInfoPath = assertNoSymlinkComponents(controlledRoot, ensureAbsoluteInsideRoot(controlledRoot, info.path, "INSTALL_SCHEME_DIST_INFO_PATH", "dist-info"), "INSTALL_SCHEME_DIST_INFO_PATH", "dist-info");
+    assertPlainObject(info, "INSTALL_SCHEME_DIST_INFO_SET", "installed dist-info");
+    assertAllowedKeys(info, new Set(["name", "version", "dist_info_basename"]), "INSTALL_SCHEME_DIST_INFO_SET", "installed dist-info");
+    validateRelativePath(info.dist_info_basename, "INSTALL_SCHEME_DIST_INFO_PATH", "dist-info basename");
+    if (info.dist_info_basename.includes("/")) fail("INSTALL_SCHEME_DIST_INFO_PATH", "dist-info basename must be a single path segment");
+    const distInfoPath = assertNoSymlinkComponents(controlledRoot, ensureAbsoluteInsideRoot(controlledRoot, path.join(library, info.dist_info_basename), "INSTALL_SCHEME_DIST_INFO_PATH", "dist-info"), "INSTALL_SCHEME_DIST_INFO_PATH", "dist-info");
     if (path.dirname(distInfoPath).toLowerCase() !== library.toLowerCase()) fail("INSTALL_SCHEME_DIST_INFO_PATH", "dist-info must be a direct library child");
     const metadataPath = path.join(distInfoPath, "METADATA");
     const recordPath = path.join(distInfoPath, "RECORD");
@@ -918,7 +925,11 @@ async function collectInstalledMetadataForLock(root, lock) {
   const distInfos = await queryInstalledDistInfo(probePython, lock, runtime.paths.purelib, { controlledRoot: root, cwd: root, tempDir: root });
   for (const [index, info] of distInfos.entries()) {
     const distribution = lock.distributions[index];
-    const distInfoPath = info.path;
+    assertPlainObject(info, "INSTALL_SCHEME_DIST_INFO_SET", "installed dist-info");
+    assertAllowedKeys(info, new Set(["name", "version", "dist_info_basename"]), "INSTALL_SCHEME_DIST_INFO_SET", "installed dist-info");
+    validateRelativePath(info.dist_info_basename, "INSTALL_SCHEME_DIST_INFO_PATH", "dist-info basename");
+    if (info.dist_info_basename.includes("/")) fail("INSTALL_SCHEME_DIST_INFO_PATH", "dist-info basename must be a single path segment");
+    const distInfoPath = path.join(runtime.paths.purelib, info.dist_info_basename);
     distribution.declared_dist_info_metadata_sha256 = sha256(readFileSync(path.join(distInfoPath, "METADATA")));
     distribution.declared_dist_info_record_sha256 = sha256(readFileSync(path.join(distInfoPath, "RECORD")));
   }
