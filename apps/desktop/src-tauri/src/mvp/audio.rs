@@ -23,6 +23,8 @@ use std::sync::mpsc::{TrySendError, sync_channel};
 pub const DEFAULT_PACKET_QUEUE_CAPACITY: usize = 32;
 /// Default number of capture status messages that may wait for the consumer.
 pub const DEFAULT_STATUS_QUEUE_CAPACITY: usize = 16;
+/// Maximum serialized CPAL device identifier accepted across IPC.
+pub const MAX_DEVICE_ID_LENGTH: usize = 1024;
 
 /// Stable identifiers for the two MVP capture sources.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -54,6 +56,7 @@ pub enum AudioSampleFormat {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioDevicePreflight {
     pub source: AudioSourceId,
+    pub device_id: String,
     pub name: String,
     pub sample_rate: u32,
     pub channels: u16,
@@ -65,6 +68,30 @@ pub struct AudioDevicePreflight {
 pub struct AudioCapturePreflight {
     pub system_output: AudioDevicePreflight,
     pub microphone: AudioDevicePreflight,
+}
+
+/// One currently available device suitable for an MVP capture role.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioDeviceInventoryItem {
+    pub device_id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Selectable Windows render and capture devices.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioDeviceInventory {
+    pub system_outputs: Vec<AudioDeviceInventoryItem>,
+    pub microphones: Vec<AudioDeviceInventoryItem>,
+}
+
+/// Optional explicit endpoints for a capture session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AudioDeviceSelection {
+    pub system_output_device_id: Option<String>,
+    pub microphone_device_id: Option<String>,
 }
 
 /// Raw audio passed to the sibling processing service.
@@ -224,6 +251,20 @@ pub enum AudioCaptureError {
         operation: &'static str,
         message: String,
     },
+    InvalidDeviceId {
+        source: AudioSourceId,
+        reason: &'static str,
+    },
+    SelectedDeviceUnavailable {
+        source: AudioSourceId,
+    },
+    SelectedDeviceRoleMismatch {
+        source: AudioSourceId,
+    },
+    SelectedDeviceOpenFailed {
+        source: AudioSourceId,
+        message: String,
+    },
     UnsupportedSampleFormat {
         source: AudioSourceId,
         format: String,
@@ -261,6 +302,21 @@ impl fmt::Display for AudioCaptureError {
                 formatter,
                 "failed to query {operation} for default {source} device: {message}"
             ),
+            Self::InvalidDeviceId { source, reason } => {
+                write!(formatter, "invalid {source} device id: {reason}")
+            }
+            Self::SelectedDeviceUnavailable { source } => {
+                write!(formatter, "selected {source} device is unavailable")
+            }
+            Self::SelectedDeviceRoleMismatch { source } => {
+                write!(formatter, "selected device is not a {source} device")
+            }
+            Self::SelectedDeviceOpenFailed { source, message } => {
+                write!(
+                    formatter,
+                    "failed to open selected {source} device: {message}"
+                )
+            }
             Self::UnsupportedSampleFormat { source, format } => {
                 write!(formatter, "default {source} format {format} is unsupported")
             }
@@ -296,6 +352,18 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
+    /// Enumerate devices that can provide the role's default stream format.
+    pub fn device_inventory() -> Result<AudioDeviceInventory, AudioCaptureError> {
+        #[cfg(windows)]
+        {
+            platform::device_inventory()
+        }
+        #[cfg(not(windows))]
+        {
+            Err(AudioCaptureError::UnsupportedPlatform)
+        }
+    }
+
     /// Inspect the current Windows default render and capture endpoints.
     pub fn preflight_default_devices() -> Result<AudioCapturePreflight, AudioCaptureError> {
         #[cfg(windows)]
@@ -312,14 +380,22 @@ impl AudioCapture {
     pub fn start_default(
         options: AudioCaptureOptions,
     ) -> Result<(Self, AudioCaptureOutput), AudioCaptureError> {
+        Self::start(options, AudioDeviceSelection::default())
+    }
+
+    /// Start capture with explicit endpoints when supplied, otherwise legacy defaults.
+    pub fn start(
+        options: AudioCaptureOptions,
+        selection: AudioDeviceSelection,
+    ) -> Result<(Self, AudioCaptureOutput), AudioCaptureError> {
         let options = options.validate()?;
         #[cfg(windows)]
         {
-            platform::start_default(options)
+            platform::start(options, selection)
         }
         #[cfg(not(windows))]
         {
-            let _ = options;
+            let _ = (options, selection);
             Err(AudioCaptureError::UnsupportedPlatform)
         }
     }
@@ -365,6 +441,36 @@ impl AudioCapture {
         }
         self.stopped = true;
     }
+}
+
+fn resolve_explicit_or_default<T>(
+    requested: Option<&str>,
+    source: AudioSourceId,
+    resolve_explicit: impl FnOnce(&str) -> Result<T, AudioCaptureError>,
+    resolve_default: impl FnOnce() -> Result<T, AudioCaptureError>,
+) -> Result<T, AudioCaptureError> {
+    let Some(device_id) = requested else {
+        return resolve_default();
+    };
+    if device_id.is_empty() {
+        return Err(AudioCaptureError::InvalidDeviceId {
+            source,
+            reason: "empty",
+        });
+    }
+    if device_id.len() > MAX_DEVICE_ID_LENGTH {
+        return Err(AudioCaptureError::InvalidDeviceId {
+            source,
+            reason: "too long",
+        });
+    }
+    if device_id.chars().any(char::is_control) {
+        return Err(AudioCaptureError::InvalidDeviceId {
+            source,
+            reason: "contains control characters",
+        });
+    }
+    resolve_explicit(device_id)
 }
 
 impl Drop for AudioCapture {
@@ -486,7 +592,7 @@ mod platform {
         traits::{DeviceTrait, HostTrait, StreamTrait},
     };
 
-    struct DefaultEndpoints {
+    struct Endpoints {
         system_output: Device,
         system_output_config: SupportedStreamConfig,
         microphone: Device,
@@ -495,13 +601,62 @@ mod platform {
     }
 
     pub(super) fn preflight_default_devices() -> Result<AudioCapturePreflight, AudioCaptureError> {
-        Ok(query_default_endpoints()?.preflight)
+        Ok(query_endpoints(AudioDeviceSelection::default())?.preflight)
     }
 
-    pub(super) fn start_default(
+    pub(super) fn device_inventory() -> Result<AudioDeviceInventory, AudioCaptureError> {
+        let host = cpal::default_host();
+        let default_system_output_id = host
+            .default_output_device()
+            .and_then(|device| device.id().ok())
+            .map(|device_id| device_id.to_string());
+        let default_microphone_id = host
+            .default_input_device()
+            .and_then(|device| device.id().ok())
+            .map(|device_id| device_id.to_string());
+
+        let system_outputs = host
+            .output_devices()
+            .map_err(|error| AudioCaptureError::DeviceQueryFailed {
+                source: AudioSourceId::SystemOutput,
+                operation: "available devices",
+                message: error.to_string(),
+            })?
+            .filter_map(|device| {
+                inventory_item(
+                    device,
+                    AudioSourceId::SystemOutput,
+                    default_system_output_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let microphones = host
+            .input_devices()
+            .map_err(|error| AudioCaptureError::DeviceQueryFailed {
+                source: AudioSourceId::Microphone,
+                operation: "available devices",
+                message: error.to_string(),
+            })?
+            .filter_map(|device| {
+                inventory_item(
+                    device,
+                    AudioSourceId::Microphone,
+                    default_microphone_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AudioDeviceInventory {
+            system_outputs: sorted_inventory(system_outputs),
+            microphones: sorted_inventory(microphones),
+        })
+    }
+
+    pub(super) fn start(
         options: AudioCaptureOptions,
+        selection: AudioDeviceSelection,
     ) -> Result<(AudioCapture, AudioCaptureOutput), AudioCaptureError> {
-        let endpoints = query_default_endpoints()?;
+        let endpoints = query_endpoints(selection)?;
         let (packet_sender, packets) = sync_channel(options.packet_queue_capacity);
         let (status_sender, statuses) = sync_channel(options.status_queue_capacity);
         let metrics = AudioCaptureMetrics::default();
@@ -554,33 +709,18 @@ mod platform {
         Ok((capture, output))
     }
 
-    fn query_default_endpoints() -> Result<DefaultEndpoints, AudioCaptureError> {
+    fn query_endpoints(selection: AudioDeviceSelection) -> Result<Endpoints, AudioCaptureError> {
         let host = cpal::default_host();
-        let system_output =
-            host.default_output_device()
-                .ok_or(AudioCaptureError::DefaultDeviceUnavailable {
-                    source: AudioSourceId::SystemOutput,
-                })?;
-        let microphone =
-            host.default_input_device()
-                .ok_or(AudioCaptureError::DefaultDeviceUnavailable {
-                    source: AudioSourceId::Microphone,
-                })?;
-
-        let system_output_config = system_output.default_output_config().map_err(|error| {
-            AudioCaptureError::DeviceQueryFailed {
-                source: AudioSourceId::SystemOutput,
-                operation: "default output config",
-                message: error.to_string(),
-            }
-        })?;
-        let microphone_config = microphone.default_input_config().map_err(|error| {
-            AudioCaptureError::DeviceQueryFailed {
-                source: AudioSourceId::Microphone,
-                operation: "default input config",
-                message: error.to_string(),
-            }
-        })?;
+        let (system_output, system_output_config) = query_endpoint(
+            &host,
+            selection.system_output_device_id.as_deref(),
+            AudioSourceId::SystemOutput,
+        )?;
+        let (microphone, microphone_config) = query_endpoint(
+            &host,
+            selection.microphone_device_id.as_deref(),
+            AudioSourceId::Microphone,
+        )?;
 
         let system_output_preflight = describe_device(
             &system_output,
@@ -590,7 +730,7 @@ mod platform {
         let microphone_preflight =
             describe_device(&microphone, &microphone_config, AudioSourceId::Microphone)?;
 
-        Ok(DefaultEndpoints {
+        Ok(Endpoints {
             system_output,
             system_output_config,
             microphone,
@@ -600,6 +740,111 @@ mod platform {
                 microphone: microphone_preflight,
             },
         })
+    }
+
+    fn query_endpoint(
+        host: &cpal::Host,
+        requested: Option<&str>,
+        source: AudioSourceId,
+    ) -> Result<(Device, SupportedStreamConfig), AudioCaptureError> {
+        resolve_explicit_or_default(
+            requested,
+            source,
+            |device_id| query_selected_endpoint(host, device_id, source),
+            || query_default_endpoint(host, source),
+        )
+    }
+
+    fn query_default_endpoint(
+        host: &cpal::Host,
+        source: AudioSourceId,
+    ) -> Result<(Device, SupportedStreamConfig), AudioCaptureError> {
+        let device = match source {
+            AudioSourceId::SystemOutput => host.default_output_device(),
+            AudioSourceId::Microphone => host.default_input_device(),
+        }
+        .ok_or(AudioCaptureError::DefaultDeviceUnavailable { source })?;
+        let config = match source {
+            AudioSourceId::SystemOutput => device.default_output_config(),
+            AudioSourceId::Microphone => device.default_input_config(),
+        }
+        .map_err(|error| AudioCaptureError::DeviceQueryFailed {
+            source,
+            operation: "default stream config",
+            message: error.to_string(),
+        })?;
+        Ok((device, config))
+    }
+
+    fn query_selected_endpoint(
+        host: &cpal::Host,
+        serialized_id: &str,
+        source: AudioSourceId,
+    ) -> Result<(Device, SupportedStreamConfig), AudioCaptureError> {
+        let device_id = serialized_id.parse::<cpal::DeviceId>().map_err(|_| {
+            AudioCaptureError::InvalidDeviceId {
+                source,
+                reason: "malformed",
+            }
+        })?;
+        let device = host
+            .device_by_id(&device_id)
+            .ok_or(AudioCaptureError::SelectedDeviceUnavailable { source })?;
+        let role_matches = match source {
+            AudioSourceId::SystemOutput => device.supports_output(),
+            AudioSourceId::Microphone => device.supports_input(),
+        };
+        if !role_matches {
+            return Err(AudioCaptureError::SelectedDeviceRoleMismatch { source });
+        }
+        let config = match source {
+            AudioSourceId::SystemOutput => device.default_output_config(),
+            AudioSourceId::Microphone => device.default_input_config(),
+        }
+        .map_err(|error| AudioCaptureError::SelectedDeviceOpenFailed {
+            source,
+            message: error.to_string(),
+        })?;
+        Ok((device, config))
+    }
+
+    fn inventory_item(
+        device: Device,
+        source: AudioSourceId,
+        default_id: Option<&str>,
+    ) -> Option<AudioDeviceInventoryItem> {
+        let config = match source {
+            AudioSourceId::SystemOutput => device.default_output_config(),
+            AudioSourceId::Microphone => device.default_input_config(),
+        }
+        .ok()?;
+        supported_sample_format(source, config.sample_format()).ok()?;
+        let device_id = device.id().ok()?.to_string();
+        if device_id.is_empty()
+            || device_id.len() > MAX_DEVICE_ID_LENGTH
+            || device_id.chars().any(char::is_control)
+        {
+            return None;
+        }
+        let name = device.description().ok()?.name().trim().to_owned();
+        if name.is_empty() {
+            return None;
+        }
+        Some(AudioDeviceInventoryItem {
+            is_default: default_id == Some(device_id.as_str()),
+            device_id,
+            name,
+        })
+    }
+
+    fn sorted_inventory(mut items: Vec<AudioDeviceInventoryItem>) -> Vec<AudioDeviceInventoryItem> {
+        items.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
+        items
     }
 
     fn describe_device(
@@ -618,6 +863,14 @@ mod platform {
             .to_owned();
         Ok(AudioDevicePreflight {
             source,
+            device_id: device
+                .id()
+                .map_err(|error| AudioCaptureError::DeviceQueryFailed {
+                    source,
+                    operation: "id",
+                    message: error.to_string(),
+                })?
+                .to_string(),
             name,
             sample_rate: config.sample_rate(),
             channels: config.channels(),
@@ -873,6 +1126,74 @@ mod tests {
             }
             .validate(),
             Err(AudioCaptureError::InvalidQueueCapacity { queue: "status" })
+        );
+    }
+
+    #[test]
+    fn missing_device_selection_uses_the_legacy_default() {
+        let selected = resolve_explicit_or_default(
+            None,
+            AudioSourceId::SystemOutput,
+            |_| -> Result<u8, AudioCaptureError> {
+                panic!("an absent selection must not resolve an explicit device")
+            },
+            || Ok(7),
+        )
+        .expect("the default resolver should be used");
+
+        assert_eq!(selected, 7);
+    }
+
+    #[test]
+    fn invalid_explicit_device_ids_are_rejected_before_resolution() {
+        for (device_id, reason) in [
+            (String::new(), "empty"),
+            ("wasapi:\ninvalid".to_owned(), "contains control characters"),
+            ("x".repeat(MAX_DEVICE_ID_LENGTH + 1), "too long"),
+        ] {
+            let error = resolve_explicit_or_default(
+                Some(&device_id),
+                AudioSourceId::Microphone,
+                |_| -> Result<u8, AudioCaptureError> {
+                    panic!("invalid identifiers must not reach device resolution")
+                },
+                || -> Result<u8, AudioCaptureError> {
+                    panic!("an explicit selection must never fall back to the default")
+                },
+            )
+            .expect_err("invalid identifiers must fail");
+
+            assert_eq!(
+                error,
+                AudioCaptureError::InvalidDeviceId {
+                    source: AudioSourceId::Microphone,
+                    reason,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_device_resolution_errors_never_fall_back() {
+        let error = resolve_explicit_or_default(
+            Some("wasapi:missing"),
+            AudioSourceId::SystemOutput,
+            |_| {
+                Err(AudioCaptureError::SelectedDeviceUnavailable {
+                    source: AudioSourceId::SystemOutput,
+                })
+            },
+            || -> Result<u8, AudioCaptureError> {
+                panic!("an unavailable saved selection must be reselected")
+            },
+        )
+        .expect_err("the explicit resolution error must be preserved");
+
+        assert_eq!(
+            error,
+            AudioCaptureError::SelectedDeviceUnavailable {
+                source: AudioSourceId::SystemOutput,
+            }
         );
     }
 }

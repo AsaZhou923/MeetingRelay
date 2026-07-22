@@ -1,10 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import {
+  AUDIO_DEVICE_PREFERENCE_KEY,
   formatElapsed,
   hasAllMvpExportFormats,
+  parseAudioDeviceInventory,
+  parseAudioDevicePreference,
   parseMvpExportResult,
   parseMvpSnapshot,
+  resolveAudioDeviceSelection,
+  type AudioDeviceInventory,
   type AudioSourceSnapshot,
   type ExportArtifact,
   type MvpExportResult,
@@ -32,6 +37,21 @@ app.innerHTML = `
       <aside class="control-rail" aria-label="Session controls">
         <div class="rail-index">01 / INPUT</div>
         <h2>声音源</h2>
+        <div class="device-pickers" aria-label="音频设备选择">
+          <label class="device-picker">
+            <span>系统输出</span>
+            <select id="system-device" disabled>
+              <option value="">正在读取设备…</option>
+            </select>
+          </label>
+          <label class="device-picker">
+            <span>麦克风</span>
+            <select id="microphone-device" disabled>
+              <option value="">正在读取设备…</option>
+            </select>
+          </label>
+          <p id="device-status" class="device-status" aria-live="polite">正在读取 Windows 音频设备…</p>
+        </div>
         <div id="source-system" class="source-card" data-status="booting">
           <div class="source-heading">
             <span class="source-glyph">SYS</span>
@@ -43,7 +63,7 @@ app.innerHTML = `
         <div id="source-microphone" class="source-card" data-status="booting">
           <div class="source-heading">
             <span class="source-glyph">MIC</span>
-            <div><strong>默认麦克风</strong><small id="microphone-label">正在检测默认输入</small></div>
+            <div><strong>麦克风</strong><small id="microphone-label">正在检测默认输入</small></div>
           </div>
           <div class="level-track"><i id="microphone-level"></i></div>
           <div class="source-meta"><span id="microphone-status">检测中</span><span id="microphone-frames">0 frames</span></div>
@@ -128,6 +148,9 @@ function element<T extends Element>(selector: string): T {
 }
 
 const controls = {
+  systemDevice: element<HTMLSelectElement>("#system-device"),
+  microphoneDevice: element<HTMLSelectElement>("#microphone-device"),
+  deviceStatus: element<HTMLParagraphElement>("#device-status"),
   consent: element<HTMLInputElement>("#consent"),
   start: element<HTMLButtonElement>("#start"),
   stop: element<HTMLButtonElement>("#stop"),
@@ -156,6 +179,8 @@ const controls = {
 let latest: MvpSnapshot | null = null;
 let lastExport: MvpExportResult | null = null;
 let pollTimer: number | null = null;
+let audioDevices: AudioDeviceInventory | null = null;
+let audioDeviceLoadError: string | null = null;
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 
 function message(error: unknown): string {
@@ -166,6 +191,123 @@ function message(error: unknown): string {
 
 function isActive(snapshot: MvpSnapshot): boolean {
   return ["starting", "recording", "stopping"].includes(snapshot.lifecycle);
+}
+
+function currentAudioDeviceSelection(): {
+  systemOutputDeviceId: string;
+  microphoneDeviceId: string;
+} | null {
+  if (
+    audioDevices === null ||
+    !audioDevices.systemOutputs.some(
+      (device) => device.deviceId === controls.systemDevice.value,
+    ) ||
+    !audioDevices.microphones.some(
+      (device) => device.deviceId === controls.microphoneDevice.value,
+    )
+  ) {
+    return null;
+  }
+  return {
+    systemOutputDeviceId: controls.systemDevice.value,
+    microphoneDeviceId: controls.microphoneDevice.value,
+  };
+}
+
+function populateDeviceSelect(
+  select: HTMLSelectElement,
+  devices: AudioDeviceInventory["systemOutputs"],
+  selectedDeviceId: string | null,
+  stale: boolean,
+): void {
+  const options = devices.map((device) => {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = `${device.name}${device.isDefault ? "（系统默认）" : ""}`;
+    return option;
+  });
+  if (stale && selectedDeviceId !== null) {
+    const unavailable = document.createElement("option");
+    unavailable.value = selectedDeviceId;
+    unavailable.textContent = "上次选择的设备已不可用（请重新选择）";
+    unavailable.disabled = true;
+    options.unshift(unavailable);
+  } else if (selectedDeviceId === null) {
+    const unavailable = document.createElement("option");
+    unavailable.value = "";
+    unavailable.textContent = "未找到可用设备";
+    unavailable.disabled = true;
+    options.unshift(unavailable);
+  }
+  select.replaceChildren(...options);
+  select.value = selectedDeviceId ?? "";
+}
+
+function readAudioDevicePreference() {
+  try {
+    const serialized = window.localStorage.getItem(AUDIO_DEVICE_PREFERENCE_KEY);
+    const preference = parseAudioDevicePreference(serialized);
+    if (serialized !== null && preference === null) {
+      window.localStorage.removeItem(AUDIO_DEVICE_PREFERENCE_KEY);
+    }
+    return preference;
+  } catch {
+    return null;
+  }
+}
+
+function persistAudioDeviceSelection(): void {
+  const selection = currentAudioDeviceSelection();
+  if (selection === null) return;
+  try {
+    window.localStorage.setItem(
+      AUDIO_DEVICE_PREFERENCE_KEY,
+      JSON.stringify({ version: 1, ...selection }),
+    );
+  } catch {
+    // Selection remains valid for this run even if browser storage is unavailable.
+  }
+}
+
+function renderAudioDeviceControls(active: boolean): void {
+  const selection = currentAudioDeviceSelection();
+  controls.systemDevice.disabled = active || audioDevices === null || audioDevices.systemOutputs.length === 0;
+  controls.microphoneDevice.disabled = active || audioDevices === null || audioDevices.microphones.length === 0;
+  if (audioDeviceLoadError !== null) {
+    controls.deviceStatus.dataset.status = "error";
+    controls.deviceStatus.textContent = `读取设备失败：${audioDeviceLoadError}`;
+  } else if (audioDevices === null) {
+    controls.deviceStatus.dataset.status = "loading";
+    controls.deviceStatus.textContent = "正在读取 Windows 音频设备…";
+  } else if (selection === null) {
+    controls.deviceStatus.dataset.status = "error";
+    controls.deviceStatus.textContent = "请选择当前可用的系统输出和麦克风。";
+  } else {
+    controls.deviceStatus.dataset.status = "ready";
+    controls.deviceStatus.textContent = active
+      ? "会议进行中，音频设备已锁定。"
+      : "设备已就绪；选择会保存在本机。";
+  }
+}
+
+async function loadAudioDevices(): Promise<void> {
+  const inventory = parseAudioDeviceInventory(await invoke<unknown>("mvp_audio_devices"));
+  const selection = resolveAudioDeviceSelection(inventory, readAudioDevicePreference());
+  audioDevices = inventory;
+  audioDeviceLoadError = null;
+  populateDeviceSelect(
+    controls.systemDevice,
+    inventory.systemOutputs,
+    selection.systemOutputDeviceId,
+    selection.staleSystemOutput,
+  );
+  populateDeviceSelect(
+    controls.microphoneDevice,
+    inventory.microphones,
+    selection.microphoneDeviceId,
+    selection.staleMicrophone,
+  );
+  renderAudioDeviceControls(latest !== null && isActive(latest));
 }
 
 function canExport(snapshot: MvpSnapshot): boolean {
@@ -236,9 +378,11 @@ function render(snapshot: MvpSnapshot): void {
     ? snapshot.modelLabel
     : `不可用 · ${snapshot.modelLabel}`;
   controls.model.dataset.ready = String(snapshot.modelReady);
-  controls.start.disabled = !ready || !controls.consent.checked;
+  controls.start.disabled =
+    !ready || !controls.consent.checked || currentAudioDeviceSelection() === null;
   controls.stop.disabled = !active;
   controls.consent.disabled = active;
+  renderAudioDeviceControls(active);
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
   controls.error.textContent =
     snapshot.error ?? snapshot.system.error ?? snapshot.microphone.error ?? "";
@@ -332,12 +476,31 @@ controls.consent.addEventListener("change", () => {
   if (latest) render(latest);
 });
 
+for (const select of [controls.systemDevice, controls.microphoneDevice]) {
+  select.addEventListener("change", () => {
+    persistAudioDeviceSelection();
+    if (latest) {
+      render(latest);
+    } else {
+      renderAudioDeviceControls(false);
+    }
+  });
+}
+
 controls.start.addEventListener("click", async () => {
   controls.start.disabled = true;
   controls.error.textContent = "";
   lastExport = null;
   try {
-    render(await call("mvp_start", { consentAccepted: controls.consent.checked }));
+    const selection = currentAudioDeviceSelection();
+    if (selection === null) throw new Error("请选择当前可用的系统输出和麦克风");
+    persistAudioDeviceSelection();
+    render(
+      await call("mvp_start", {
+        consentAccepted: controls.consent.checked,
+        ...selection,
+      }),
+    );
     schedulePoll();
   } catch (error) {
     if (latest) render(latest);
@@ -378,6 +541,12 @@ controls.exportAll.addEventListener("click", async () => {
 });
 
 void (async () => {
+  try {
+    await loadAudioDevices();
+  } catch (error) {
+    audioDeviceLoadError = message(error);
+    renderAudioDeviceControls(false);
+  }
   try {
     render(await call("mvp_preflight"));
   } catch (error) {

@@ -10,6 +10,7 @@ export const MVP_LIFECYCLES = [
 ] as const;
 
 export const MVP_EXPORT_FORMATS = ["json", "markdown", "txt"] as const;
+export const AUDIO_DEVICE_PREFERENCE_KEY = "meetingrelay.audio-devices.v1";
 
 export type MvpLifecycle = (typeof MVP_LIFECYCLES)[number];
 export type MvpExportFormat = (typeof MVP_EXPORT_FORMATS)[number];
@@ -22,6 +23,30 @@ export type DurabilityStatus =
   | "completed"
   | "interrupted"
   | "error";
+
+export type AudioDeviceOption = {
+  deviceId: string;
+  name: string;
+  isDefault: boolean;
+};
+
+export type AudioDeviceInventory = {
+  systemOutputs: AudioDeviceOption[];
+  microphones: AudioDeviceOption[];
+};
+
+export type AudioDevicePreference = {
+  version: 1;
+  systemOutputDeviceId: string;
+  microphoneDeviceId: string;
+};
+
+export type ResolvedAudioDeviceSelection = {
+  systemOutputDeviceId: string | null;
+  microphoneDeviceId: string | null;
+  staleSystemOutput: boolean;
+  staleMicrophone: boolean;
+};
 
 export type AudioSourceSnapshot = {
   id: AudioSourceId;
@@ -104,6 +129,9 @@ const DURABILITY_STATUSES = [
   "interrupted",
   "error",
 ] as const;
+const MAX_AUDIO_DEVICES_PER_ROLE = 256;
+const MAX_AUDIO_DEVICE_ID_LENGTH = 1024;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -124,6 +152,106 @@ function boundedString(value: unknown, label: string, maximum: number): string {
     throw new Error(`${label} must be a bounded string.`);
   }
   return value;
+}
+
+function audioDeviceId(value: unknown, label: string): string {
+  const text = boundedString(value, label, MAX_AUDIO_DEVICE_ID_LENGTH);
+  if (text.length === 0 || CONTROL_CHARACTER.test(text)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return text;
+}
+
+function audioDeviceList(value: unknown, label: string): AudioDeviceOption[] {
+  if (!Array.isArray(value) || value.length > MAX_AUDIO_DEVICES_PER_ROLE) {
+    throw new Error(`${label} must be a bounded array.`);
+  }
+  const seen = new Set<string>();
+  let defaultCount = 0;
+  const devices = value.map((entry, index) => {
+    const device = object(entry, `${label}[${index}]`);
+    const deviceId = audioDeviceId(device.deviceId, `${label}[${index}].deviceId`);
+    if (seen.has(deviceId)) {
+      throw new Error(`${label} contains a duplicate device id.`);
+    }
+    seen.add(deviceId);
+    const name = boundedString(device.name, `${label}[${index}].name`, 256).trim();
+    if (name.length === 0) {
+      throw new Error(`${label}[${index}].name is empty.`);
+    }
+    const isDefault = boolean(device.isDefault, `${label}[${index}].isDefault`);
+    if (isDefault) defaultCount += 1;
+    return { deviceId, name, isDefault };
+  });
+  if (defaultCount > 1) {
+    throw new Error(`${label} contains multiple defaults.`);
+  }
+  return devices;
+}
+
+export function parseAudioDeviceInventory(value: unknown): AudioDeviceInventory {
+  const inventory = object(value, "audio device inventory");
+  return {
+    systemOutputs: audioDeviceList(inventory.systemOutputs, "systemOutputs"),
+    microphones: audioDeviceList(inventory.microphones, "microphones"),
+  };
+}
+
+export function parseAudioDevicePreference(serialized: string | null): AudioDevicePreference | null {
+  if (serialized === null) return null;
+  try {
+    const preference = object(JSON.parse(serialized), "audio device preference");
+    if (preference.version !== 1) return null;
+    return {
+      version: 1,
+      systemOutputDeviceId: audioDeviceId(
+        preference.systemOutputDeviceId,
+        "preference.systemOutputDeviceId",
+      ),
+      microphoneDeviceId: audioDeviceId(
+        preference.microphoneDeviceId,
+        "preference.microphoneDeviceId",
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolvePreferredDevice(
+  devices: readonly AudioDeviceOption[],
+  savedDeviceId: string | undefined,
+): { deviceId: string | null; stale: boolean } {
+  if (savedDeviceId !== undefined) {
+    return {
+      deviceId: savedDeviceId,
+      stale: !devices.some((device) => device.deviceId === savedDeviceId),
+    };
+  }
+  return {
+    deviceId: devices.find((device) => device.isDefault)?.deviceId ?? devices[0]?.deviceId ?? null,
+    stale: false,
+  };
+}
+
+export function resolveAudioDeviceSelection(
+  inventory: AudioDeviceInventory,
+  preference: AudioDevicePreference | null,
+): ResolvedAudioDeviceSelection {
+  const systemOutput = resolvePreferredDevice(
+    inventory.systemOutputs,
+    preference?.systemOutputDeviceId,
+  );
+  const microphone = resolvePreferredDevice(
+    inventory.microphones,
+    preference?.microphoneDeviceId,
+  );
+  return {
+    systemOutputDeviceId: systemOutput.deviceId,
+    microphoneDeviceId: microphone.deviceId,
+    staleSystemOutput: systemOutput.stale,
+    staleMicrophone: microphone.stale,
+  };
 }
 
 function nullableString(value: unknown, label: string, maximum: number): string | null {

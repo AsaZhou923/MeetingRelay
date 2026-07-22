@@ -81,6 +81,7 @@ fn with_bootstrap_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> taur
         .invoke_handler(tauri::generate_handler![
             bootstrap_probe,
             mvp::mvp_preflight,
+            mvp::mvp_audio_devices,
             mvp::mvp_start,
             mvp::mvp_stop,
             mvp::mvp_snapshot,
@@ -217,6 +218,38 @@ mod tests {
             },
         )
         .expect_err("missing consent must be rejected");
+
+        assert!(error.to_string().contains("CONSENT_REQUIRED"));
+    }
+
+    #[test]
+    fn mvp_start_ipc_accepts_explicit_device_arguments_without_opening_them_first() {
+        let app = with_bootstrap_handler(tauri::test::mock_builder())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock Tauri app");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("failed to build mock webview window");
+
+        let error = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "mvp_start".to_owned(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost"
+                    .parse()
+                    .expect("mock invoke URL must be valid"),
+                body: tauri::ipc::InvokeBody::Json(
+                    r#"{"consentAccepted":false,"systemOutputDeviceId":"wasapi:system","microphoneDeviceId":"wasapi:microphone"}"#
+                        .parse()
+                        .expect("MVP start body must be valid JSON"),
+                ),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+            },
+        )
+        .expect_err("missing consent must be rejected before device access");
 
         assert!(error.to_string().contains("CONSENT_REQUIRED"));
     }

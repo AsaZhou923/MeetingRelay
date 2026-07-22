@@ -10,6 +10,7 @@ pub mod storage;
 pub(crate) use service::MVP_SHUTDOWN_TIMEOUT;
 pub use service::MvpService;
 
+use audio::{AudioDeviceInventory, AudioDeviceSelection};
 use contract::MvpSnapshot;
 use export::ExportResult;
 
@@ -19,11 +20,26 @@ pub fn mvp_preflight(service: tauri::State<'_, MvpService>) -> Result<MvpSnapsho
 }
 
 #[tauri::command(async)]
+pub fn mvp_audio_devices(
+    service: tauri::State<'_, MvpService>,
+) -> Result<AudioDeviceInventory, String> {
+    service.audio_devices()
+}
+
+#[tauri::command(async)]
 pub fn mvp_start(
     service: tauri::State<'_, MvpService>,
     consent_accepted: bool,
+    system_output_device_id: Option<String>,
+    microphone_device_id: Option<String>,
 ) -> Result<MvpSnapshot, String> {
-    service.start(consent_accepted)
+    service.start_with_devices(
+        consent_accepted,
+        AudioDeviceSelection {
+            system_output_device_id,
+            microphone_device_id,
+        },
+    )
 }
 
 #[tauri::command(async)]

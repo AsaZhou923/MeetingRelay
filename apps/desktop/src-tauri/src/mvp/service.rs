@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use super::{
+    audio::{AudioDeviceInventory, AudioDeviceSelection},
     contract::{AudioSourceSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus},
     export::{ExportResult, export_meeting},
     storage::{
@@ -117,17 +118,38 @@ impl MvpService {
         }
     }
 
+    pub fn audio_devices(&self) -> Result<AudioDeviceInventory, String> {
+        #[cfg(windows)]
+        {
+            AudioCapture::device_inventory().map_err(|error| public_audio_error(&error.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            Err("MVP_WINDOWS_ONLY".to_owned())
+        }
+    }
+
+    #[cfg(test)]
     pub fn start(&self, consent_accepted: bool) -> Result<MvpSnapshot, String> {
+        self.start_with_devices(consent_accepted, AudioDeviceSelection::default())
+    }
+
+    pub fn start_with_devices(
+        &self,
+        consent_accepted: bool,
+        selection: AudioDeviceSelection,
+    ) -> Result<MvpSnapshot, String> {
         if !consent_accepted {
             return Err("CONSENT_REQUIRED".to_owned());
         }
 
         #[cfg(windows)]
         {
-            self.start_windows()
+            self.start_windows(selection)
         }
         #[cfg(not(windows))]
         {
+            let _ = selection;
             Err("MVP_WINDOWS_ONLY".to_owned())
         }
     }
@@ -303,7 +325,7 @@ impl MvpService {
     }
 
     #[cfg(windows)]
-    fn start_windows(&self) -> Result<MvpSnapshot, String> {
+    fn start_windows(&self, selection: AudioDeviceSelection) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
             return Err("SESSION_ALREADY_RUNNING".to_owned());
@@ -341,7 +363,7 @@ impl MvpService {
             snapshot.microphone.frames = "0".to_owned();
         }
 
-        let (capture, output) = AudioCapture::start_default(AudioCaptureOptions::default())
+        let (capture, output) = AudioCapture::start(AudioCaptureOptions::default(), selection)
             .map_err(|error| {
                 let _ = writer.interrupt_meeting(&meeting.id);
                 let code = public_audio_error(&error.to_string());

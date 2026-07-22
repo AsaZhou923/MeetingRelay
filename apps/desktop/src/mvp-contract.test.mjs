@@ -5,8 +5,11 @@ import {
   MVP_CONTRACT_VERSION,
   formatElapsed,
   hasAllMvpExportFormats,
+  parseAudioDeviceInventory,
+  parseAudioDevicePreference,
   parseMvpExportResult,
   parseMvpSnapshot,
+  resolveAudioDeviceSelection,
 } from "./mvp-contract.ts";
 
 const source = (id) => ({
@@ -175,4 +178,88 @@ test("requires the full JSON Markdown TXT export capability set for UI export", 
   assert.equal(hasAllMvpExportFormats(["txt", "json", "markdown"]), true);
   assert.equal(hasAllMvpExportFormats(["json", "markdown"]), false);
   assert.equal(hasAllMvpExportFormats(["json", "json", "txt"]), false);
+});
+
+test("parses selectable devices without collapsing duplicate display names", () => {
+  const inventory = parseAudioDeviceInventory({
+    systemOutputs: [
+      { deviceId: "wasapi:speaker-a", name: "Speakers", isDefault: true },
+      { deviceId: "wasapi:speaker-b", name: "Speakers", isDefault: false },
+    ],
+    microphones: [
+      { deviceId: "wasapi:microphone-a", name: "USB Microphone", isDefault: true },
+    ],
+  });
+
+  assert.equal(inventory.systemOutputs.length, 2);
+  assert.equal(inventory.systemOutputs[0].name, inventory.systemOutputs[1].name);
+  assert.notEqual(inventory.systemOutputs[0].deviceId, inventory.systemOutputs[1].deviceId);
+});
+
+test("uses current defaults only when there is no saved device preference", () => {
+  const inventory = parseAudioDeviceInventory({
+    systemOutputs: [
+      { deviceId: "wasapi:speaker-a", name: "Speakers A", isDefault: false },
+      { deviceId: "wasapi:speaker-b", name: "Speakers B", isDefault: true },
+    ],
+    microphones: [
+      { deviceId: "wasapi:microphone-a", name: "Microphone", isDefault: true },
+    ],
+  });
+
+  assert.deepEqual(resolveAudioDeviceSelection(inventory, null), {
+    systemOutputDeviceId: "wasapi:speaker-b",
+    microphoneDeviceId: "wasapi:microphone-a",
+    staleSystemOutput: false,
+    staleMicrophone: false,
+  });
+});
+
+test("keeps a stale saved selection visible so the user must reselect", () => {
+  const inventory = parseAudioDeviceInventory({
+    systemOutputs: [
+      { deviceId: "wasapi:speaker-current", name: "Current Speakers", isDefault: true },
+    ],
+    microphones: [
+      { deviceId: "wasapi:microphone-current", name: "Current Mic", isDefault: true },
+    ],
+  });
+  const preference = parseAudioDevicePreference(
+    JSON.stringify({
+      version: 1,
+      systemOutputDeviceId: "wasapi:speaker-missing",
+      microphoneDeviceId: "wasapi:microphone-current",
+    }),
+  );
+
+  assert.deepEqual(resolveAudioDeviceSelection(inventory, preference), {
+    systemOutputDeviceId: "wasapi:speaker-missing",
+    microphoneDeviceId: "wasapi:microphone-current",
+    staleSystemOutput: true,
+    staleMicrophone: false,
+  });
+});
+
+test("discards malformed local device preferences", () => {
+  assert.equal(parseAudioDevicePreference("not json"), null);
+  assert.equal(
+    parseAudioDevicePreference(
+      JSON.stringify({
+        version: 1,
+        systemOutputDeviceId: "wasapi:speaker\ninvalid",
+        microphoneDeviceId: "wasapi:microphone",
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseAudioDevicePreference(
+      JSON.stringify({
+        version: 2,
+        systemOutputDeviceId: "wasapi:speaker",
+        microphoneDeviceId: "wasapi:microphone",
+      }),
+    ),
+    null,
+  );
 });
