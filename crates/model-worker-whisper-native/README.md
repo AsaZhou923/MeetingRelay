@@ -34,3 +34,26 @@ Authority ceiling:
 This child does not load a model, accept audio, transcribe, implement the
 model-worker contract, measure quality, package model assets, or select a
 fallback. Those remain pending in the parent `WP-0.4.5` and later children.
+
+## WP-0.4.5b identity preflight
+
+The repository also contains a separate Node stdlib-only fallback-candidate
+identity preflight at `tools/whisper-native`. That slice hashes only
+caller-provided bytes for `adapter-source`, `license`, `model`,
+`model-manifest`, `package-lock`, `parameters`, and `runtime`.
+
+Run it with:
+
+```powershell
+pnpm phase0:whisper-candidate-preflight:test
+pnpm phase0:whisper-candidate-preflight:validate
+```
+
+Its authority ceiling is
+`measurement_status=whisper-fallback-identity-preflight-only`,
+`execution_status=not-executed-no-model-no-transcription`,
+`quality_gate_status=not-assessed`, `formal_claims=none`,
+`production_evidence=false`, `public_distribution=false`,
+`selection_authority=none`, and `fallback_authority=none`. It does not launch
+a runtime, load a model, accept audio, transcribe, measure quality, select or
+rank a fallback, mark a default, or approve distribution/legal use.

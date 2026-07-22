@@ -229,6 +229,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 10
 
+      - name: Test and validate WP-0.4.5b whisper fallback candidate preflight (identity bytes only)
+        run: |
+          pnpm phase0:whisper-candidate-preflight:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm phase0:whisper-candidate-preflight:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 5
+
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5

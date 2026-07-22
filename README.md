@@ -106,6 +106,8 @@ pnpm phase0:funasr-sidecar-python-launch:test
 pnpm phase0:funasr-sidecar-python-launch:validate
 pnpm phase0:funasr-sidecar-venv-materialization:test
 pnpm phase0:funasr-sidecar-venv-materialization:validate
+pnpm phase0:whisper-candidate-preflight:test
+pnpm phase0:whisper-candidate-preflight:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 cargo test --package meetingrelay-model-worker-whisper-native --no-default-features --locked
@@ -194,6 +196,27 @@ node tools/funasr-sidecar/sidecar-candidate-preflight.mjs --preflight <controlle
 ```
 
 This command does not launch Python, import FunASR, load a model, process audio, access the network, download files, select a package form, rank candidates, mark a default, or grant public distribution authority.
+
+### WP-0.4.5b whisper fallback candidate preflight
+
+WP-0.4.5b adds only a whisper fallback-candidate byte-identity preflight. It consumes a caller-supplied canonical JSON manifest and exactly one file for each role under one absolute local controlled root: `adapter-source`, `license`, `model`, `model-manifest`, `package-lock`, `parameters`, and `runtime`. The validator rejects unsafe or non-NFC relative paths, duplicate or unordered roles, duplicate logical IDs, case-insensitive duplicate paths, empty files, files over 8 GiB, total expected input over 16 GiB, digest or size drift, symlinks/junctions/special files where Node can observe them, noncanonical JSON, unknown fields, and authority overclaims. Candidate files are hashed by streaming from already-open handles with fixed-size chunks; the bounded manifest file is read only after regular-file and identity checks.
+
+The public evidence is intentionally path-free and text-free. It binds the schema-file SHA-256, validator-source SHA-256, canonical input-manifest SHA-256, per-role file SHA-256/size, and a deterministic candidate descriptor/aggregate digest. Its authority is fixed to `measurement_status=whisper-fallback-identity-preflight-only`, `execution_status=not-executed-no-model-no-transcription`, `quality_gate_status=not-assessed`, `formal_claims=none`, `production_evidence=false`, `public_distribution=false`, `selection_authority=none`, and `fallback_authority=none`. Runtime packaging, model semantics, license approval, fallback selection, ranking, defaults, quality/performance, model loading, audio, transcription, public distribution, and legal approval remain pending under parent `WP-0.4.5`.
+
+Run the offline synthetic checks from the repository root:
+
+```powershell
+pnpm phase0:whisper-candidate-preflight:test
+pnpm phase0:whisper-candidate-preflight:validate
+```
+
+To preflight real caller-provided bytes without executing them:
+
+```powershell
+node tools/whisper-native/whisper-fallback-candidate-preflight.mjs --preflight <controlled-root> <canonical-input-manifest.json>
+```
+
+This command does not launch a runtime, load a model, process audio, transcribe, access the network, download files, select a fallback, rank candidates, mark a default, or grant public distribution authority.
 
 ### FunASR sidecar Python-compatible launch probe
 
