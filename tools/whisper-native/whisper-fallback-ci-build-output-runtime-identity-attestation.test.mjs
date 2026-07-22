@@ -21,6 +21,7 @@ import {
   makeSyntheticPe,
   observeToolFileBytes,
   parsePe,
+  resolveIsolatedTargetRoot,
   runCargoBuild,
   scanForbiddenPublicEvidence,
   selectCargoExecutable,
@@ -261,10 +262,19 @@ test("configured Cargo, CMake, and Git paths are bound to both observation and e
   assert.equal(bound.toolResolver.git, git);
 });
 
+test("real isolated target root stays short while exact HEAD remains a repository evidence join", () => {
+  const root = path.resolve(process.cwd());
+  const targetRoot = resolveIsolatedTargetRoot(root);
+  assert.equal(path.relative(root, targetRoot).split(path.sep).join("/"), "target/w5d");
+  assert.ok(targetRoot.length - root.length <= 12);
+  assert.equal(targetRoot.includes(HEAD), false);
+});
+
 test("Cargo child reconstructs only the bound CMake path and reports bounded redacted failure context", async () => {
   const root = path.resolve(process.cwd());
   const targetRoot = path.join(root, "target", "synthetic-wp-0.4.5d");
   const cmake = path.join(root, "synthetic-tools", "cmake.exe");
+  const userProfile = path.resolve(root, "..", "synthetic-runner-profile");
   let observedOptions;
   await assert.rejects(
     () => runCargoBuild(root, targetRoot, {
@@ -273,26 +283,29 @@ test("Cargo child reconstructs only the bound CMake path and reports bounded red
       env: {
         CARGO_INCREMENTAL: "0",
         CARGO_NET_OFFLINE: "true",
-        HOME: path.join(root, "synthetic-home"),
+        HOME: userProfile,
         MEETINGRELAY_WHISPER_CMAKE_PATH: cmake,
         PATH: "synthetic-path",
+        USERPROFILE: userProfile,
       },
       runCargoForTest: async (_command, _args, processOptions) => {
         observedOptions = processOptions;
         return {
           code: 101,
           signal: null,
-          stdout: Buffer.from(`compiler-message under ${targetRoot}\n`, "utf8"),
-          stderr: Buffer.from(`\u001b[31merror\u001b[0m: failed under ${targetRoot} and ${root}\n`, "utf8"),
+          stdout: Buffer.from(`${JSON.stringify({ manifest_path: path.join(userProfile, ".cargo", "registry", "crate.rs"), target: targetRoot })}\n`, "utf8"),
+          stderr: Buffer.from(`\u001b[31merror\u001b[0m: failed under ${targetRoot.replaceAll("\\", "/")} and ${root.replaceAll("\\", "/")}\n`, "utf8"),
         };
       },
     }),
     (error) => {
       assert.match(error.message, /WHISPER_CI_ATTEST_CARGO_NONZERO/u);
       assert.match(error.message, /exit_code=101 signal=none stdout_sha256=[0-9a-f]{64} stderr_sha256=[0-9a-f]{64}/u);
-      assert.match(error.message, /stdout_tail:\ncompiler-message under <target>/u);
+      assert.match(error.message, /stdout_tail:\n\{"manifest_path":"<user-profile>\\\\\.cargo/u);
+      assert.match(error.message, /"target":"<target>"\}/u);
       assert.match(error.message, /stderr_tail:\nerror: failed under <target> and <repo>/u);
       assert.doesNotMatch(error.message, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
+      assert.doesNotMatch(error.message, /synthetic-runner-profile/u);
       return true;
     },
   );

@@ -360,8 +360,12 @@ async function trackedTreeDigest(repoRoot, options = {}) {
   return { digest_sha256: hash.digest("hex"), entry_count: count };
 }
 
-async function assertTargetRootReady(repoRoot, expectedHead, options = {}) {
-  const targetRoot = path.resolve(repoRoot, "target", "whisper-native", "wp-0.4.5d", expectedHead);
+export function resolveIsolatedTargetRoot(repoRoot) {
+  return path.resolve(repoRoot, "target", "w5d");
+}
+
+async function assertTargetRootReady(repoRoot, options = {}) {
+  const targetRoot = resolveIsolatedTargetRoot(repoRoot);
   if (!isInside(repoRoot, targetRoot)) fail("WHISPER_CI_ATTEST_TARGET", "target root escaped repo");
   if (await exists(targetRoot)) fail("WHISPER_CI_ATTEST_TARGET_EXISTS", "isolated target root already exists");
   const ignored = (await gitText(["check-ignore", "--quiet", "--", relativePosix(repoRoot, targetRoot)], repoRoot, options).then(
@@ -539,6 +543,20 @@ function redactDiagnosticLiteral(value, literal, replacement) {
   return value.replace(new RegExp(escaped, "giu"), replacement);
 }
 
+function redactDiagnosticPath(value, literal, replacement) {
+  if (typeof literal !== "string" || literal.length === 0) return value;
+  const variants = new Set([
+    literal,
+    literal.replaceAll("\\", "/"),
+    literal.replaceAll("\\", "\\\\"),
+  ]);
+  let redacted = value;
+  for (const variant of [...variants].sort((left, right) => right.length - left.length)) {
+    redacted = redactDiagnosticLiteral(redacted, variant, replacement);
+  }
+  return redacted;
+}
+
 export function formatCargoFailureDiagnostic(stderr, repoRoot, targetRoot, env = process.env) {
   const bytes = Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? "", "utf8");
   let value = bytes.subarray(Math.max(0, bytes.length - CARGO_FAILURE_DIAGNOSTIC_MAX_BYTES)).toString("utf8");
@@ -552,7 +570,7 @@ export function formatCargoFailureDiagnostic(stderr, repoRoot, targetRoot, env =
     [env.HOME, "<home>"],
     [env.RUNNER_TEMP, "<runner-temp>"],
   ]) {
-    value = redactDiagnosticLiteral(value, literal, replacement);
+    value = redactDiagnosticPath(value, literal, replacement);
   }
   value = value.trim();
   if (value.length === 0) return "<empty>";
@@ -705,7 +723,7 @@ export async function attestWhisperCiBuildOutputRuntimeIdentity(expectedHead, re
   validateAmbientEnvironment(options.env ?? process.env);
   const executionOptions = injected ? options : await bindExecutionToolPaths(root, options);
   const before = executionOptions.gitStateBeforeForTest ?? (await inspectGitState(root, expectedHead, executionOptions));
-  const targetRoot = executionOptions.targetRootForTest ?? (await assertTargetRootReady(root, expectedHead, executionOptions));
+  const targetRoot = executionOptions.targetRootForTest ?? (await assertTargetRootReady(root, executionOptions));
   await mkdir(targetRoot, { recursive: true });
   const sourceFiles = executionOptions.sourceFilesForTest ?? (await observeSourceFiles(root));
   const registryLock = executionOptions.registryLockForTest ?? (await observeCargoRegistryLock(root));
