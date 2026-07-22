@@ -245,6 +245,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         timeout-minutes: 5
 
+      - name: Test and validate WP-0.4.5d whisper fallback CI build-output runtime identity attestation harness (synthetic only)
+        run: |
+          pnpm phase0:whisper-ci-build-output-runtime-identity:test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm phase0:whisper-ci-build-output-runtime-identity:validate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        timeout-minutes: 5
+
       - name: Test WP-0.4 real-data materialization and shard-runner contracts (offline fixtures only)
         run: pnpm phase0:sherpa-realdata-shard:test
         timeout-minutes: 5
@@ -525,6 +533,28 @@ jobs:
             throw "whisper runtime version probe changed Cargo.lock"
           }
         timeout-minutes: 15
+
+      - name: Run WP-0.4.5d whisper fallback CI build-output runtime identity attestation
+        shell: pwsh
+        run: |
+          $repositoryRoot = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          if (-not [string]::IsNullOrWhiteSpace($env:CMAKE)) {
+            $env:MEETINGRELAY_WHISPER_CMAKE_PATH = $env:CMAKE
+            Remove-Item Env:CMAKE
+          }
+          $output = @(& pnpm phase0:whisper-ci-build-output-runtime-identity:run $env:GITHUB_SHA $repositoryRoot)
+          $output | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "whisper CI build-output runtime identity attestation failed" }
+          $marker = @($output | Where-Object {
+            [string]$_ -match '^whisper-fallback-ci-build-output-runtime-identity-attestation=verified evidence_sha256=[0-9a-f]{64} runtime_sha256=[0-9a-f]{64} candidate_aggregate_sha256=[0-9a-f]{64} five_c_runtime_sha256=[0-9a-f]{64} observation_scope=windows-ci-clean-exact-head-build-output measurement_status=whisper-ci-build-output-runtime-identity-attestation-only execution_status=ci-built-runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription build_output_identity_attestation=true source_build_provenance_authority=none registry_source_byte_closure=false toolchain_provenance_authority=observed-tool-bytes-only loaded_image_attestation=false network_isolation_authority=none quality_gate_status=not-assessed formal_claims=none production_evidence=false public_distribution=false selection_authority=none fallback_authority=none launch_binding_status=preflight-prespawn-postflight-path-identity-observed-spawn-reopen-window-not-eliminated$'
+          })
+          if ($marker.Count -ne 1) {
+            throw "whisper CI build-output runtime identity marker is missing or duplicated"
+          }
+          if (@(git status --porcelain=v1 -- Cargo.lock).Count -ne 0) {
+            throw "whisper CI build-output runtime identity attestation changed Cargo.lock"
+          }
+        timeout-minutes: 30
 
       - name: Lint Rust workspace including desktop MVP and sherpa wrapper
         run: cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings

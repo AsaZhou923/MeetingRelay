@@ -110,6 +110,8 @@ pnpm phase0:whisper-candidate-preflight:test
 pnpm phase0:whisper-candidate-preflight:validate
 pnpm phase0:whisper-runtime-version-probe:test
 pnpm phase0:whisper-runtime-version-probe:validate
+pnpm phase0:whisper-ci-build-output-runtime-identity:test
+pnpm phase0:whisper-ci-build-output-runtime-identity:validate
 cargo test --package meetingrelay-model-worker-contract --all-targets --locked
 cargo test --package meetingrelay-model-worker-sherpa-native --no-default-features --locked
 cargo test --package meetingrelay-model-worker-whisper-native --no-default-features --locked
@@ -246,6 +248,25 @@ node tools/whisper-native/whisper-fallback-runtime-version-probe.mjs --probe `
 ```
 
 This command grants no model, audio, transcription, network-isolation, download, fallback-selection, ranking, default, or public-distribution authority. It forwards no proxy environment, but it does not enforce operating-system network isolation. Because Node cannot bind `spawn` to the already hashed file handle, pre-spawn and postflight identity matches are observations rather than loaded-image attestation.
+
+### WP-0.4.5d whisper fallback CI build-output runtime identity attestation
+
+WP-0.4.5d narrows the real Windows CI claim to one build-output identity join: at the exact expected clean HEAD, one isolated Cargo release build emits exactly one `meetingrelay-whisper-runtime-version-probe.exe`; that executable's SHA-256 is copied into the WP-0.4.5b `runtime` role; then the existing WP-0.4.5c probe launches that manifest-bound runtime path and observes the fixed marker. The 5d evidence is valid only when the selected build executable SHA-256 equals the 5c runtime SHA-256.
+
+The synthetic test and validate commands exercise injected git/Cargo/tool observations and do not require libclang or a native build:
+
+```powershell
+pnpm phase0:whisper-ci-build-output-runtime-identity:test
+pnpm phase0:whisper-ci-build-output-runtime-identity:validate
+```
+
+The real CI command is Windows-only and intended for GitHub Actions after tool setup:
+
+```powershell
+pnpm phase0:whisper-ci-build-output-runtime-identity:run <expected-head> <absolute-repo-root>
+```
+
+Public evidence includes `observation_scope=synthetic-injected-harness` for the local unit harness and `observation_scope=windows-ci-clean-exact-head-build-output` for the real CI path, so synthetic evidence cannot masquerade as a real build-output observation. Its authority is fixed to `measurement_status=whisper-ci-build-output-runtime-identity-attestation-only`, `execution_status=ci-built-runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription`, `build_output_identity_attestation=true`, `source_build_provenance_authority=none`, `registry_source_byte_closure=false`, `toolchain_provenance_authority=observed-tool-bytes-only`, `loaded_image_attestation=false`, and `network_isolation_authority=none`. This is not source-build provenance, not reproducible-build proof, not registry source byte closure, and not model/license selection or approval. It creates no model load, audio, transcription, `ModelBackend`, quality/performance/resource, fallback/ranking/default, legal/distribution, parent WP-0.4.5, CT-WORKER-CANDIDATE-001, or Phase 1 authority.
 
 ### FunASR sidecar Python-compatible launch probe
 

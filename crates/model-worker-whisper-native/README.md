@@ -86,3 +86,40 @@ quality/performance, select/rank/default a fallback, or approve distribution.
 The Node supervisor performs preflight, immediate pre-spawn, and postflight
 path/file-identity checks, but its path-based `spawn` cannot eliminate the final
 reopen window or attest the loaded image.
+
+## WP-0.4.5d build-output runtime identity attestation
+
+The repository also contains a CI-only Node attestor for the crate's dedicated
+runtime probe binary:
+`tools/whisper-native/whisper-fallback-ci-build-output-runtime-identity-attestation.mjs`.
+Its real Windows CI mode performs one isolated Cargo release build at the exact
+expected clean HEAD, selects the single Cargo JSON compiler-artifact executable
+for `meetingrelay-whisper-runtime-version-probe`, hashes that build output,
+places the same bytes into the WP-0.4.5b `runtime` role, and reuses the
+WP-0.4.5c fixed-marker probe. The accepted join requires the 5c runtime SHA-256
+to equal the selected build executable SHA-256.
+
+The local unit harness is synthetic and does not require a native build:
+
+```powershell
+pnpm phase0:whisper-ci-build-output-runtime-identity:test
+pnpm phase0:whisper-ci-build-output-runtime-identity:validate
+```
+
+Synthetic evidence carries `observation_scope=synthetic-injected-harness`; the
+real Windows CI path carries
+`observation_scope=windows-ci-clean-exact-head-build-output`.
+
+This 5d surface is build-output runtime identity attestation only:
+`measurement_status=whisper-ci-build-output-runtime-identity-attestation-only`,
+`execution_status=ci-built-runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription`,
+`build_output_identity_attestation=true`,
+`source_build_provenance_authority=none`,
+`registry_source_byte_closure=false`,
+`toolchain_provenance_authority=observed-tool-bytes-only`,
+`loaded_image_attestation=false`, and
+`network_isolation_authority=none`. It is not source-build provenance or
+reproducible-build proof and grants no model/license selection or approval,
+model load, audio, transcription, `ModelBackend`, quality/performance/resource,
+fallback/ranking/default, legal/distribution, parent `WP-0.4.5`,
+`CT-WORKER-CANDIDATE-001`, or Phase 1 authority.

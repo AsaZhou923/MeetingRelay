@@ -98,3 +98,58 @@ for the stdout marker and linked version.
 It still does not select, download, load, validate, benchmark, rank, default, or
 distribute any Whisper model; it does not process audio or produce
 transcription.
+
+## WP-0.4.5d whisper fallback CI build-output runtime identity attestation
+
+This tool is the CI-only build-output identity join for the dedicated runtime
+version probe. In real mode it requires the exact expected HEAD and repository
+root, verifies a clean tracked/untracked-nonignored worktree around the run,
+uses an absent ignored target root under
+`target/whisper-native/wp-0.4.5d/<head>`, runs one isolated Cargo release build
+for `meetingrelay-whisper-runtime-version-probe`, selects exactly one Cargo JSON
+compiler-artifact executable, hashes that executable, copies those bytes into
+the WP-0.4.5b `runtime` role, and then invokes the existing WP-0.4.5c fixed
+marker probe against the manifest-bound path.
+
+The unit harness is synthetic and uses injected git/Cargo/tool observations, so
+it does not require libclang or a native Windows build. Its evidence uses
+`observation_scope=synthetic-injected-harness`:
+
+```powershell
+pnpm phase0:whisper-ci-build-output-runtime-identity:test
+pnpm phase0:whisper-ci-build-output-runtime-identity:validate
+```
+
+Run the real CI attestation only after Windows native tool setup:
+
+```powershell
+pnpm phase0:whisper-ci-build-output-runtime-identity:run <expected-head> <absolute-repo-root>
+```
+
+The real path uses
+`observation_scope=windows-ci-clean-exact-head-build-output`.
+
+Authority ceiling:
+
+- `measurement_status=whisper-ci-build-output-runtime-identity-attestation-only`
+- `execution_status=ci-built-runtime-path-launched-fixed-version-marker-observed-no-model-no-transcription`
+- `build_output_identity_attestation=true`
+- `source_build_provenance_authority=none`
+- `registry_source_byte_closure=false`
+- `toolchain_provenance_authority=observed-tool-bytes-only`
+- `loaded_image_attestation=false`
+- `network_isolation_authority=none`
+- `quality_gate_status=not-assessed`
+- `formal_claims=none`
+- `production_evidence=false`
+- `public_distribution=false`
+- `selection_authority=none`
+- `fallback_authority=none`
+
+This is a single Windows CI build-output observation, not reproducible-build
+proof, source-build provenance, registry source closure, loaded-image
+attestation, or network isolation. It does not select or approve a model or
+license, load a model, process audio, transcribe, implement `ModelBackend`,
+measure quality/performance/resources, select/rank/default fallback behavior,
+approve legal/distribution status, close parent `WP-0.4.5`, create
+`CT-WORKER-CANDIDATE-001`, or start Phase 1.
