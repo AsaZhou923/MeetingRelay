@@ -389,3 +389,12 @@ test("cleanup remains fail-visible and symlink components are rejected in source
   assert.match(source, /await rm\(fixture\.root, \{ recursive: true, force: true \}\)/u);
   assert.match(source, /must not traverse a symlink or junction/u);
 });
+
+test("dist-info discovery stays anchored to interpreter purelib without absolute-path alias coupling", async () => {
+  const source = await readFile(MODULE_PATH, "utf8");
+  assert.match(source, /m\.distributions\(path=\[str\(site\)\]\)/u);
+  assert.match(source, /pathlib\.Path\(d\._path\)\.resolve\(\)\.relative_to\(site\)/u);
+  assert.match(source, /dist_info_basename/u);
+  assert.match(source, /normalizeDistInfoBasename\(row\.dist_info_basename\)/u);
+  assert.doesNotMatch(source, /'dist_info': str\(pathlib\.Path\(d\._path\)\.resolve\(\)\)/u);
+});

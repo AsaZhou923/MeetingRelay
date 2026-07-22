@@ -305,6 +305,24 @@ function normalizeRecordPath(recordPath) {
   return recordPath;
 }
 
+function normalizeDistInfoBasename(value) {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.length > 255
+    || /[<>:"/\\|?*\u0000-\u001f]/u.test(value)
+    || value === "."
+    || value === ".."
+    || value.endsWith(" ")
+    || value.endsWith(".")
+    || path.win32.basename(value) !== value
+    || path.posix.basename(value) !== value
+    || !value.endsWith(".dist-info")
+    || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(value)
+  ) fail("VENV_DIST_INFO_PATH", "metadata path must be one safe dist-info basename");
+  return value;
+}
+
 function parseCsvRecordLine(line) {
   const cells = [];
   let current = "";
@@ -338,12 +356,22 @@ async function verifyInstalledDistInfo(venvRoot, lock, options = {}) {
   const sitePackages = path.join(venvRoot, "Lib", "site-packages");
   const controlledRoot = options.controlledRoot ?? venvRoot;
   const script = [
-    "import importlib.metadata as m, json, pathlib, sys",
+    "import importlib.metadata as m, json, pathlib, re, sys, sysconfig",
     "names=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))",
+    "site=pathlib.Path(sysconfig.get_path('purelib')).resolve()",
+    "wanted=set(names)",
+    "found={}",
     "out=[]",
+    "for d in m.distributions(path=[str(site)]):",
+    " key=re.sub(r'[-_.]+','-',d.metadata['Name']).lower()",
+    " if key not in wanted: continue",
+    " relative=pathlib.Path(d._path).resolve().relative_to(site)",
+    " if len(relative.parts) != 1: raise RuntimeError('distribution metadata must be a direct purelib child')",
+    " if key in found: raise RuntimeError('duplicate distribution metadata')",
+    " found[key]={'name': d.metadata['Name'], 'version': d.version, 'dist_info_basename': relative.parts[0]}",
     "for name in names:",
-    " d=m.distribution(name)",
-    " out.append({'name': d.metadata['Name'], 'version': d.version, 'dist_info': str(pathlib.Path(d._path).resolve())})",
+    " if name not in found: raise RuntimeError('locked distribution metadata missing from purelib')",
+    " out.append(found[name])",
     "print(json.dumps(out, sort_keys=True, separators=(',', ':')))",
   ].join("\n");
   const names = lock.distributions.map((item) => normalizePackageName(item.name));
@@ -372,14 +400,21 @@ async function verifyInstalledDistInfo(venvRoot, lock, options = {}) {
   } catch {
     fail("VENV_IMPORTLIB_METADATA", "metadata query did not return JSON");
   }
+  if (!Array.isArray(rows) || rows.length !== lock.distributions.length) fail("VENV_INSTALLED_SET", "metadata query installed set count mismatch");
   const byName = new Map(lock.distributions.map((item) => [normalizePackageName(item.name), item]));
+  const seen = new Set();
   const contracts = [];
   for (const row of rows) {
+    assertPlainObject(row, "VENV_INSTALLED_SET", "installed distribution metadata");
+    assertAllowedKeys(row, new Set(["name", "version", "dist_info_basename"]), "VENV_INSTALLED_SET", "installed distribution metadata");
+    if (typeof row.name !== "string" || typeof row.version !== "string") fail("VENV_INSTALLED_SET", "installed name and version must be strings");
     const normalized = normalizePackageName(row.name);
     const expected = byName.get(normalized);
     if (!expected || row.version !== expected.version) fail("VENV_INSTALLED_SET", "installed set/version mismatch");
-    const distInfo = ensureInside(sitePackages, row.dist_info, "VENV_DIST_INFO_PATH", "dist-info");
-    if (!distInfo.endsWith(".dist-info")) fail("VENV_DIST_INFO_PATH", "metadata path must be dist-info");
+    if (seen.has(normalized)) fail("VENV_INSTALLED_SET", "installed distribution metadata must be unique");
+    seen.add(normalized);
+    const distInfoBasename = normalizeDistInfoBasename(row.dist_info_basename);
+    const distInfo = ensureInside(sitePackages, path.join(sitePackages, distInfoBasename), "VENV_DIST_INFO_PATH", "dist-info");
     assertNoSymlinkComponents(controlledRoot, distInfo, "VENV_DIST_INFO_PATH", "dist-info");
     const metadataPath = path.join(distInfo, "METADATA");
     const recordPath = path.join(distInfo, "RECORD");
