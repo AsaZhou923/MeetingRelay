@@ -2,7 +2,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, copyFile, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -669,7 +669,7 @@ export async function attestWhisperCiBuildOutputRuntimeIdentity(expectedHead, re
   const tools = await observeTools(root, executionOptions);
   const build = await runCargoBuild(root, targetRoot, executionOptions);
   const selectedExecutable = executionOptions.selectedExecutableForTest ?? selectCargoExecutable(build, targetRoot);
-  const buildRuntime = await hashRegularFile(selectedExecutable, "WHISPER_CI_ATTEST_RUNTIME");
+  const buildRuntime = await hashRegularFile(selectedExecutable, "WHISPER_CI_ATTEST_RUNTIME", MAX_RUNTIME_BYTES, { requireSingleLink: false });
   const pe = executionOptions.peForTest ?? (await inspectPe(selectedExecutable));
   const controlled = executionOptions.controlledRootForTest ?? (await writeControlled5bRoot(targetRoot, selectedExecutable));
   const preflight = await preflightWhisperFallbackCandidate(controlled.controlledRoot, controlled.manifestPath);
@@ -773,7 +773,7 @@ export async function attestWhisperCiBuildOutputRuntimeIdentity(expectedHead, re
   await writeFile(persistedPath, evidenceText, "utf8");
   const reread = await readFile(persistedPath, "utf8");
   if (reread !== evidenceText) fail("WHISPER_CI_ATTEST_EVIDENCE_REREAD", "persisted canonical evidence reread mismatch");
-  const finalRuntime = await hashRegularFile(selectedExecutable, "WHISPER_CI_ATTEST_RUNTIME_FINAL");
+  const finalRuntime = await hashRegularFile(selectedExecutable, "WHISPER_CI_ATTEST_RUNTIME_FINAL", MAX_RUNTIME_BYTES, { requireSingleLink: false });
   const finalGit = executionOptions.gitStateFinalForTest ?? (await inspectGitState(root, expectedHead, executionOptions));
   if (finalRuntime.sha256 !== buildRuntime.sha256 || finalGit.head !== expectedHead || finalGit.tracked_tree.digest_sha256 !== before.tracked_tree.digest_sha256) {
     fail("WHISPER_CI_ATTEST_FINAL_DRIFT", "runtime bytes, HEAD, or tracked tree changed after evidence reread");
@@ -1045,9 +1045,11 @@ async function runSynthetic() {
       '[[package]]\nname = "whisper-rs"\nversion = "0.16.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "2088172d00f936c348d6a72f488dc2660ab3f507263a195df308a3c2383229f6"\n\n[[package]]\nname = "whisper-rs-sys"\nversion = "0.15.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "6986c0fe081241d391f09b9a071fbcbb59720c3563628c3c829057cf69f2a56f"\n',
       "utf8",
     );
-    await mkdir(path.join(targetRoot, "release"), { recursive: true });
+    await mkdir(path.join(targetRoot, "release", "deps"), { recursive: true });
     const exe = path.join(targetRoot, "release", RUNTIME_EXE_NAME);
-    await writeFile(exe, makeSyntheticPe(), { mode: 0o700 });
+    const depsExe = path.join(targetRoot, "release", "deps", `meetingrelay_whisper_runtime_version_probe-synthetic${process.platform === "win32" ? ".exe" : ""}`);
+    await writeFile(depsExe, makeSyntheticPe(), { mode: 0o700 });
+    await link(depsExe, exe);
     const gitState = {
       head,
       repo_root_identity_sha256: sha256Hex(Buffer.from("root-id", "utf8")),

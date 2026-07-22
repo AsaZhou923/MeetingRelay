@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { link, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -92,7 +92,7 @@ async function fixture(fn) {
     const targetRoot = path.join(repo, "target", "whisper-native", "wp-0.4.5d", HEAD);
     await mkdir(path.join(repo, ".cargo"), { recursive: true });
     await mkdir(path.join(repo, "crates", "model-worker-whisper-native"), { recursive: true });
-    await mkdir(path.join(targetRoot, "release"), { recursive: true });
+    await mkdir(path.join(targetRoot, "release", "deps"), { recursive: true });
     await writeFile(path.join(repo, "Cargo.toml"), "[workspace]\n", "utf8");
     await writeFile(path.join(repo, ".cargo", "config.toml"), "[env]\n", "utf8");
     await writeFile(path.join(repo, "rust-toolchain.toml"), "[toolchain]\nchannel = \"1.95.0\"\n", "utf8");
@@ -103,7 +103,10 @@ async function fixture(fn) {
       "utf8",
     );
     const exe = path.join(targetRoot, "release", EXE_NAME);
-    await writeFile(exe, makeSyntheticPe(), { mode: 0o700 });
+    const depsExe = path.join(targetRoot, "release", "deps", `meetingrelay_whisper_runtime_version_probe-synthetic${process.platform === "win32" ? ".exe" : ""}`);
+    await writeFile(depsExe, makeSyntheticPe(), { mode: 0o700 });
+    await link(depsExe, exe);
+    assert.equal((await stat(exe, { bigint: true })).nlink, 2n, "fixture must mirror Cargo's release/deps hardlink layout");
     const message = {
       executable: exe,
       profile: { opt_level: "3", test: false },

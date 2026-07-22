@@ -111,6 +111,12 @@ compiler-artifact executable, hashes that executable, copies those bytes into
 the WP-0.4.5b `runtime` role, and then invokes the existing WP-0.4.5c fixed
 marker probe against the manifest-bound path.
 
+Cargo's normal hardlink between the selected top-level Release executable and
+its `release/deps` artifact is accepted inside the isolated target. The copy
+placed into the 5b controlled root must still be a single-link regular file;
+the existing 5b/5c symlink, junction, hardlink, size, and hash checks remain in
+force for that launched runtime path.
+
 The unit harness is synthetic and uses injected git/Cargo/tool observations, so
 it does not require libclang or a native Windows build. Its evidence uses
 `observation_scope=synthetic-injected-harness`:
