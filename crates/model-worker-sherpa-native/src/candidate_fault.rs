@@ -429,11 +429,11 @@ mod tests {
         assert!(material.ends_with(&format!("\"wav_sha256\":\"{B}\"}}")));
         assert_eq!(
             locked_input_snapshot_sha256(A, B),
-            "d4b3d1990b420c042e735f620c675d68a343370521fc07e1c6fcd53ed4a644c9"
+            "8060abb0fd6fb7ad534f14ed8fa5f03250788d25fcf53988ee3971afd4885c2e"
         );
         assert_eq!(
             lower_hex(&Sha256::digest(material.as_bytes())),
-            "d4b3d1990b420c042e735f620c675d68a343370521fc07e1c6fcd53ed4a644c9"
+            "8060abb0fd6fb7ad534f14ed8fa5f03250788d25fcf53988ee3971afd4885c2e"
         );
     }
 

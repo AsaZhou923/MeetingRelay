@@ -22,7 +22,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "../..");
 const MATERIALIZER_PATH = path.join(HERE, "materialize.ps1");
 const EXPECTED_BUILDER_INPUT_SHA256 =
-  "2d648737cebb9a2317daf478b496055ff73f3b6c41007362aaf537bd18ae7e5b";
+  "1ad523582bdb9f58e860cc084bb3d4456fb20039c4d639bfda3b17f869b5ec71";
 
 function sha256Bytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");

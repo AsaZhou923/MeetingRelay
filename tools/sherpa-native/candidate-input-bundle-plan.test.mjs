@@ -380,7 +380,7 @@ test("legacy schema 1.0 remains the exact 28/26 fixture plan without a collector
   assert.equal(plan.schema_version, "1.0");
   assert.equal(
     plan.proposedContractSha256,
-    "da8836617dcb51fa4ecb17c4909f387a23c461b102c32cf18b11e5e290292fca",
+    "1fdc36ac734504ed89b6911c38774b22e660eec4c64fdbbb5221fa1690558fa3",
   );
   assert.equal(plan.materials.length, 28);
   assert.equal(plan.materials.filter((entry) => entry.kind === "copy").length, 17);

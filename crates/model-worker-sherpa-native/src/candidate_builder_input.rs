@@ -20,7 +20,7 @@ pub const LOCKED_CANDIDATE_ID: &str = "sherpa-native-sensevoice-int8-2024-07-17-
 /// candidate-bundle validation still requires an independently supplied
 /// `expectedContractSha256` value outside the bundle.
 pub const LOCKED_CANDIDATE_BUILDER_INPUT_SHA256_HEX: &str =
-    "2d648737cebb9a2317daf478b496055ff73f3b6c41007362aaf537bd18ae7e5b";
+    "1ad523582bdb9f58e860cc084bb3d4456fb20039c4d639bfda3b17f869b5ec71";
 
 /// SHA-256 of the locked FunASR model-license snapshot consumed by bundling.
 pub const LOCKED_MODEL_LICENSE_TEXT_SHA256_HEX: &str =

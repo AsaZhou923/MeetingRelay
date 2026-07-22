@@ -17,7 +17,7 @@ const EXPECTED_DESCRIPTOR_JSON: &str = concat!(
     "\"model_manifest_sha256\":\"e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181\",",
     "\"model_sha256\":\"c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51\",",
     "\"offline\":true,",
-    "\"package_lock_sha256\":\"3510ddfa99e3eabd022954fa71c23515abaa6a0411d8555844efe49d64b29acf\",",
+    "\"package_lock_sha256\":\"e01ae17e027bf7b61c8e787b1679da67bba9fb1df33726f11adbd8231b9f59ab\",",
     "\"parameter_sha256\":\"0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e\",",
     "\"quantization\":\"int8\",\"runtime_id\":\"sherpa-onnx-shared-cpu\",",
     "\"runtime_sha256\":\"0682618f660a2a9f2278d99decb77624253aadde60e8199a9b07813b8d843317\",",
