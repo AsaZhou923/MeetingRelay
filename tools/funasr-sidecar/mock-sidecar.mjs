@@ -47,7 +47,8 @@ export async function runMockSidecar() {
     return 0;
   }
   if (fault === "timeout") {
-    await new Promise(() => {});
+    // A never-settled Promise alone does not keep Node's event loop alive.
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
     return 0;
   }
   if (fault === "nonzero") {
