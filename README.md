@@ -34,6 +34,34 @@ powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1
 powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -AllowDownload
 ```
 
+### 下载本地 ASR 模型
+
+推荐使用仓库脚本下载。它会下载当前锁定的 SenseVoice 模型、校验 SHA-256 并解压到 `target/sherpa-native`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/sherpa-native/materialize.ps1 -AssetSet Model -AllowDownload
+```
+
+如果希望同时下载模型、Sherpa 原生运行库并启动完整桌面端，直接运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -AllowDownload
+```
+
+模型压缩包约 163 MB，解压后的 `model.int8.onnx` 约 239 MB，默认位于：
+
+```text
+target/sherpa-native/extracted/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx
+```
+
+也可以[直接下载锁定的模型压缩包](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2)，其 SHA-256 为 `7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e`。首次下载成功后，后续启动可以去掉 `-AllowDownload` 并复用本地缓存。
+
+当前模型许可仅接受内部评估，公开再分发状态仍为 Pending，因此 GitHub Release 不附带模型文件。
+
+### 预发布 EXE
+
+[`v0.0.1` 预发布版](https://github.com/AsaZhou923/MeetingRelay/releases/tag/v0.0.1) 提供单独的 `MeetingRelay.exe`，SHA-256 为 `fc69a400af8001c0fb4979c6f71272d011e3b4660e4f29f983d27dd6805240a1`，用于与该标签源码及锁定资产配套。该文件未签名，也不包含模型和 Sherpa DLL，不能作为独立的一键安装包使用；完整同机运行目录仍应使用下面的 personal release 命令生成。
+
 生成个人 release：
 
 ```powershell
