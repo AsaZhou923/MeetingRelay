@@ -52,6 +52,7 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
         .invoke_handler(tauri::generate_handler![
             mvp::mvp_preflight,
             mvp::mvp_audio_devices,
+            mvp::mvp_prepare_language,
             mvp::mvp_start,
             mvp::mvp_stop,
             mvp::mvp_pause,

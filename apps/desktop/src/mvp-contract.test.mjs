@@ -6,16 +6,26 @@ import {
   formatMvpErrorMessage,
   formatMvpSnapshotError,
   formatElapsed,
+  hasCompleteMvpTranscript,
   hasAllMvpExportFormats,
   isMvpActiveLifecycle,
   isMvpActiveSession,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
   parseMvpExportResult,
+  parseMvpRecognitionLanguage,
   parseMvpSnapshot,
   parseMvpTranscriptText,
   resolveAudioDeviceSelection,
 } from "./mvp-contract.ts";
+
+test("accepts only the per-meeting Chinese Japanese and English choices", () => {
+  assert.equal(parseMvpRecognitionLanguage("zh"), "zh");
+  assert.equal(parseMvpRecognitionLanguage("ja"), "ja");
+  assert.equal(parseMvpRecognitionLanguage("en"), "en");
+  assert.throws(() => parseMvpRecognitionLanguage("auto"), /recognition language/);
+  assert.throws(() => parseMvpRecognitionLanguage("ko"), /recognition language/);
+});
 
 const source = (id) => ({
   id,
@@ -202,6 +212,30 @@ test("reports inactive completed lifecycle states for UI lock decisions", () => 
   assert.equal(isMvpActiveSession(snapshot), false);
   assert.equal(isMvpActiveLifecycle("ready"), false);
   assert.equal(isMvpActiveLifecycle("error"), false);
+});
+
+test("blocks copy and export affordances for persistently incomplete meetings", () => {
+  assert.equal(
+    hasCompleteMvpTranscript({
+      durabilityStatus: "interrupted",
+      error: "ASR_FINAL_OVERLOAD",
+    }),
+    false,
+  );
+  assert.equal(
+    hasCompleteMvpTranscript({
+      durabilityStatus: "interrupted",
+      error: null,
+    }),
+    true,
+  );
+  assert.equal(
+    hasCompleteMvpTranscript({
+      durabilityStatus: "completed",
+      error: null,
+    }),
+    true,
+  );
 });
 
 test("parses full backend transcript text for clipboard copy", () => {

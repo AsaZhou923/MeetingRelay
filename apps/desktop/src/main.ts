@@ -5,18 +5,21 @@ import {
   formatMvpErrorMessage,
   formatMvpSnapshotError,
   formatElapsed,
+  hasCompleteMvpTranscript,
   hasAllMvpExportFormats,
   isMvpActiveSession,
   parseMvpTranscriptText,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
   parseMvpExportResult,
+  parseMvpRecognitionLanguage,
   parseMvpSnapshot,
   resolveAudioDeviceSelection,
   type AudioDeviceInventory,
   type AudioSourceSnapshot,
   type ExportArtifact,
   type MvpExportResult,
+  type MvpRecognitionLanguage,
   type MvpSnapshot,
 } from "./mvp-contract";
 import "./styles.css";
@@ -53,6 +56,15 @@ app.innerHTML = `
             <select id="microphone-device" disabled>
               <option value="">正在读取设备…</option>
             </select>
+          </label>
+          <label class="device-picker language-picker">
+            <span>本次识别语言</span>
+            <select id="recognition-language" disabled>
+              <option value="zh">中文 · ZH</option>
+              <option value="ja">日本語 · JA</option>
+              <option value="en">English · EN</option>
+            </select>
+            <small>会议开始后锁定；下一次会议可重新选择。</small>
           </label>
           <p id="device-status" class="device-status" aria-live="polite">正在读取 Windows 音频设备…</p>
         </div>
@@ -141,7 +153,7 @@ app.innerHTML = `
         </section>
         <footer class="stage-footer">
           <span>队列 <strong id="queue-depth">0 / 8</strong></span>
-          <span>固定语言 <strong>中文 · ZH</strong></span>
+          <span>识别语言 <strong id="footer-language">中文 · ZH</strong></span>
           <span>存储 <strong id="footer-storage">初始化</strong></span>
         </footer>
       </section>
@@ -158,6 +170,7 @@ function element<T extends Element>(selector: string): T {
 const controls = {
   systemDevice: element<HTMLSelectElement>("#system-device"),
   microphoneDevice: element<HTMLSelectElement>("#microphone-device"),
+  recognitionLanguage: element<HTMLSelectElement>("#recognition-language"),
   deviceStatus: element<HTMLParagraphElement>("#device-status"),
   consent: element<HTMLInputElement>("#consent"),
   start: element<HTMLButtonElement>("#start"),
@@ -179,6 +192,7 @@ const controls = {
   visibleWindow: element<HTMLElement>("#visible-window"),
   meetingId: element<HTMLElement>("#meeting-id"),
   footerStorage: element<HTMLElement>("#footer-storage"),
+  footerLanguage: element<HTMLElement>("#footer-language"),
   openRecent: element<HTMLButtonElement>("#open-recent"),
   recentSummary: element<HTMLElement>("#recent-summary"),
   copyTranscript: element<HTMLButtonElement>("#copy-transcript"),
@@ -193,6 +207,8 @@ let lastExport: MvpExportResult | null = null;
 let pollTimer: number | null = null;
 let audioDevices: AudioDeviceInventory | null = null;
 let audioDeviceLoadError: string | null = null;
+let preparedLanguage: MvpRecognitionLanguage = "zh";
+let languagePreparing = false;
 let lastClipboardText: string | null = null;
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 
@@ -202,6 +218,16 @@ function message(error: unknown): string {
 
 function isActive(snapshot: MvpSnapshot): boolean {
   return isMvpActiveSession(snapshot);
+}
+
+const LANGUAGE_LABELS: Record<MvpRecognitionLanguage, string> = {
+  zh: "中文 · ZH",
+  ja: "日本語 · JA",
+  en: "English · EN",
+};
+
+function currentRecognitionLanguage(): MvpRecognitionLanguage {
+  return parseMvpRecognitionLanguage(controls.recognitionLanguage.value);
 }
 
 function currentAudioDeviceSelection(): {
@@ -325,6 +351,7 @@ function canExport(snapshot: MvpSnapshot): boolean {
   return (
     snapshot.meetingId !== null &&
     !isActive(snapshot) &&
+    hasCompleteMvpTranscript(snapshot) &&
     ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus) &&
     hasAllMvpExportFormats(snapshot.availableExports) &&
     BigInt(snapshot.savedFinalCount) > 0n
@@ -335,6 +362,7 @@ function canCopyTranscript(snapshot: MvpSnapshot): boolean {
   return (
     snapshot.meetingId !== null &&
     !isActive(snapshot) &&
+    hasCompleteMvpTranscript(snapshot) &&
     ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus) &&
     BigInt(snapshot.savedFinalCount) > 0n
   );
@@ -415,13 +443,23 @@ function render(snapshot: MvpSnapshot): void {
     : `不可用 · ${snapshot.modelLabel}`;
   controls.model.dataset.ready = String(snapshot.modelReady);
   controls.start.disabled =
-    !ready || !controls.consent.checked || currentAudioDeviceSelection() === null;
+    !ready ||
+    languagePreparing ||
+    preparedLanguage !== currentRecognitionLanguage() ||
+    !controls.consent.checked ||
+    currentAudioDeviceSelection() === null;
   controls.pauseResume.disabled = !["recording", "paused"].includes(snapshot.lifecycle);
   controls.pauseResume.textContent = paused ? "继续转写" : "暂停转写";
   controls.pauseResume.dataset.state =
     paused ? "paused" : snapshot.lifecycle === "recording" ? "recording" : "idle";
   controls.stop.disabled = !active;
   controls.consent.disabled = active;
+  controls.recognitionLanguage.disabled =
+    active ||
+    languagePreparing ||
+    snapshot.lifecycle !== "ready" ||
+    !snapshot.modelReady;
+  controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
   renderAudioDeviceControls(active);
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
   controls.error.textContent = formatMvpSnapshotError(snapshot);
@@ -546,6 +584,34 @@ for (const select of [controls.systemDevice, controls.microphoneDevice]) {
   });
 }
 
+controls.recognitionLanguage.addEventListener("change", async () => {
+  const language = currentRecognitionLanguage();
+  controls.footerLanguage.textContent = LANGUAGE_LABELS[language];
+  if (language === preparedLanguage) {
+    if (latest) render(latest);
+    return;
+  }
+  languagePreparing = true;
+  controls.recognitionLanguage.disabled = true;
+  controls.start.disabled = true;
+  controls.model.dataset.ready = "false";
+  controls.model.textContent = `正在准备 ${LANGUAGE_LABELS[language]} 识别模型…`;
+  controls.error.textContent = "";
+  let switchError: string | null = null;
+  try {
+    const snapshot = await call("mvp_prepare_language", { language });
+    preparedLanguage = language;
+    render(snapshot);
+  } catch (error) {
+    controls.recognitionLanguage.value = preparedLanguage;
+    switchError = `无法切换识别语言：${message(error)}`;
+  } finally {
+    languagePreparing = false;
+    if (latest) render(latest);
+    if (switchError !== null) controls.error.textContent = switchError;
+  }
+});
+
 controls.start.addEventListener("click", async () => {
   controls.start.disabled = true;
   controls.error.textContent = "";
@@ -561,6 +627,7 @@ controls.start.addEventListener("click", async () => {
     render(
       await call("mvp_start", {
         consentAccepted: controls.consent.checked,
+        language: currentRecognitionLanguage(),
         ...selection,
       }),
     );

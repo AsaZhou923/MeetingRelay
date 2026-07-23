@@ -25,8 +25,8 @@ pub const LOCKED_REALTIME_MAX_PCM16_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Local paths to the five verified inputs required by the realtime engine.
 ///
-/// Callers supply locations only. All expected digests, the language, the CPU
-/// provider, and inference parameters remain fixed by the committed engine.
+/// Callers supply locations only. All expected digests, allowed languages, the
+/// CPU provider, and inference parameters remain fixed by the committed engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockedSherpaRealtimePaths {
     pub model_path: PathBuf,
@@ -34,6 +34,26 @@ pub struct LockedSherpaRealtimePaths {
     pub runtime_lib_dir: PathBuf,
     pub asset_lock_path: PathBuf,
     pub package_lock_path: PathBuf,
+}
+
+/// Per-meeting recognition language allowed by the sealed SenseVoice profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LockedSherpaLanguage {
+    English,
+    Japanese,
+    #[default]
+    Chinese,
+}
+
+impl LockedSherpaLanguage {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::Japanese => "ja",
+            Self::Chinese => "zh",
+        }
+    }
 }
 
 /// Stable, path-free failure categories for an application boundary such as Tauri.
@@ -89,9 +109,17 @@ pub struct LockedSherpaRealtime {
 }
 
 impl LockedSherpaRealtime {
-    /// Verifies and prepares the locked zh/CPU engine once.
+    /// Verifies and prepares the locked Chinese/CPU engine once.
     pub fn prepare(paths: LockedSherpaRealtimePaths) -> Result<Self, LockedSherpaRealtimeError> {
-        let config = locked_zh_cpu_config(&paths)?;
+        Self::prepare_with_language(paths, LockedSherpaLanguage::default())
+    }
+
+    /// Verifies and prepares one allowed single-language CPU engine.
+    pub fn prepare_with_language(
+        paths: LockedSherpaRealtimePaths,
+        language: LockedSherpaLanguage,
+    ) -> Result<Self, LockedSherpaRealtimeError> {
+        let config = locked_cpu_config(&paths, language)?;
         let backend = SherpaNativeBackend::new(config).map_err(map_config_error)?;
         Self::prepare_backend(backend)
     }
@@ -105,7 +133,16 @@ impl LockedSherpaRealtime {
     pub fn prepare_local_mvp(
         paths: LockedSherpaRealtimePaths,
     ) -> Result<Self, LockedSherpaRealtimeError> {
-        let mut config = locked_zh_cpu_config(&paths)?;
+        Self::prepare_local_mvp_with_language(paths, LockedSherpaLanguage::default())
+    }
+
+    /// Prepares one allowed per-meeting language for the desktop MVP.
+    #[cfg(feature = "native-sherpa")]
+    pub fn prepare_local_mvp_with_language(
+        paths: LockedSherpaRealtimePaths,
+        language: LockedSherpaLanguage,
+    ) -> Result<Self, LockedSherpaRealtimeError> {
+        let mut config = locked_cpu_config(&paths, language)?;
         let package_lock_sha256 = sha256_file(&paths.package_lock_path)
             .map_err(|_| LockedSherpaRealtimeError::AssetMismatch)?;
         config.expected_package_lock_sha256 = package_lock_sha256;
@@ -122,6 +159,15 @@ impl LockedSherpaRealtime {
         paths: LockedSherpaRealtimePaths,
     ) -> Result<Self, LockedSherpaRealtimeError> {
         let _ = paths;
+        Err(LockedSherpaRealtimeError::NativeFeatureDisabled)
+    }
+
+    #[cfg(not(feature = "native-sherpa"))]
+    pub fn prepare_local_mvp_with_language(
+        paths: LockedSherpaRealtimePaths,
+        language: LockedSherpaLanguage,
+    ) -> Result<Self, LockedSherpaRealtimeError> {
+        let _ = (paths, language);
         Err(LockedSherpaRealtimeError::NativeFeatureDisabled)
     }
 
@@ -165,8 +211,9 @@ impl LockedSherpaRealtime {
     }
 }
 
-pub(super) fn locked_zh_cpu_config(
+pub(super) fn locked_cpu_config(
     paths: &LockedSherpaRealtimePaths,
+    language: LockedSherpaLanguage,
 ) -> Result<SherpaNativeConfig, LockedSherpaRealtimeError> {
     let asset_paths = [
         &paths.model_path,
@@ -195,7 +242,7 @@ pub(super) fn locked_zh_cpu_config(
         runtime_lib_dir: paths.runtime_lib_dir.clone(),
         asset_lock_path: paths.asset_lock_path.clone(),
         package_lock_path: paths.package_lock_path.clone(),
-        normalized_language: LanguageCode::new("zh")
+        normalized_language: LanguageCode::new(language.code())
             .map_err(|_| LockedSherpaRealtimeError::Configuration)?,
         execution_provider: ExecutionProvider::Cpu,
         num_threads: 1,

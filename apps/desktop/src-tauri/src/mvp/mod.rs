@@ -32,14 +32,24 @@ pub fn mvp_start(
     consent_accepted: bool,
     system_output_device_id: Option<String>,
     microphone_device_id: Option<String>,
+    language: Option<String>,
 ) -> Result<MvpSnapshot, String> {
-    service.start_with_devices(
+    service.start_with_devices_and_language(
         consent_accepted,
         AudioDeviceSelection {
             system_output_device_id,
             microphone_device_id,
         },
+        language.as_deref().unwrap_or("zh"),
     )
+}
+
+#[tauri::command(async)]
+pub fn mvp_prepare_language(
+    service: tauri::State<'_, MvpService>,
+    language: String,
+) -> Result<MvpSnapshot, String> {
+    service.prepare_language(&language)
 }
 
 #[tauri::command(async)]

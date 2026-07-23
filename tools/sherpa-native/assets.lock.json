@@ -197,7 +197,11 @@
     "homophone_rule_fsts": null,
     "hotwords_file": null,
     "hotwords_score": 0,
-    "language": "zh",
+    "languages": [
+      "en",
+      "ja",
+      "zh"
+    ],
     "lm_model": null,
     "lm_scale": 1,
     "max_active_paths": 4,
@@ -212,7 +216,7 @@
     "sample_rate_hz": 16000,
     "telespeech_ctc": null,
     "use_itn": true,
-    "canonical_json_sha256": "0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e"
+    "canonical_json_sha256": "29977f5eee13b19050f89a4bc957d43abcb76a8f17b5b5b12603b95f1cc8d08b"
   },
   "entrypoints": {
     "runtime_lib_relative_path": "lib",

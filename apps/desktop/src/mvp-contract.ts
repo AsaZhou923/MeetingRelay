@@ -11,10 +11,12 @@ export const MVP_LIFECYCLES = [
 ] as const;
 
 export const MVP_EXPORT_FORMATS = ["json", "markdown", "txt"] as const;
+export const MVP_RECOGNITION_LANGUAGES = ["zh", "ja", "en"] as const;
 export const AUDIO_DEVICE_PREFERENCE_KEY = "meetingrelay.audio-devices.v1";
 
 export type MvpLifecycle = (typeof MVP_LIFECYCLES)[number];
 export type MvpExportFormat = (typeof MVP_EXPORT_FORMATS)[number];
+export type MvpRecognitionLanguage = (typeof MVP_RECOGNITION_LANGUAGES)[number];
 export type AudioSourceId = "system" | "microphone";
 export type AudioSourceStatus = "ready" | "capturing" | "degraded" | "error";
 export type DurabilityStatus =
@@ -118,12 +120,22 @@ export function hasAllMvpExportFormats(formats: readonly MvpExportFormat[]): boo
   return MVP_EXPORT_FORMATS.every((format) => available.has(format));
 }
 
+export function parseMvpRecognitionLanguage(value: unknown): MvpRecognitionLanguage {
+  return enumValue(value, "recognition language", MVP_RECOGNITION_LANGUAGES);
+}
+
 export function isMvpActiveLifecycle(lifecycle: MvpLifecycle): boolean {
   return ["starting", "recording", "paused", "stopping"].includes(lifecycle);
 }
 
 export function isMvpActiveSession(snapshot: MvpSnapshot): boolean {
   return isMvpActiveLifecycle(snapshot.lifecycle);
+}
+
+export function hasCompleteMvpTranscript(
+  snapshot: Pick<MvpSnapshot, "durabilityStatus" | "error">,
+): boolean {
+  return snapshot.durabilityStatus !== "interrupted" || snapshot.error === null;
 }
 
 export function parseMvpTranscriptText(value: unknown): string {

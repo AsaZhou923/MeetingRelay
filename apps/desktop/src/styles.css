@@ -47,6 +47,8 @@ h2 { margin: 0 0 20px; font-size: 18px; font-weight: 560; letter-spacing: -.02em
 .device-picker select { width: 100%; min-height: 36px; padding: 0 30px 0 10px; overflow: hidden; border: 1px solid #35413d; border-radius: 0; outline: 0; background: #0d1311; color: #dce5df; font-size: 11px; text-overflow: ellipsis; }
 .device-picker select:focus-visible { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan); }
 .device-picker select:disabled { color: #6f7c75; cursor: not-allowed; opacity: .72; }
+.language-picker { margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--line); }
+.language-picker small { color: #6f7c75; font-size: 10px; line-height: 1.4; }
 .device-status { min-height: 16px; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .device-status[data-status="ready"] { color: #9fbd77; }
 .device-status[data-status="error"] { color: var(--danger); }

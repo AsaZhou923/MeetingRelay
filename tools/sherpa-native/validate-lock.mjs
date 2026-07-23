@@ -250,7 +250,7 @@ export function validateLockObject(lock) {
     "homophone_rule_fsts",
     "hotwords_file",
     "hotwords_score",
-    "language",
+    "languages",
     "lm_model",
     "lm_scale",
     "max_active_paths",
@@ -277,7 +277,7 @@ export function validateLockObject(lock) {
     homophone_rule_fsts: null,
     hotwords_file: null,
     hotwords_score: 0,
-    language: "zh",
+    languages: ["en", "ja", "zh"],
     lm_model: null,
     lm_scale: 1,
     max_active_paths: 4,
@@ -293,7 +293,22 @@ export function validateLockObject(lock) {
     telespeech_ctc: null,
     use_itn: true,
   };
-  for (const [key, value] of Object.entries(parameterMaterial)) exact(lock.parameters[key], value, `lock.parameters.${key}`);
+  for (const [key, value] of Object.entries(parameterMaterial)) {
+    if (key !== "languages") exact(lock.parameters[key], value, `lock.parameters.${key}`);
+  }
+  if (
+    !Array.isArray(lock.parameters.languages) ||
+    lock.parameters.languages.length !== parameterMaterial.languages.length ||
+    lock.parameters.languages.some(
+      (language, index) => language !== parameterMaterial.languages[index],
+    )
+  ) {
+    fail(
+      "LOCK_PIN_MISMATCH",
+      `expected ${JSON.stringify(parameterMaterial.languages)}`,
+      "lock.parameters.languages",
+    );
+  }
   const parameterHash = createHash("sha256").update(JSON.stringify(parameterMaterial)).digest("hex");
   exact(lock.parameters.canonical_json_sha256, parameterHash, "lock.parameters.canonical_json_sha256");
 

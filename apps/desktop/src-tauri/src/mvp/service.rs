@@ -31,8 +31,8 @@ use std::{
 
 #[cfg(windows)]
 use meetingrelay_model_worker_sherpa_native::{
-    LOCKED_REALTIME_MAX_PCM16_BYTES, LockedSherpaRealtime, LockedSherpaRealtimeError,
-    LockedSherpaRealtimePaths,
+    LOCKED_REALTIME_MAX_PCM16_BYTES, LockedSherpaLanguage, LockedSherpaRealtime,
+    LockedSherpaRealtimeError, LockedSherpaRealtimePaths,
 };
 
 #[cfg(windows)]
@@ -62,6 +62,55 @@ struct ServiceInner {
     inference: Option<InferenceWorker>,
     #[cfg(windows)]
     session: Option<RunningSession>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RecognitionLanguage {
+    English,
+    Japanese,
+    #[default]
+    Chinese,
+}
+
+impl RecognitionLanguage {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "en" => Ok(Self::English),
+            "ja" => Ok(Self::Japanese),
+            "zh" => Ok(Self::Chinese),
+            _ => Err("ASR_LANGUAGE_UNSUPPORTED".to_owned()),
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::Japanese => "ja",
+            Self::Chinese => "zh",
+        }
+    }
+
+    fn model_label(self) -> String {
+        format!("SenseVoice · {} · CPU · local", self.code())
+    }
+
+    #[cfg(windows)]
+    const fn sherpa(self) -> LockedSherpaLanguage {
+        match self {
+            Self::English => LockedSherpaLanguage::English,
+            Self::Japanese => LockedSherpaLanguage::Japanese,
+            Self::Chinese => LockedSherpaLanguage::Chinese,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn history_open_blocked(inner: &ServiceInner, snapshot: &Mutex<MvpSnapshot>) -> bool {
+    inner.session.is_some()
+        || matches!(
+            lock(snapshot).lifecycle,
+            Lifecycle::Starting | Lifecycle::Recording | Lifecycle::Paused | Lifecycle::Stopping
+        )
 }
 
 impl Default for MvpService {
@@ -134,25 +183,44 @@ impl MvpService {
 
     #[cfg(test)]
     pub fn start(&self, consent_accepted: bool) -> Result<MvpSnapshot, String> {
-        self.start_with_devices(consent_accepted, AudioDeviceSelection::default())
+        self.start_with_devices_and_language(
+            consent_accepted,
+            AudioDeviceSelection::default(),
+            "zh",
+        )
     }
 
-    pub fn start_with_devices(
+    pub fn start_with_devices_and_language(
         &self,
         consent_accepted: bool,
         selection: AudioDeviceSelection,
+        language: &str,
     ) -> Result<MvpSnapshot, String> {
         if !consent_accepted {
             return Err("CONSENT_REQUIRED".to_owned());
         }
+        let language = RecognitionLanguage::parse(language)?;
 
         #[cfg(windows)]
         {
-            self.start_windows(selection)
+            self.start_windows(selection, language)
         }
         #[cfg(not(windows))]
         {
-            let _ = selection;
+            let _ = (selection, language);
+            Err("MVP_WINDOWS_ONLY".to_owned())
+        }
+    }
+
+    pub fn prepare_language(&self, language: &str) -> Result<MvpSnapshot, String> {
+        let language = RecognitionLanguage::parse(language)?;
+        #[cfg(windows)]
+        {
+            self.prepare_language_windows(language)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = language;
             Err("MVP_WINDOWS_ONLY".to_owned())
         }
     }
@@ -191,6 +259,11 @@ impl MvpService {
     }
 
     pub fn open_recent(&self) -> Result<MvpSnapshot, String> {
+        let inner = lock(&self.inner);
+        #[cfg(windows)]
+        if history_open_blocked(&inner, &self.snapshot) {
+            return Err("SESSION_ACTIVE".to_owned());
+        }
         let storage = self
             .storage
             .as_ref()
@@ -202,15 +275,24 @@ impl MvpService {
         let recent = storage
             .recent_meeting()?
             .ok_or_else(|| "MVP_STORAGE_RECENT_EMPTY".to_owned())?;
-        self.apply_meeting_snapshot(writer.open_meeting(&recent.id)?)
+        let result = self.apply_meeting_snapshot(writer.open_meeting(&recent.id)?);
+        drop(inner);
+        result
     }
 
     pub fn open_meeting(&self, meeting_id: &str) -> Result<MvpSnapshot, String> {
+        let inner = lock(&self.inner);
+        #[cfg(windows)]
+        if history_open_blocked(&inner, &self.snapshot) {
+            return Err("SESSION_ACTIVE".to_owned());
+        }
         let writer = self
             .storage_writer
             .as_ref()
             .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
-        self.apply_meeting_snapshot(writer.open_meeting(meeting_id)?)
+        let result = self.apply_meeting_snapshot(writer.open_meeting(meeting_id)?);
+        drop(inner);
+        result
     }
 
     pub fn export_meeting(
@@ -288,6 +370,7 @@ impl MvpService {
             .last()
             .map(|final_segment| final_segment.sequence.to_string());
         snapshot.visible_final_window_start_sequence = visible_window_start_sequence(total);
+        snapshot.error = meeting.meeting.completion_error;
         snapshot.enforce_bounds();
         Ok(snapshot.clone())
     }
@@ -304,24 +387,34 @@ impl MvpService {
     }
 
     #[cfg(windows)]
-    fn prepare_inference_worker(&self) -> Result<InferenceWorker, String> {
+    fn prepare_inference_worker(
+        &self,
+        language: RecognitionLanguage,
+    ) -> Result<InferenceWorker, String> {
         let paths = resolve_model_paths().inspect_err(|error| self.fail(error))?;
         InferenceWorker::prepare(
             Arc::clone(&self.snapshot),
             paths,
             self.storage_writer.clone(),
+            language,
         )
         .inspect_err(|error| self.fail(error))
     }
 
     #[cfg(windows)]
-    fn ensure_inference_worker(&self, inner: &mut ServiceInner) -> Result<(), String> {
-        if inner
+    fn ensure_inference_worker(
+        &self,
+        inner: &mut ServiceInner,
+        language: RecognitionLanguage,
+    ) -> Result<(), String> {
+        let replace = inner
             .inference
             .as_ref()
-            .is_some_and(InferenceWorker::is_finished)
-        {
-            inner.inference = None;
+            .is_some_and(|worker| worker.is_finished() || worker.language != language);
+        if replace {
+            if let Some(worker) = inner.inference.take() {
+                worker.shutdown_before(Instant::now() + MVP_SHUTDOWN_TIMEOUT)?;
+            }
             let mut snapshot = lock(&self.snapshot);
             snapshot.model_ready = false;
             if snapshot.error.as_deref() == Some("ASR_WORKER_STOPPED") {
@@ -329,7 +422,7 @@ impl MvpService {
             }
         }
         if inner.inference.is_none() {
-            inner.inference = Some(self.prepare_inference_worker()?);
+            inner.inference = Some(self.prepare_inference_worker(language)?);
         }
         Ok(())
     }
@@ -363,13 +456,14 @@ impl MvpService {
             code
         })?;
 
-        self.ensure_inference_worker(&mut inner)?;
+        let language = RecognitionLanguage::default();
+        self.ensure_inference_worker(&mut inner, language)?;
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
         snapshot.durability_status = "ready".to_owned();
         snapshot.model_ready = true;
-        snapshot.model_label = "SenseVoice · zh · CPU · local".to_owned();
+        snapshot.model_label = language.model_label();
         snapshot.system = ready_source(SourceId::System, &devices.system_output);
         snapshot.microphone = ready_source(SourceId::Microphone, &devices.microphone);
         snapshot.error = None;
@@ -380,7 +474,40 @@ impl MvpService {
     }
 
     #[cfg(windows)]
-    fn start_windows(&self, selection: AudioDeviceSelection) -> Result<MvpSnapshot, String> {
+    fn prepare_language_windows(
+        &self,
+        language: RecognitionLanguage,
+    ) -> Result<MvpSnapshot, String> {
+        let mut inner = lock(&self.inner);
+        if inner.session.is_some() {
+            return Err("SESSION_ALREADY_RUNNING".to_owned());
+        }
+        if lock(&self.snapshot).lifecycle != Lifecycle::Ready {
+            return Err("MVP_NOT_READY".to_owned());
+        }
+        {
+            let mut snapshot = lock(&self.snapshot);
+            snapshot.model_ready = false;
+            snapshot.model_label = format!("SenseVoice · {} · preparing", language.code());
+            snapshot.error = None;
+        }
+        self.ensure_inference_worker(&mut inner, language)?;
+        let mut snapshot = lock(&self.snapshot);
+        snapshot.model_ready = true;
+        snapshot.model_label = language.model_label();
+        snapshot.error = None;
+        Ok(public_snapshot(
+            &mut snapshot,
+            inner.inference.as_ref().map(|worker| &worker.submitter),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn start_windows(
+        &self,
+        selection: AudioDeviceSelection,
+        language: RecognitionLanguage,
+    ) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
             return Err("SESSION_ALREADY_RUNNING".to_owned());
@@ -392,8 +519,9 @@ impl MvpService {
         if lock(&self.snapshot).lifecycle != Lifecycle::Ready {
             return Err("MVP_NOT_READY".to_owned());
         }
-        self.ensure_inference_worker(&mut inner)?;
-        let meeting = writer.start_meeting(true, "SenseVoice · zh · CPU · local")?;
+        self.ensure_inference_worker(&mut inner, language)?;
+        let model_label = language.model_label();
+        let meeting = writer.start_meeting(true, &model_label)?;
 
         if let Some(inference) = inner.inference.as_ref() {
             inference
@@ -405,6 +533,8 @@ impl MvpService {
         {
             let mut snapshot = lock(&self.snapshot);
             snapshot.lifecycle = Lifecycle::Starting;
+            snapshot.model_ready = true;
+            snapshot.model_label = model_label;
             snapshot.error = None;
             snapshot.interim = None;
             snapshot.finals.clear();
@@ -577,12 +707,12 @@ impl MvpService {
             let Some(session) = inner.session.take() else {
                 return Ok(self.snapshot_locked(&inner));
             };
+            lock(&self.snapshot).lifecycle = Lifecycle::Stopping;
             let submitter = inner.inference.as_ref().map(InferenceWorker::submitter);
             (session, submitter)
         };
 
         self.refresh_from_session(&session, true);
-        lock(&self.snapshot).lifecycle = Lifecycle::Stopping;
         session.capture.stop();
         session.stop.store(true, Ordering::Release);
 
@@ -595,16 +725,17 @@ impl MvpService {
                 .barrier_before(deadline)
                 .inspect_err(|error| self.fail(error))?;
         }
-        if let Some(writer) = self.storage_writer.as_ref()
-            && let Err(error) = writer.complete_meeting(&session.meeting_id)
-        {
-            self.fail(&error);
-            return Err(error);
-        }
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let meeting = finish_session_meeting(writer, &session.meeting_id, &session.errors)
+            .inspect_err(|error| self.fail(error))?;
+        let completion_error = meeting.completion_error.clone();
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
-        snapshot.durability_status = "completed".to_owned();
+        snapshot.durability_status = meeting.state;
         snapshot.system.active = false;
         snapshot.system.peak = 0.0;
         snapshot.system.status = SourceStatus::Ready;
@@ -612,11 +743,12 @@ impl MvpService {
         snapshot.microphone.peak = 0.0;
         snapshot.microphone.status = SourceStatus::Ready;
         snapshot.queue_depth = 0;
-        if snapshot.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
-            snapshot.error = None;
-        }
+        snapshot.error = None;
         if let Some(error) = take_runtime_error(&session.errors) {
             set_public_error(&mut snapshot, error);
+        }
+        if completion_error.is_some() {
+            snapshot.error = completion_error;
         }
         Ok(public_snapshot(&mut snapshot, submitter.as_ref()))
     }
@@ -659,7 +791,10 @@ impl MvpService {
         apply_source_stats(&mut snapshot.system, system, active);
         apply_source_stats(&mut snapshot.microphone, microphone, active);
         if stream_error {
+            session.errors.mark_incomplete("AUDIO_STREAM_ERROR");
             set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
+        } else if system.dropped_packets > 0 || microphone.dropped_packets > 0 {
+            session.errors.mark_incomplete("AUDIO_PACKETS_DROPPED");
         }
         if let Some(error) = take_runtime_error(&session.errors) {
             set_public_error(&mut snapshot, error);
@@ -681,17 +816,21 @@ fn public_snapshot(
 
 #[cfg(windows)]
 fn set_public_error(snapshot: &mut MvpSnapshot, error: &str) {
-    let priority = |code| match code {
-        "ASR_FINAL_OVERLOAD" => 3,
-        "ASR_WORKER_STOPPED" => 2,
-        _ => 1,
-    };
     if snapshot
         .error
         .as_deref()
-        .is_none_or(|current| priority(error) >= priority(current))
+        .is_none_or(|current| public_error_priority(error) >= public_error_priority(current))
     {
         snapshot.error = Some(error.to_owned());
+    }
+}
+
+#[cfg(windows)]
+fn public_error_priority(code: &str) -> u8 {
+    match code {
+        "ASR_FINAL_OVERLOAD" => 3,
+        "ASR_WORKER_STOPPED" => 2,
+        _ => 1,
     }
 }
 
@@ -709,6 +848,18 @@ fn storage_error_from_snapshot(snapshot: &Mutex<MvpSnapshot>) -> String {
 }
 
 #[cfg(windows)]
+fn finish_session_meeting(
+    writer: &MvpStorageWriter,
+    meeting_id: &str,
+    errors: &RuntimeErrors,
+) -> Result<super::storage::MeetingRecord, String> {
+    match errors.completion_error().as_deref() {
+        Some(error) => writer.incomplete_meeting(meeting_id, error),
+        None => writer.complete_meeting(meeting_id),
+    }
+}
+
+#[cfg(windows)]
 fn lock_before<'a, T>(mutex: &'a Mutex<T>, deadline: Instant) -> Result<MutexGuard<'a, T>, String> {
     loop {
         match mutex.try_lock() {
@@ -723,16 +874,37 @@ fn lock_before<'a, T>(mutex: &'a Mutex<T>, deadline: Instant) -> Result<MutexGua
 }
 
 #[cfg(windows)]
-type RuntimeErrors = AtomicU8;
+#[derive(Default)]
+struct RuntimeErrors {
+    priority: AtomicU8,
+    completion_error: Mutex<Option<String>>,
+}
+
+#[cfg(windows)]
+impl RuntimeErrors {
+    fn mark_incomplete(&self, error: &str) {
+        let mut current = lock(&self.completion_error);
+        if current
+            .as_deref()
+            .is_none_or(|existing| public_error_priority(error) >= public_error_priority(existing))
+        {
+            *current = Some(error.to_owned());
+        }
+    }
+
+    fn completion_error(&self) -> Option<String> {
+        lock(&self.completion_error).clone()
+    }
+}
 
 #[cfg(windows)]
 fn record_runtime_error(errors: &RuntimeErrors, priority: u8) {
-    errors.fetch_max(priority, Ordering::AcqRel);
+    errors.priority.fetch_max(priority, Ordering::AcqRel);
 }
 
 #[cfg(windows)]
 fn take_runtime_error(errors: &RuntimeErrors) -> Option<&'static str> {
-    match errors.swap(0, Ordering::AcqRel) {
+    match errors.priority.swap(0, Ordering::AcqRel) {
         1 => Some("AUDIO_DSP_CONFIGURATION"),
         2 => Some("ASR_WORKER_STOPPED"),
         3 => Some("ASR_FINAL_OVERLOAD"),
@@ -953,6 +1125,9 @@ struct InferenceSubmitter {
 impl InferenceSubmitter {
     fn submit(&self, task: InferenceTask) -> Result<(), String> {
         if self.shared.shutdown.load(Ordering::Acquire) {
+            if task.is_final {
+                task.session_errors.mark_incomplete("ASR_WORKER_STOPPED");
+            }
             return Err("ASR_WORKER_STOPPED".to_owned());
         }
         if task.is_final {
@@ -1003,8 +1178,14 @@ impl InferenceSubmitter {
             Err(error) => {
                 self.shared.pending.fetch_sub(1, Ordering::AcqRel);
                 match error {
-                    TrySendError::Full(_) => Err("ASR_FINAL_OVERLOAD".to_owned()),
-                    TrySendError::Disconnected(_) => Err("ASR_WORKER_STOPPED".to_owned()),
+                    TrySendError::Full(task) => {
+                        task.session_errors.mark_incomplete("ASR_FINAL_OVERLOAD");
+                        Err("ASR_FINAL_OVERLOAD".to_owned())
+                    }
+                    TrySendError::Disconnected(task) => {
+                        task.session_errors.mark_incomplete("ASR_WORKER_STOPPED");
+                        Err("ASR_WORKER_STOPPED".to_owned())
+                    }
                 }
             }
         }
@@ -1076,9 +1257,17 @@ impl InferenceShared {
 }
 
 #[cfg(windows)]
+#[derive(Clone)]
+struct RecognizerProfile {
+    paths: LockedSherpaRealtimePaths,
+    language: RecognitionLanguage,
+}
+
+#[cfg(windows)]
 struct InferenceWorker {
     submitter: InferenceSubmitter,
     join: Option<JoinHandle<()>>,
+    language: RecognitionLanguage,
 }
 
 #[cfg(windows)]
@@ -1087,23 +1276,28 @@ impl InferenceWorker {
         snapshot: Arc<Mutex<MvpSnapshot>>,
         paths: LockedSherpaRealtimePaths,
         storage_writer: Option<Arc<MvpStorageWriter>>,
+        language: RecognitionLanguage,
     ) -> Result<Self, String> {
         let (ready_sender, ready_receiver) = sync_channel(1);
         let (finals, final_receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
         let shared = Arc::new(InferenceShared::default());
         let worker_shared = Arc::clone(&shared);
-        let worker_paths = paths.clone();
+        let profile = RecognizerProfile { paths, language };
+        let worker_profile = profile.clone();
         let join = thread::Builder::new()
             .name("meetingrelay-asr".to_owned())
             .spawn(move || {
-                let recognizer = LockedSherpaRealtime::prepare_local_mvp(paths)
-                    .map_err(|error| error.to_string());
+                let recognizer = LockedSherpaRealtime::prepare_local_mvp_with_language(
+                    profile.paths.clone(),
+                    profile.language.sherpa(),
+                )
+                .map_err(|error| error.to_string());
                 let ready = recognizer.as_ref().map(|_| ()).map_err(Clone::clone);
                 let _ = ready_sender.send(ready);
                 if let Ok(mut recognizer) = recognizer {
                     inference_loop(
                         &mut recognizer,
-                        worker_paths,
+                        worker_profile,
                         final_receiver,
                         worker_shared,
                         snapshot,
@@ -1124,6 +1318,7 @@ impl InferenceWorker {
                 worker_thread,
             },
             join: Some(join),
+            language,
         })
     }
 
@@ -1167,12 +1362,13 @@ struct InferenceTask {
     started_at_ms: String,
     ended_at_ms: String,
     samples: Arc<[i16]>,
+    session_errors: Arc<RuntimeErrors>,
 }
 
 #[cfg(windows)]
 fn inference_loop(
     recognizer: &mut LockedSherpaRealtime,
-    paths: LockedSherpaRealtimePaths,
+    profile: RecognizerProfile,
     finals: Receiver<InferenceTask>,
     shared: Arc<InferenceShared>,
     snapshot: Arc<Mutex<MvpSnapshot>>,
@@ -1188,7 +1384,7 @@ fn inference_loop(
         if let Some((interim_generation, task)) = scheduled {
             process_inference_task(
                 recognizer,
-                &paths,
+                &profile,
                 &shared,
                 &snapshot,
                 storage_writer.as_deref(),
@@ -1208,7 +1404,7 @@ fn inference_loop(
 #[cfg(windows)]
 fn transcribe_with_recovery(
     recognizer: &mut LockedSherpaRealtime,
-    paths: &LockedSherpaRealtimePaths,
+    profile: &RecognizerProfile,
     task: &InferenceTask,
 ) -> Result<String, LockedSherpaRealtimeError> {
     let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
@@ -1217,7 +1413,10 @@ fn transcribe_with_recovery(
         .err()
         .is_some_and(|error| should_retry_transcription(*error, task))
     {
-        *recognizer = LockedSherpaRealtime::prepare_local_mvp(paths.clone())?;
+        *recognizer = LockedSherpaRealtime::prepare_local_mvp_with_language(
+            profile.paths.clone(),
+            profile.language.sherpa(),
+        )?;
         recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples))
     } else {
         result
@@ -1254,20 +1453,25 @@ fn is_replayable_sample_count(sample_count: usize) -> bool {
 #[cfg(windows)]
 fn process_inference_task(
     recognizer: &mut LockedSherpaRealtime,
-    paths: &LockedSherpaRealtimePaths,
+    profile: &RecognizerProfile,
     shared: &InferenceShared,
     snapshot: &Mutex<MvpSnapshot>,
     storage_writer: Option<&MvpStorageWriter>,
     interim_generation: Option<u64>,
     task: InferenceTask,
 ) {
-    if interim_generation.is_some_and(|generation| !shared.interim_is_current(generation))
-        || lock(snapshot).session_id.as_deref() != Some(task.session_id.as_str())
-    {
+    let stale_task = interim_generation
+        .is_some_and(|generation| !shared.interim_is_current(generation))
+        || lock(snapshot).session_id.as_deref() != Some(task.session_id.as_str());
+    if stale_task {
+        if task.is_final {
+            task.session_errors
+                .mark_incomplete("ASR_FINAL_SESSION_MISMATCH");
+        }
         return;
     }
 
-    let result = transcribe_with_recovery(recognizer, paths, &task);
+    let result = transcribe_with_recovery(recognizer, profile, &task);
     let session_id = task.session_id.clone();
     let durable_final = match result {
         Ok(text) => {
@@ -1277,6 +1481,8 @@ fn process_inference_task(
             if task.is_final {
                 let sequence = shared.next_durable_sequence_candidate();
                 let Some(storage_writer) = storage_writer else {
+                    task.session_errors
+                        .mark_incomplete("MVP_STORAGE_UNAVAILABLE");
                     let _ = publish_if_current(
                         shared,
                         snapshot,
@@ -1299,7 +1505,10 @@ fn process_inference_task(
                         shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);
                         Some(Ok((ack.final_segment, ack.duplicate)))
                     }
-                    Err(error) => Some(Err(error)),
+                    Err(error) => {
+                        task.session_errors.mark_incomplete(&error);
+                        Some(Err(error))
+                    }
                 }
             } else {
                 let segment = TranscriptSegment {
@@ -1334,7 +1543,11 @@ fn process_inference_task(
                 return;
             }
         }
-        Err(error) if task.is_final => Some(Err(error.to_string())),
+        Err(error) if task.is_final => {
+            let error = error.to_string();
+            task.session_errors.mark_incomplete(&error);
+            Some(Err(error))
+        }
         Err(_) => None,
     };
     let _ = publish_if_current(
@@ -1460,6 +1673,7 @@ fn coordinator_loop(
     let microphone = SourcePipeline::new(&preflight.microphone);
     let (Ok(mut system), Ok(mut microphone)) = (system, microphone) else {
         record_runtime_error(&errors, 1);
+        errors.mark_incomplete("AUDIO_DSP_CONFIGURATION");
         return;
     };
     let mut endpoint = EnergyEndpointSegmenter::new();
@@ -1543,7 +1757,7 @@ fn finalize_pause_boundary(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    errors: &RuntimeErrors,
+    errors: &Arc<RuntimeErrors>,
     session_id: &str,
 ) {
     while let Some(block) = system.blocks.pop_front() {
@@ -1680,7 +1894,7 @@ fn drain_mixed(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    errors: &RuntimeErrors,
+    errors: &Arc<RuntimeErrors>,
     session_id: &str,
 ) {
     const ALIGNMENT_BLOCKS: usize = 4;
@@ -1750,7 +1964,7 @@ fn drain_all_mixed(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    errors: &RuntimeErrors,
+    errors: &Arc<RuntimeErrors>,
     session_id: &str,
 ) {
     while !system.is_empty() || !microphone.is_empty() {
@@ -1774,7 +1988,7 @@ fn process_pair(
     endpoint: &mut EnergyEndpointSegmenter,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    errors: &RuntimeErrors,
+    errors: &Arc<RuntimeErrors>,
     session_id: &str,
 ) {
     if system.is_none() && microphone.is_none() {
@@ -1819,7 +2033,7 @@ fn submit_segment(
     event: SegmentEvent,
     identity: &mut SegmentIdentity,
     submitter: &InferenceSubmitter,
-    errors: &RuntimeErrors,
+    errors: &Arc<RuntimeErrors>,
     session_id: &str,
 ) {
     let (segment, is_final) = match event {
@@ -1827,7 +2041,14 @@ fn submit_segment(
         SegmentEvent::Final { segment, .. } => (segment, true),
     };
     let (segment_id, revision) = identity.metadata(is_final);
-    let task = inference_task(session_id, segment_id, revision, is_final, segment);
+    let task = inference_task(
+        session_id,
+        segment_id,
+        revision,
+        is_final,
+        segment,
+        Arc::clone(errors),
+    );
     if let Err(error) = submitter.submit(task) {
         match error.as_str() {
             "ASR_FINAL_OVERLOAD" => record_runtime_error(errors, 3),
@@ -1844,6 +2065,7 @@ fn inference_task(
     revision: u32,
     is_final: bool,
     segment: AudioSegment,
+    session_errors: Arc<RuntimeErrors>,
 ) -> InferenceTask {
     let started_at_ms = samples_to_ms(segment.started_at_sample).to_string();
     let ended_at_ms = samples_to_ms(segment.ended_at_sample).to_string();
@@ -1861,6 +2083,7 @@ fn inference_task(
         started_at_ms,
         ended_at_ms,
         samples,
+        session_errors,
     }
 }
 
@@ -1911,6 +2134,7 @@ mod tests {
             started_at_ms: "0".to_owned(),
             ended_at_ms: "20".to_owned(),
             samples: vec![0_i16].into(),
+            session_errors: Arc::new(RuntimeErrors::default()),
         }
     }
 
@@ -1925,6 +2149,22 @@ mod tests {
             },
             receiver,
         )
+    }
+
+    #[cfg(windows)]
+    fn test_running_session(meeting_id: &str) -> RunningSession {
+        let capture = AudioCapture::stopped_for_test();
+        let metrics = capture.metrics();
+        RunningSession {
+            capture,
+            coordinator: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            pause_gate: Arc::new(PauseGate::default()),
+            metrics,
+            errors: Arc::new(RuntimeErrors::default()),
+            started: Instant::now(),
+            meeting_id: meeting_id.to_owned(),
+        }
     }
 
     #[test]
@@ -1981,6 +2221,44 @@ mod tests {
         assert_eq!(
             service.snapshot().latest_opened_meeting.as_deref(),
             Some(meeting.id.as_str())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_session_rejects_history_open_without_replacing_session_identity() {
+        let (storage, writer) = temp_storage_writer("active-history-guard");
+        let historical = writer.start_meeting(true, "test model").unwrap();
+        writer.complete_meeting(&historical.id).unwrap();
+        drop(writer);
+        let service = MvpService::new_with_storage_result(Ok(storage));
+        {
+            let mut snapshot = lock(&service.snapshot);
+            snapshot.lifecycle = Lifecycle::Recording;
+            snapshot.meeting_id = Some("active-meeting".to_owned());
+            snapshot.session_id = Some("active-meeting".to_owned());
+            snapshot.durability_status = "recording".to_owned();
+        }
+        lock(&service.inner).session = Some(test_running_session("active-meeting"));
+
+        assert_eq!(service.open_recent(), Err("SESSION_ACTIVE".to_owned()));
+        assert_eq!(
+            service.open_meeting(&historical.id),
+            Err("SESSION_ACTIVE".to_owned())
+        );
+        {
+            let snapshot = lock(&service.snapshot);
+            assert_eq!(snapshot.meeting_id.as_deref(), Some("active-meeting"));
+            assert_eq!(snapshot.session_id.as_deref(), Some("active-meeting"));
+            assert_eq!(snapshot.lifecycle, Lifecycle::Recording);
+        }
+
+        lock(&service.inner).session = None;
+        lock(&service.snapshot).lifecycle = Lifecycle::Stopping;
+        assert_eq!(service.open_recent(), Err("SESSION_ACTIVE".to_owned()));
+        assert_eq!(
+            service.open_meeting(&historical.id),
+            Err("SESSION_ACTIVE".to_owned())
         );
     }
 
@@ -2225,9 +2503,15 @@ mod tests {
         for _ in 0..MAX_INFERENCE_QUEUE_DEPTH {
             submitter.submit(queued_task(1, true)).unwrap();
         }
+        let rejected = queued_task(1, true);
+        let rejected_errors = Arc::clone(&rejected.session_errors);
         assert_eq!(
-            submitter.submit(queued_task(1, true)),
+            submitter.submit(rejected),
             Err("ASR_FINAL_OVERLOAD".to_owned())
+        );
+        assert_eq!(
+            rejected_errors.completion_error().as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
         );
 
         let (contended, finals) = test_submitter();
@@ -2319,13 +2603,42 @@ mod tests {
         for _ in 0..MAX_INFERENCE_QUEUE_DEPTH {
             submitter.submit(queued_task(1, true)).unwrap();
         }
+        let rejected = queued_task(1, true);
+        let rejected_errors = Arc::clone(&rejected.session_errors);
         assert_eq!(
-            submitter.submit(queued_task(1, true)),
+            submitter.submit(rejected),
             Err("ASR_FINAL_OVERLOAD".to_owned())
+        );
+        assert_eq!(
+            rejected_errors.completion_error().as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
         );
         assert_eq!(
             submitter.shared.next_final_sequence.load(Ordering::Acquire),
             0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_overload_persists_an_incomplete_meeting_instead_of_completed() {
+        let (storage, writer) = temp_storage_writer("overload-incomplete");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        let errors = RuntimeErrors::default();
+        errors.mark_incomplete("ASR_FINAL_OVERLOAD");
+
+        let finished = finish_session_meeting(&writer, &meeting.id, &errors).unwrap();
+
+        assert_eq!(finished.state, "interrupted");
+        assert_eq!(
+            finished.completion_error.as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
+        );
+        let reopened = storage.snapshot(&meeting.id).unwrap();
+        assert_eq!(reopened.meeting.state, "interrupted");
+        assert_eq!(
+            reopened.meeting.completion_error.as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
         );
     }
 
@@ -2418,6 +2731,7 @@ mod tests {
                 worker_thread,
             },
             join: Some(join),
+            language: RecognitionLanguage::Chinese,
         };
 
         let started = Instant::now();
@@ -2444,4 +2758,27 @@ mod tests {
         assert_eq!(f32_to_pcm16(-1.5), -i16::MAX);
         assert_eq!(f32_to_pcm16(f32::NAN), 0);
     }
+}
+#[test]
+fn recognition_language_is_limited_to_chinese_japanese_and_english() {
+    assert_eq!(
+        RecognitionLanguage::parse("zh"),
+        Ok(RecognitionLanguage::Chinese)
+    );
+    assert_eq!(
+        RecognitionLanguage::parse("ja"),
+        Ok(RecognitionLanguage::Japanese)
+    );
+    assert_eq!(
+        RecognitionLanguage::parse("en"),
+        Ok(RecognitionLanguage::English)
+    );
+    assert_eq!(
+        RecognitionLanguage::parse("auto"),
+        Err("ASR_LANGUAGE_UNSUPPORTED".to_owned())
+    );
+    assert_eq!(
+        RecognitionLanguage::parse("ko"),
+        Err("ASR_LANGUAGE_UNSUPPORTED".to_owned())
+    );
 }

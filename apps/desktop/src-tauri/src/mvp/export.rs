@@ -38,6 +38,9 @@ pub fn transcript_text(storage: &MvpStorage, meeting_id: &str) -> Result<String,
     if snapshot.meeting.state == "recording" {
         return Err("MVP_COPY_RECORDING_NOT_ALLOWED".to_owned());
     }
+    if let Some(error) = snapshot.meeting.completion_error.as_deref() {
+        return Err(format!("MVP_COPY_INCOMPLETE:{error}"));
+    }
     if snapshot.finals.is_empty() {
         return Err("MVP_COPY_EMPTY".to_owned());
     }
@@ -53,6 +56,9 @@ pub fn export_meeting(
     let snapshot = storage.snapshot(meeting_id)?;
     if snapshot.meeting.state == "recording" {
         return Err("MVP_EXPORT_RECORDING_NOT_ALLOWED".to_owned());
+    }
+    if let Some(error) = snapshot.meeting.completion_error.as_deref() {
+        return Err(format!("MVP_EXPORT_INCOMPLETE:{error}"));
     }
     let export_root = storage.default_export_dir();
     reject_reparse_path_chain(&export_root)?;
@@ -913,6 +919,37 @@ mod tests {
         assert_eq!(
             export_meeting(&storage, &writer, &meeting.id, "out").unwrap_err(),
             "MVP_EXPORT_RECORDING_NOT_ALLOWED"
+        );
+    }
+
+    #[test]
+    fn incomplete_meeting_cannot_export_or_copy_without_a_data_loss_warning() {
+        let root = temp_root("incomplete");
+        let storage = MvpStorage::open_at(root.join("db.sqlite3")).unwrap();
+        let writer = MvpStorageWriter::start(storage.clone()).unwrap();
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(FinalCandidate {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                sequence: 1,
+                revision: 1,
+                text: "saved before overload".to_owned(),
+                started_at_ms: "0".to_owned(),
+                ended_at_ms: "1000".to_owned(),
+            })
+            .unwrap();
+        writer
+            .incomplete_meeting(&meeting.id, "ASR_FINAL_OVERLOAD")
+            .unwrap();
+
+        assert_eq!(
+            export_meeting(&storage, &writer, &meeting.id, "out").unwrap_err(),
+            "MVP_EXPORT_INCOMPLETE:ASR_FINAL_OVERLOAD"
+        );
+        assert_eq!(
+            transcript_text(&storage, &meeting.id).unwrap_err(),
+            "MVP_COPY_INCOMPLETE:ASR_FINAL_OVERLOAD"
         );
     }
 

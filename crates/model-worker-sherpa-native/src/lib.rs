@@ -29,8 +29,8 @@ mod realtime;
 use descriptor::locked_engine_descriptor;
 
 pub use realtime::{
-    LOCKED_REALTIME_MAX_PCM16_BYTES, LOCKED_REALTIME_SAMPLE_RATE_HZ, LockedSherpaRealtime,
-    LockedSherpaRealtimeError, LockedSherpaRealtimePaths,
+    LOCKED_REALTIME_MAX_PCM16_BYTES, LOCKED_REALTIME_SAMPLE_RATE_HZ, LockedSherpaLanguage,
+    LockedSherpaRealtime, LockedSherpaRealtimeError, LockedSherpaRealtimePaths,
 };
 
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 16_000;
@@ -50,7 +50,7 @@ pub const LOCKED_TOKENS_SHA256_HEX: &str =
     "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc";
 // Kept in one place because every intentional assets.lock.json edit changes it.
 pub const LOCKED_ASSET_LOCK_SHA256_HEX: &str =
-    "e22adeea2dde27cab1c40fa116b665ef111b7c1b8cf24f7b7a1900a23e263181";
+    "b163d2c87d3dfb24f8fbdb0a408c6cd9057ffba29f3446f99e29e074b22cfca3";
 pub const LOCKED_PACKAGE_LOCK_SHA256_HEX: &str =
     "e01ae17e027bf7b61c8e787b1679da67bba9fb1df33726f11adbd8231b9f59ab";
 pub const LOCKED_RUNTIME_BUNDLE_SHA256_HEX: &str =
@@ -61,7 +61,7 @@ pub const LOCKED_PARAMETER_CANONICAL_JSON: &str = concat!(
     "{\"blank_penalty\":0,\"bpe_vocab\":null,\"channels\":1,",
     "\"debug\":false,\"decoding_method\":\"greedy_search\",\"feature_dim\":80,",
     "\"homophone_lexicon\":null,\"homophone_rule_fsts\":null,",
-    "\"hotwords_file\":null,\"hotwords_score\":0,\"language\":\"zh\",",
+    "\"hotwords_file\":null,\"hotwords_score\":0,\"languages\":[\"en\",\"ja\",\"zh\"],",
     "\"lm_model\":null,\"lm_scale\":1,\"max_active_paths\":4,",
     "\"max_input_bytes\":67108864,\"model_family\":\"sense_voice\",",
     "\"model_type\":null,\"modeling_unit\":null,\"num_threads\":1,",
@@ -69,7 +69,7 @@ pub const LOCKED_PARAMETER_CANONICAL_JSON: &str = concat!(
     "\"sample_rate_hz\":16000,\"telespeech_ctc\":null,\"use_itn\":true}"
 );
 pub const LOCKED_PARAMETER_SHA256_HEX: &str =
-    "0ac8669e387262648fcf05fd301a9ba798bb2822e56ec952f1e17d6c692f802e";
+    "29977f5eee13b19050f89a4bc957d43abcb76a8f17b5b5b12603b95f1cc8d08b";
 
 #[cfg(feature = "native-sherpa")]
 const RUNTIME_INVENTORY_CANONICAL_JSON: &str = concat!(
@@ -257,23 +257,27 @@ impl SherpaNativeConfig {
     /// external asset lock and intentionally require no serialization crate.
     #[must_use]
     pub fn parameter_canonical_json(&self) -> String {
+        let languages = self
+            .descriptor
+            .languages
+            .iter()
+            .map(LanguageCode::as_str)
+            .collect::<Vec<_>>()
+            .join("\",\"");
         format!(
             concat!(
                 "{{\"blank_penalty\":0,\"bpe_vocab\":null,\"channels\":1,",
                 "\"debug\":false,\"decoding_method\":\"greedy_search\",",
                 "\"feature_dim\":80,\"homophone_lexicon\":null,",
                 "\"homophone_rule_fsts\":null,\"hotwords_file\":null,",
-                "\"hotwords_score\":0,\"language\":\"{}\",\"lm_model\":null,",
+                "\"hotwords_score\":0,\"languages\":[\"{}\"],\"lm_model\":null,",
                 "\"lm_scale\":1,\"max_active_paths\":4,\"max_input_bytes\":{},",
                 "\"model_family\":\"sense_voice\",\"model_type\":null,",
                 "\"modeling_unit\":null,\"num_threads\":{},\"provider\":\"cpu\",",
                 "\"rule_fars\":null,\"rule_fsts\":null,\"sample_rate_hz\":16000,",
                 "\"telespeech_ctc\":null,\"use_itn\":{}}}"
             ),
-            self.normalized_language.as_str(),
-            self.max_input_bytes,
-            self.num_threads,
-            self.use_itn,
+            languages, self.max_input_bytes, self.num_threads, self.use_itn,
         )
     }
 
@@ -1032,7 +1036,7 @@ mod tests {
         config.expected_package_lock_sha256 = locked_digest(LOCKED_PACKAGE_LOCK_SHA256_HEX);
         config.descriptor.package_lock_sha256 = config.expected_package_lock_sha256;
         config.normalized_language = language("zh");
-        config.descriptor.languages = vec![language("zh")];
+        config.descriptor.languages = vec![language("en"), language("ja"), language("zh")];
         config.num_threads = 1;
         config.max_input_bytes = 64 * 1024 * 1024;
         config.descriptor.parameter_sha256 = config.parameter_sha256();
@@ -1298,22 +1302,28 @@ mod tests {
     }
 
     #[test]
-    fn realtime_locked_config_is_the_exact_zh_cpu_engine() {
+    fn realtime_locked_config_allows_each_declared_single_language() {
         let assets = TestAssets::new();
-        let config = realtime::locked_zh_cpu_config(&realtime_paths(&assets))
-            .expect("locked realtime config");
+        for (language, code) in [
+            (LockedSherpaLanguage::English, "en"),
+            (LockedSherpaLanguage::Japanese, "ja"),
+            (LockedSherpaLanguage::Chinese, "zh"),
+        ] {
+            let config = realtime::locked_cpu_config(&realtime_paths(&assets), language)
+                .expect("locked realtime config");
 
-        assert_eq!(config.descriptor, locked_engine_descriptor());
-        assert_eq!(config.normalized_language.as_str(), "zh");
-        assert_eq!(config.execution_provider, ExecutionProvider::Cpu);
-        assert_eq!(config.num_threads, 1);
-        assert!(config.use_itn);
-        assert_eq!(config.max_input_bytes, LOCKED_REALTIME_MAX_PCM16_BYTES);
-        assert_eq!(
-            config.expected_tokens_sha256,
-            locked_digest(LOCKED_TOKENS_SHA256_HEX)
-        );
-        assert_eq!(config.validate_locked_engine(), Ok(()));
+            assert_eq!(config.descriptor, locked_engine_descriptor());
+            assert_eq!(config.normalized_language.as_str(), code);
+            assert_eq!(config.execution_provider, ExecutionProvider::Cpu);
+            assert_eq!(config.num_threads, 1);
+            assert!(config.use_itn);
+            assert_eq!(config.max_input_bytes, LOCKED_REALTIME_MAX_PCM16_BYTES);
+            assert_eq!(
+                config.expected_tokens_sha256,
+                locked_digest(LOCKED_TOKENS_SHA256_HEX)
+            );
+            assert_eq!(config.validate_locked_engine(), Ok(()));
+        }
     }
 
     #[test]

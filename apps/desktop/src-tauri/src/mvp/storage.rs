@@ -30,6 +30,7 @@ pub struct MeetingRecord {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub last_final_sequence: u64,
+    pub completion_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,7 +107,15 @@ impl MvpStorage {
         self.with_read_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT id, state, started_at, ended_at, last_final_sequence
+                    "SELECT id, state, started_at, ended_at, last_final_sequence,
+                            (
+                                SELECT causation_id
+                                FROM mvp_events
+                                WHERE meeting_id=mvp_meetings.id
+                                  AND event_type='meeting.incomplete'
+                                ORDER BY event_sequence DESC
+                                LIMIT 1
+                            )
                      FROM mvp_meetings
                      ORDER BY CAST(last_opened_at AS INTEGER) DESC, CAST(started_at AS INTEGER) DESC
                      LIMIT 1",
@@ -173,17 +182,36 @@ impl MvpStorageWriter {
     }
 
     pub fn complete_meeting(&self, meeting_id: &str) -> Result<MeetingRecord, String> {
-        self.finish_meeting(meeting_id, "completed")
+        self.finish_meeting(meeting_id, "completed", None)
     }
 
     pub fn interrupt_meeting(&self, meeting_id: &str) -> Result<MeetingRecord, String> {
-        self.finish_meeting(meeting_id, "interrupted")
+        self.finish_meeting(meeting_id, "interrupted", None)
     }
 
-    fn finish_meeting(&self, meeting_id: &str, state: &str) -> Result<MeetingRecord, String> {
+    pub fn incomplete_meeting(
+        &self,
+        meeting_id: &str,
+        completion_error: &str,
+    ) -> Result<MeetingRecord, String> {
+        self.finish_meeting(meeting_id, "interrupted", Some(completion_error))
+    }
+
+    fn finish_meeting(
+        &self,
+        meeting_id: &str,
+        state: &str,
+        completion_error: Option<&str>,
+    ) -> Result<MeetingRecord, String> {
+        if completion_error.is_some_and(|error| {
+            error.is_empty() || error.len() > 128 || error.chars().any(char::is_control)
+        }) {
+            return Err("MVP_STORAGE_COMPLETION_ERROR_INVALID".to_owned());
+        }
         self.request(|reply| StorageRequest::FinishMeeting {
             meeting_id: meeting_id.to_owned(),
             state: state.to_owned(),
+            completion_error: completion_error.map(str::to_owned),
             reply,
         })
     }
@@ -331,6 +359,7 @@ enum StorageRequest {
     FinishMeeting {
         meeting_id: String,
         state: String,
+        completion_error: Option<String>,
         reply: SyncSender<Result<MeetingRecord, String>>,
     },
     OpenMeeting {
@@ -383,12 +412,14 @@ fn storage_writer_loop(
             StorageRequest::FinishMeeting {
                 meeting_id,
                 state,
+                completion_error,
                 reply,
             } => {
                 let _ = reply.send(finish_meeting_on_writer(
                     &mut connection,
                     &meeting_id,
                     &state,
+                    completion_error.as_deref(),
                 ));
             }
             StorageRequest::OpenMeeting { meeting_id, reply } => {
@@ -697,8 +728,12 @@ fn finish_meeting_on_writer(
     connection: &mut Connection,
     meeting_id: &str,
     state: &str,
+    completion_error: Option<&str>,
 ) -> Result<MeetingRecord, String> {
     if !matches!(state, "completed" | "interrupted") {
+        return Err("MVP_STORAGE_MEETING_STATE_INVALID".to_owned());
+    }
+    if completion_error.is_some() && state != "interrupted" {
         return Err("MVP_STORAGE_MEETING_STATE_INVALID".to_owned());
     }
     let now = now_ms_string();
@@ -723,6 +758,15 @@ fn finish_meeting_on_writer(
         meeting_id,
         &now,
     )?;
+    if let Some(completion_error) = completion_error {
+        insert_event(
+            &tx,
+            Some(meeting_id),
+            "meeting.incomplete",
+            completion_error,
+            &now,
+        )?;
+    }
     tx.commit()
         .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
     meeting_on_connection(connection, meeting_id)?
@@ -915,7 +959,15 @@ fn meeting_on_connection(
 ) -> Result<Option<MeetingRecord>, String> {
     connection
         .query_row(
-            "SELECT id, state, started_at, ended_at, last_final_sequence
+            "SELECT id, state, started_at, ended_at, last_final_sequence,
+                    (
+                        SELECT causation_id
+                        FROM mvp_events
+                        WHERE meeting_id=mvp_meetings.id
+                          AND event_type='meeting.incomplete'
+                        ORDER BY event_sequence DESC
+                        LIMIT 1
+                    )
              FROM mvp_meetings WHERE id=?1",
             params![meeting_id],
             meeting_from_row,
@@ -943,7 +995,15 @@ fn snapshot_from_transaction(
 ) -> Result<MeetingSnapshot, String> {
     let meeting = tx
         .query_row(
-            "SELECT id, state, started_at, ended_at, last_final_sequence
+            "SELECT id, state, started_at, ended_at, last_final_sequence,
+                    (
+                        SELECT causation_id
+                        FROM mvp_events
+                        WHERE meeting_id=mvp_meetings.id
+                          AND event_type='meeting.incomplete'
+                        ORDER BY event_sequence DESC
+                        LIMIT 1
+                    )
              FROM mvp_meetings WHERE id=?1",
             params![meeting_id],
             meeting_from_row,
@@ -1099,6 +1159,7 @@ fn meeting_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingRecord> 
         started_at: row.get(2)?,
         ended_at: row.get(3)?,
         last_final_sequence: u64::try_from(last).unwrap_or(0),
+        completion_error: row.get(5)?,
     })
 }
 
@@ -1148,11 +1209,12 @@ pub fn now_ms_string() -> String {
 
 pub fn semantic_digest(meeting: &MeetingRecord, finals: &[DurableFinal]) -> String {
     let mut material = format!(
-        "{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n",
         meeting.id,
         meeting.state,
         meeting.started_at,
-        meeting.ended_at.as_deref().unwrap_or("")
+        meeting.ended_at.as_deref().unwrap_or(""),
+        meeting.completion_error.as_deref().unwrap_or("")
     );
     for final_segment in finals {
         material.push_str(&format!(
@@ -1470,6 +1532,37 @@ mod tests {
         assert_eq!(snapshot.meeting.state, "interrupted");
         assert_eq!(snapshot.finals.len(), 1);
         assert_eq!(snapshot.finals[0].text, "survives");
+    }
+
+    #[test]
+    fn incomplete_meeting_persists_the_data_loss_reason() {
+        let (storage, writer) = storage_and_writer("incomplete-meeting");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        let incomplete = writer
+            .incomplete_meeting(&meeting.id, "ASR_FINAL_OVERLOAD")
+            .unwrap();
+        assert_eq!(incomplete.state, "interrupted");
+        assert_eq!(
+            incomplete.completion_error.as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
+        );
+        drop(writer);
+
+        let reopened = storage.snapshot(&meeting.id).unwrap();
+        assert_eq!(reopened.meeting.state, "interrupted");
+        assert_eq!(
+            reopened.meeting.completion_error.as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
+        );
+        assert_eq!(
+            storage
+                .recent_meeting()
+                .unwrap()
+                .unwrap()
+                .completion_error
+                .as_deref(),
+            Some("ASR_FINAL_OVERLOAD")
+        );
     }
 
     #[test]

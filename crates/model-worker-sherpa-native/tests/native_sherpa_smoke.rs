@@ -8,7 +8,7 @@ use std::sync::Arc;
 use meetingrelay_model_worker_contract::Sha256Digest;
 use meetingrelay_model_worker_sherpa_native::{
     LOCKED_ASSET_LOCK_SHA256_HEX, LOCKED_MODEL_SHA256_HEX, LOCKED_TOKENS_SHA256_HEX,
-    LockedSherpaRealtime, LockedSherpaRealtimePaths, sha256_file,
+    LockedSherpaLanguage, LockedSherpaRealtime, LockedSherpaRealtimePaths, sha256_file,
 };
 
 const SAMPLE_RATE_HZ: u32 = 16_000;
@@ -48,6 +48,27 @@ fn native_sense_voice_smoke_returns_nonempty_final() {
         "native smoke transcript must be nonempty"
     );
     eprintln!("SHERPA_SMOKE_NONEMPTY_TRANSCRIPT_BYTES={transcript_bytes}");
+}
+
+#[test]
+#[ignore = "requires explicitly provisioned sherpa runtime, SenseVoice model, tokens, and lock"]
+fn native_sense_voice_prepares_all_selectable_language_profiles() {
+    let paths = LockedSherpaRealtimePaths {
+        model_path: required_path("MEETINGRELAY_SHERPA_MODEL"),
+        tokens_path: required_path("MEETINGRELAY_SHERPA_TOKENS"),
+        runtime_lib_dir: required_path("SHERPA_ONNX_LIB_DIR"),
+        asset_lock_path: required_path("MEETINGRELAY_SHERPA_LOCK"),
+        package_lock_path: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+    };
+
+    for language in [
+        LockedSherpaLanguage::Chinese,
+        LockedSherpaLanguage::Japanese,
+        LockedSherpaLanguage::English,
+    ] {
+        LockedSherpaRealtime::prepare_local_mvp_with_language(paths.clone(), language)
+            .expect("prepare selectable language profile");
+    }
 }
 
 fn assert_locked_file(path: &Path, expected: &str, label: &str) {

@@ -412,6 +412,19 @@ impl AudioCapture {
         !self.stopped
     }
 
+    #[cfg(test)]
+    pub(crate) fn stopped_for_test() -> Self {
+        let (status_sender, _statuses) = sync_channel(1);
+        Self {
+            #[cfg(windows)]
+            streams: None,
+            active_sources: Vec::new(),
+            status_sender,
+            metrics: AudioCaptureMetrics::default(),
+            stopped: true,
+        }
+    }
+
     /// Stop both streams immediately. Dropping the handle has the same effect.
     pub fn stop(mut self) {
         self.stop_inner();

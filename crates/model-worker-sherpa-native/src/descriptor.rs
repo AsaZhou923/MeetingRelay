@@ -25,7 +25,11 @@ pub(crate) fn locked_engine_descriptor() -> EngineDescriptor {
         parameter_sha256: locked_digest(LOCKED_PARAMETER_SHA256_HEX),
         execution_provider: ExecutionProvider::Cpu,
         quantization: locked_identifier(QUANTIZATION),
-        languages: vec![locked_language("zh")],
+        languages: vec![
+            locked_language("en"),
+            locked_language("ja"),
+            locked_language("zh"),
+        ],
         streaming: true,
         offline: true,
     }
