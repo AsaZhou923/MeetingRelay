@@ -1,8 +1,0 @@
-{
-  "artifact_scope": "candidate-input",
-  "formal_claims": "none",
-  "schema_version": "1.0",
-  "schemas": [
-    "meetingrelay.model-worker.v1"
-  ]
-}

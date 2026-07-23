@@ -15,7 +15,7 @@
 *.woff2 binary
 *.pdf binary
 
-# These are byte-sealed upstream evidence snapshots. Preserve their exact line
-# endings and permit an upstream trailing blank line without weakening checks
-# for the rest of the repository.
+# These locked upstream license snapshots are hashed by assets.lock.json.
+# Preserve their exact line endings and permit an upstream trailing blank line
+# without weakening whitespace checks for the rest of the repository.
 tools/sherpa-native/licenses/*.txt -text whitespace=-blank-at-eof

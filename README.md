@@ -1,48 +1,45 @@
 # MeetingRelay
 
-MeetingRelay 是一个面向个人使用的 Windows 本地会议转写工具。当前目标不是建立企业审计或形式化供应链证明，而是让开发者本人能够稳定完成一场真实会议：选择音频、实时看到文字、结束后保存和导出，并尽量不因普通错误丢失已经生成的结果。
+MeetingRelay 是一个面向个人使用的 Windows 本地会议转写工具。当前 main 分支只保留个人 MVP 需要的产品代码、启动脚本、打包脚本和最小验证；Phase 0、attestation、benchmark、候选引擎和历史实验代码已经归档到 [`archive/full-repository-before-mvp-trim-2026-07-23`](https://github.com/AsaZhou923/MeetingRelay/tree/archive/full-repository-before-mvp-trim-2026-07-23)。
 
-## 当前可以做什么
+## 当前实际能做什么
 
-- 在 Windows 上通过 Tauri 桌面应用枚举并选择系统输出和麦克风，再进行本地双源采集；默认设备会明确标出。
-- 使用本地 Sherpa / SenseVoice 中文 CPU 模型进行真实离线转写。
-- 在界面中查看增量文本、已保存 final、音频状态、队列状态和错误。
-- 开始、暂停、继续和停止同一场会议；暂停期间音频不会进入 DSP/ASR，final 仅在 SQLite/WAL 提交成功后标记为已保存。
-- 复制数据库中的全部已保存转写，或重新打开最近一次会议，并从同一快照导出 JSON、Markdown 和 TXT。
-- 在异常退出后恢复已经提交的 final；未提交尾段不会伪装成已保存结果。
-- Sherpa 推理遇到可恢复错误时会在提交前自动重试一次；已结束的推理线程会在下一场会议前重建。
-- 生成包含程序、锁定模型、运行时和相对路径启动器的个人 Windows Release 目录，无需从源码目录启动。
+- 在 Windows 桌面应用中选择系统输出和麦克风输入。
+- 开始、暂停、继续、停止一场会议录音与本地转写。
+- 使用锁定的 Sherpa / SenseVoice 本地 ASR 作为当前唯一主引擎。
+- 在 UI 中实时查看增量文本、音频状态、队列状态和错误提示。
+- 将已完成文本保存到本地 SQLite/WAL，并在异常退出后恢复已提交的 final 文本。
+- 重新打开最近会议，复制全部文本，导出 JSON、Markdown 和 TXT。
+- 构建一个同机使用的 Windows personal release 目录，包含程序、锁定模型、运行时和相对路径启动器。
 
-这些是已接入桌面产品的运行链路，不是 mock 或 contract-only 声明。
+这些能力已经接入桌面产品链路。仓库里剩余的 JS/PowerShell 工具主要用于资产物化、启动契约、发布契约和前端契约测试。
 
 ## 快速启动
 
-要求：Windows、Rust 工具链、Node.js/pnpm，以及已缓存的锁定 Sherpa 资产和运行时。
+要求：Windows、Rust 工具链、Node.js/pnpm，以及可获取的锁定 Sherpa 资产和运行时。
 
 ```powershell
-# 只检查资产、运行时和前端，不打开应用
+pnpm install
+
+# 只检查依赖、资产和启动契约，不打开应用
 powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -DryRun
 
 # 启动本地桌面应用
 powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1
 ```
 
-首次缺少锁定资产或 pnpm 缓存时，才显式允许下载：
+首次缺少锁定资产或 pnpm 缓存时，显式允许下载：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -AllowDownload
 ```
 
-更多启动器说明见 [tools/mvp/README.md](tools/mvp/README.md)。
-
-也可以生成并运行个人 Release 目录：
+生成个人 release：
 
 ```powershell
 pnpm mvp:release:personal
 powershell -ExecutionPolicy Bypass -File target/mvp/personal-release/MeetingRelay.same-machine.ps1
 ```
-
-该目录用于开发者本人本机使用和内部评估；它不是签名安装包，也没有获得模型或运行时再分发授权。
 
 ## 常用验证
 
@@ -57,16 +54,17 @@ pnpm mvp:release:personal:test
 
 ## 当前限制
 
-- 当前个人 MVP 固定同时采集系统输出和麦克风；单一来源模式暂缓，只有真实使用证明需要时再加入。
-- 运行中物理设备热插拔不会自动切换设备；应用会保留已提交文本并提示停止、重新选择和重新开始，物理拔插回归尚未执行。
-- Sherpa / SenseVoice 是唯一产品 ASR；Whisper 和 FunASR 只有工具、探针或离线契约，未接入桌面转写。
-- 已有一次超过 15 分钟的真机 soak 记录，但尚未完成约 60 分钟真实会议验收。
-- 暂停/继续、全量复制、最近会议重开和同机个人 Release 已通过短时真机 smoke，但尚未做物理设备拔插和真实长会压力回归。
-- 个人 Release 是约 295 MB 的目录式可执行程序，不是 MSI/NSIS 安装包；签名和对外可重复分发属于 Deferred。
-- fallback 未实现；当前 Sherpa 的一次自动恢复和下场会议前重建已经满足个人 MVP，只有真实故障证明不足时才增加一个 fallback。
+- 目前只以 Sherpa / SenseVoice 作为产品 ASR；Whisper、FunASR 和更复杂候选评测不在 main 的 MVP 门禁中。
+- release 是同机个人使用目录，不是签名安装包，也不声明对外再分发授权。
+- 设备热插拔、长时间真实会议、延迟和准确率仍需要在开发者自己的电脑上继续做真实验收。
+- 尚未加入独立 fallback；只有真实故障证明当前 Sherpa 恢复能力不足时再增加。
+- main 分支不再维护企业审计、完整 provenance、formal evidence 或每个微小 schema 的文档门禁。
 
-## 文档
+## 仓库结构
 
-核心项目文档位于 `E:\Project Code\docs\01 - Projects\MeetingRelay`，其中任务状态、实现状态和测试状态是当前权威来源。
-
-原顶层 README 已原样保存在 [README.phase0-archive.md](README.phase0-archive.md)。Phase 0、attestation、benchmark 和 provenance 工具继续保留，但属于 Optional Hardening / Archived Phase 0，不阻塞个人 MVP。
+- `apps/desktop`：Tauri 桌面应用和前端契约。
+- `crates/model-worker-sherpa-native`：当前产品 ASR 后端。
+- `crates/model-worker-contract`：ASR 后端内部接口类型。
+- `tools/sherpa-native`：锁定 Sherpa 资产校验、物化和运行时 staging。
+- `tools/mvp`：个人启动和发布脚本及其契约测试。
+- `.github/workflows/mvp.yml`：main/PR 唯一产品 CI。

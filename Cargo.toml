@@ -1,10 +1,8 @@
 [workspace]
 members = [
   "apps/desktop/src-tauri",
-  "crates/benchmark-contract",
   "crates/model-worker-contract",
   "crates/model-worker-sherpa-native",
-  "crates/model-worker-whisper-native",
 ]
 resolver = "3"
 

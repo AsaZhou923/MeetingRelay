@@ -1,2 +1,0 @@
-{"action":"delta","chunk":"fixture-token-1","fixture_id":"FX-UND-CAL-001-v1","logical_offset_ns":"0","logical_sequence":"1","schema_version":"1.0"}
-{"action":"complete","chunk":"fixture-token-1 fixture-token-2","fixture_id":"FX-UND-CAL-001-v1","logical_offset_ns":"1000000","logical_sequence":"2","schema_version":"1.0"}

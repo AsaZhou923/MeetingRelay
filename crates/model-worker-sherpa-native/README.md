@@ -1,154 +1,31 @@
-# MeetingRelay sherpa-onnx native backend
+# MeetingRelay Sherpa backend
 
-This crate is the narrow native ASR adapter for the model-worker contract. It
-keeps sherpa-onnx and its native FFI dependencies outside the transport-neutral
-contract crate.
+This crate is the only ASR engine kept on `main` for the personal desktop MVP.
+It prepares a local sherpa-onnx SenseVoice runtime and exposes a small realtime
+API to the Tauri app:
 
-The default feature set is empty so deterministic unit tests can exercise the
-adapter without loading native libraries. Production construction fails
-immediately with an explicit configuration error unless `native-sherpa` is
-enabled. With that feature enabled, `SHERPA_ONNX_LIB_DIR` must point at the
-already materialized, pinned sherpa-onnx v1.13.4 shared-runtime `lib`
-directory. Cargo's `links` override suppresses the upstream dependency build
-script; MeetingRelay's build gate verifies and stages the sealed runtime, and
-neither the adapter nor its build path downloads anything.
+- `LockedSherpaRealtime::prepare_local_mvp(...)` verifies local model, token,
+  runtime, asset-lock, and workspace lock-file inputs.
+- `transcribe_mono_16khz_pcm16(...)` accepts bounded mono 16 kHz PCM16 segments
+  and returns transcript text.
 
-`Prepare` is the readiness boundary. Its first successful call hashes the
-committed asset lock, workspace `Cargo.lock`, SenseVoice model, tokens, and all
-seven files in the exact runtime inventory, then constructs the native
-recognizer. Only after both verification and initialization succeed may the
-session report `Prepared { ready: true }`. A later `Prepare` is idempotent and
-does not rehash the 239 MB model or reconstruct the recognizer. `execute`
-validates canonical PCM and performs inference only; it has no cold-start or
-network path. Asset and initialization failures become sanitized
-`PreparationFailed` outcomes (`SHERPA_ASSET_MISMATCH` or
-`SHERPA_INIT_FAILED`).
+The archived Phase 0 candidate builders, sidecar runners, formal evidence, and
+quality/attestation CLIs are intentionally not part of this crate on `main`.
+They remain recoverable from the archive branch created before the MVP trim.
 
-Production configuration requires absolute model and tokens paths. At the start
-of `Prepare`, both are canonicalized to stable absolute final targets and the
-resolved paths replace the configured values used by native initialization. On
-Windows, those targets are opened with read-only sharing before hashing. The
-same file handles remain open through native initialization and for the backend
-lifetime, so a writer, delete, path replacement, or CWD change cannot redirect
-the bytes between verification and the native library reopening the paths. If
-another writer is already present, `Prepare` fails closed. An initialization
-failure deliberately drops the handles; a later recovery `Prepare` resolves,
-reopens, and rehashes all assets. Only a successful `Prepare` enables the
-no-rehash idempotent path.
+## Native smoke test
 
-The adapter also fail-closes descriptor drift for the locked candidate:
-sherpa-onnx `1.13.4`, shared CPU runtime/ONNX Runtime `1.27.0`, SenseVoice
-2024 INT8, and `LicenseRef-FunASR-Model-1.1-Internal-Evaluation`. The license
-is accepted only for internal Phase-0 evaluation; distribution approval remains
-pending.
-
-Result provenance is bound to the bytes verified during `Prepare`: model,
-asset-lock manifest, package lock, and the complete runtime-inventory digest.
-Production configuration also pins the model and tokens hashes instead of
-accepting caller-selected values. The canonical parameter digest covers mono
-16 kHz input, feature dimension 80, CPU provider, one thread, debug disabled,
-Chinese language, ITN, the 64 MiB input bound, SenseVoice model family, greedy
-search, four active paths, zero blank penalty, and explicitly disabled
-hotwords, rule FST/FAR, external LM, homophone replacement, model type,
-modeling unit, BPE vocabulary, and TeleSpeech CTC paths.
-
-## Explicit native smoke
-
-The ignored integration smoke uses the official safe Rust API through a
-`DirectWorkerSession`. It requires these environment variables:
-
-- `MEETINGRELAY_SHERPA_MODEL`: SenseVoice ONNX model path
-- `MEETINGRELAY_SHERPA_TOKENS`: matching tokens file path
-- `MEETINGRELAY_SHERPA_WAV`: mono 16 kHz PCM16 WAV path
-- `MEETINGRELAY_SHERPA_LOCK`: committed `assets.lock.json` path
-- `SHERPA_ONNX_LIB_DIR`: exact seven-file shared-runtime `lib` directory
-
-The smoke binds package provenance to the workspace `Cargo.lock`; it does not
-accept a package-lock environment override.
-
-Materialize the sealed archives and stage their DLLs beside Cargo's test
-executables before running the smoke:
+The ignored smoke test exercises the product path directly:
 
 ```powershell
-$assets = ./tools/sherpa-native/materialize.ps1 `
-  -CacheRoot target/sherpa-native `
-  -AllowDownload
-foreach ($line in $assets) {
-  if ($line -match '^([A-Z0-9_]+)=(.*)$') {
-    Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
-  }
-}
-./tools/sherpa-native/stage-runtime.ps1 `
-  -LibDir $env:SHERPA_ONNX_LIB_DIR `
-  -Configuration Debug
-cargo test -p meetingrelay-model-worker-sherpa-native --features native-sherpa --test native_sherpa_smoke -- --ignored --exact native_sense_voice_smoke_returns_nonempty_final
+$env:MEETINGRELAY_SHERPA_MODEL = "...\model.int8.onnx"
+$env:MEETINGRELAY_SHERPA_TOKENS = "...\tokens.txt"
+$env:MEETINGRELAY_SHERPA_LOCK = "...\assets.lock.json"
+$env:SHERPA_ONNX_LIB_DIR = "...\runtime\lib"
+$env:MEETINGRELAY_SHERPA_WAV = "...\smoke.wav"
+cargo test -p meetingrelay-model-worker-sherpa-native --features native-sherpa --test native_sherpa_smoke -- --ignored --nocapture
 ```
 
-The explicit copy places the pinned DLLs beside Cargo's integration-test
-executable. This prevents Windows' system-directory search precedence from
-selecting an incompatible inbox `onnxruntime.dll` before entries on `PATH`.
-
-The smoke verifies the lock/model/tokens/WAV/runtime digests, asserts that
-`Prepare` really reached Ready, inference completes with a non-empty final
-result, and replaying the same flush does not invoke the backend again. It makes
-no transcript accuracy,
-language-detection, quality, latency, or throughput claim.
-
-## Release candidate conformance host
-
-`meetingrelay-sherpa-candidate-host.exe` remains a provenance-only binary and
-must not import sherpa or ONNX Runtime DLLs. The distinct
-`meetingrelay-sherpa-candidate-execution-host.exe` is the Release executable
-material for candidate-input plans. It runs the locked backend through a
-`DirectWorkerSession`; the semantic transport is always `InProcess`. The Node
-runner's child-process boundary only supervises timeout, abnormal exit, stderr,
-and bounded output. It is not model-worker IPC or a sidecar.
-
-After materializing the sealed assets and staging the Release DLLs, run the
-actual host through the validating supervisor:
-
-```powershell
-cargo build --release --offline --locked `
-  -p meetingrelay-model-worker-sherpa-native `
-  --features native-sherpa `
-  --bin meetingrelay-sherpa-candidate-execution-host
-./tools/sherpa-native/stage-runtime.ps1 `
-  -LibDir $env:SHERPA_ONNX_LIB_DIR `
-  -Configuration Release
-node ./tools/sherpa-native/validate-candidate-conformance.mjs `
-  ./target/release/meetingrelay-sherpa-candidate-execution-host.exe `
-  ./tools/sherpa-native/candidate-schema-registry.json `
-  $env:MEETINGRELAY_SHERPA_MODEL `
-  $env:MEETINGRELAY_SHERPA_TOKENS `
-  $env:SHERPA_ONNX_LIB_DIR `
-  $env:MEETINGRELAY_SHERPA_LOCK `
-  ./Cargo.lock `
-  $env:MEETINGRELAY_SHERPA_WAV
-```
-
-The host executes one real locked inference and assertive handshake, prepare,
-audio/gap, final replay, cancellation, restart replay, heartbeat/progress,
-bounded-credit, stable-failure, provenance, and Rust-panic-containment lanes.
-Before it may emit the record, it verifies the four locked runtime DLLs staged
-beside its exact executable and binds the loaded `sherpa-onnx-c-api.dll` and
-`onnxruntime.dll` module paths, sizes, and hashes to those executable-directory
-files. The Node supervisor independently verifies the staged DLL identities
-before and after execution and restricts the child `PATH` to the executable
-directory plus `%SystemRoot%\System32`. CI additionally observes the live
-process modules through the hold hook below; the three checks protect separate
-parts of the Windows loader boundary.
-Its canonical record contains the final transcript digest and UTF-8 byte count,
-never the transcript text, paths, timings, or run IDs. The authority remains
-`formal_claims=none` and `production_evidence=false`; resource/performance,
-onsite quality, native access-violation handling, and process-abort isolation
-remain explicitly unmeasured or untested.
-
-For CI-only loaded-module inspection, both the native smoke and the Release
-execution host support the pair
-`MEETINGRELAY_SHERPA_MODULE_PROBE_READY_FILE` and
-`MEETINGRELAY_SHERPA_MODULE_PROBE_HOLD_MS`. After successful `Prepare`, the
-smoke writes its decimal PID (without a newline) to the ready file and pauses
-for 1--15000 ms. This lets an external PowerShell probe verify the loaded sherpa
-and ONNX Runtime module paths and hashes. The execution host uses the same hook
-before conformance execution. Joint absence has zero effect; partial or
-malformed probe configuration fails closed without emitting a record.
+The test proves the configured local model/runtime can produce non-empty text
+from a real WAV fixture. It is not an accuracy benchmark or enterprise audit
+artifact.

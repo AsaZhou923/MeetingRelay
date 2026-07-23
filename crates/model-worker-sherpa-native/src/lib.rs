@@ -1,9 +1,8 @@
-//! Offline sherpa-onnx backend for the MeetingRelay model-worker contract.
+//! Offline sherpa-onnx backend for MeetingRelay's local desktop MVP.
 //!
-//! `Prepare` is the readiness boundary: it verifies every sealed local asset
-//! and constructs the recognizer before the session may report Ready. Backend
-//! execution therefore performs only canonical audio validation and inference;
-//! it never hides cold initialization behind an admitted action.
+//! The product boundary is [`LockedSherpaRealtime`]: it verifies the local
+//! model/runtime assets once, then transcribes bounded mono 16 kHz PCM16
+//! segments for the desktop capture loop.
 
 use std::fmt;
 #[cfg(feature = "native-sherpa")]
@@ -23,50 +22,15 @@ use meetingrelay_model_worker_contract::{
 };
 use sha2::{Digest, Sha256};
 
-mod candidate_builder_input;
-#[cfg(feature = "native-sherpa")]
-mod candidate_execution;
-#[cfg(feature = "native-fault-fixture")]
-mod candidate_fault;
-#[cfg(feature = "native-quality-sample")]
-mod candidate_quality_sample;
-#[cfg(feature = "native-quality-shard")]
-mod candidate_quality_shard;
+mod descriptor;
 mod realtime;
-mod worker_provenance;
 
-pub use candidate_builder_input::{
-    LOCKED_CANDIDATE_BUILDER_INPUT_SHA256_HEX, LOCKED_CANDIDATE_ID,
-    LOCKED_MODEL_LICENSE_TEXT_SHA256_HEX, locked_candidate_builder_input_json_bytes,
-    locked_engine_descriptor,
-};
-#[cfg(feature = "native-sherpa")]
-pub use candidate_execution::{
-    LOCKED_CONFORMANCE_WAV_SHA256_HEX, NativeCandidateExecutionError,
-    NativeCandidateExecutionInput, run_locked_native_candidate_conformance,
-};
-#[cfg(all(feature = "native-sherpa", feature = "native-fault-fixture"))]
-pub use candidate_fault::run_locked_native_candidate_fault;
-#[cfg(feature = "native-fault-fixture")]
-pub use candidate_fault::{NATIVE_CANDIDATE_FAULT_CHECKPOINT_KIND, NativeCandidateFaultMode};
-#[cfg(feature = "native-quality-sample")]
-pub use candidate_quality_sample::{
-    NativeCandidateQualitySampleError, NativeCandidateQualitySampleIdentity,
-    NativeCandidateQualitySampleInput, run_locked_native_candidate_quality_sample,
-};
-#[cfg(feature = "native-quality-shard")]
-pub use candidate_quality_shard::{
-    NativeCandidateQualityShardError, NativeCandidateQualityShardInput,
-    run_locked_native_candidate_quality_shard,
-};
+#[cfg(any(feature = "native-sherpa", test))]
+use descriptor::locked_engine_descriptor;
+
 pub use realtime::{
     LOCKED_REALTIME_MAX_PCM16_BYTES, LOCKED_REALTIME_SAMPLE_RATE_HZ, LockedSherpaRealtime,
     LockedSherpaRealtimeError, LockedSherpaRealtimePaths,
-};
-pub use worker_provenance::{
-    LOCKED_SCHEMA_REGISTRY_BYTES, LOCKED_WORKER_ID, MAX_SCHEMA_REGISTRY_BYTES,
-    WorkerProvenanceError, locked_schema_registry_sha256, locked_worker_manifest,
-    locked_worker_manifest_projection_json_bytes,
 };
 
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 16_000;
@@ -92,7 +56,7 @@ pub const LOCKED_PACKAGE_LOCK_SHA256_HEX: &str =
 pub const LOCKED_RUNTIME_BUNDLE_SHA256_HEX: &str =
     "0682618f660a2a9f2278d99decb77624253aadde60e8199a9b07813b8d843317";
 
-/// Canonical JSON material hashed by the sealed Phase-0 parameter lock.
+/// Canonical JSON material hashed by the locked local engine parameters.
 pub const LOCKED_PARAMETER_CANONICAL_JSON: &str = concat!(
     "{\"blank_penalty\":0,\"bpe_vocab\":null,\"channels\":1,",
     "\"debug\":false,\"decoding_method\":\"greedy_search\",\"feature_dim\":80,",
@@ -181,8 +145,8 @@ const EMPTY_RESULT: &str = "SHERPA_EMPTY_RESULT";
 
 /// Complete, offline-only configuration for one SenseVoice backend instance.
 ///
-/// Every expected provenance digest must match its descriptor field. Production
-/// construction additionally pins the official candidate digests and requires
+/// Every expected model/runtime digest must match its descriptor field. Product
+/// construction additionally pins the official engine digests and requires
 /// absolute model/tokens paths; `Prepare` resolves and verifies the actual
 /// local bytes before creating the recognizer. `execution_provider` is
 /// restricted to [`ExecutionProvider::Cpu`].
@@ -245,7 +209,7 @@ impl SherpaNativeConfig {
             || self.descriptor.model_license_id.as_str() != MODEL_LICENSE_ID
             || self.descriptor.quantization.as_str() != QUANTIZATION
         {
-            return Err(SherpaConfigError::CandidateIdentityConflict);
+            return Err(SherpaConfigError::EngineIdentityConflict);
         }
         if self.execution_provider != ExecutionProvider::Cpu
             || self.descriptor.execution_provider != ExecutionProvider::Cpu
@@ -319,7 +283,7 @@ impl SherpaNativeConfig {
     }
 
     #[cfg(any(feature = "native-sherpa", test))]
-    fn validate_locked_candidate(&self) -> Result<(), SherpaConfigError> {
+    fn validate_locked_engine(&self) -> Result<(), SherpaConfigError> {
         self.validate()?;
         let locked_descriptor = locked_engine_descriptor();
         if self.descriptor != locked_descriptor
@@ -332,34 +296,7 @@ impl SherpaNativeConfig {
             || !self.model_path.is_absolute()
             || !self.tokens_path.is_absolute()
         {
-            return Err(SherpaConfigError::LockedCandidateConflict);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "native-quality-sample")]
-    fn validate_locked_quality_candidate(&self) -> Result<(), SherpaConfigError> {
-        self.validate()?;
-        let locked_descriptor = locked_engine_descriptor();
-        let mut base_descriptor = self.descriptor.clone();
-        base_descriptor.parameter_sha256 = locked_descriptor.parameter_sha256;
-        base_descriptor.languages = locked_descriptor.languages.clone();
-        if base_descriptor != locked_descriptor
-            || self.expected_model_sha256 != locked_descriptor.model_sha256
-            || self.expected_tokens_sha256 != locked_digest(LOCKED_TOKENS_SHA256_HEX)
-            || self.expected_runtime_sha256 != locked_descriptor.runtime_sha256
-            || self.expected_asset_lock_sha256 != locked_descriptor.model_manifest_sha256
-            || self.expected_package_lock_sha256 != locked_descriptor.package_lock_sha256
-            || !matches!(self.normalized_language.as_str(), "zh" | "ja" | "en")
-            || self.descriptor.languages.len() != 1
-            || self.descriptor.languages[0] != self.normalized_language
-            || self.num_threads != 1
-            || !self.use_itn
-            || self.max_input_bytes != 64 * 1024 * 1024
-            || !self.model_path.is_absolute()
-            || !self.tokens_path.is_absolute()
-        {
-            return Err(SherpaConfigError::LockedCandidateConflict);
+            return Err(SherpaConfigError::LockedEngineConflict);
         }
         Ok(())
     }
@@ -375,14 +312,14 @@ pub enum SherpaConfigError {
     RuntimeDigestConflict,
     AssetLockDigestConflict,
     PackageLockDigestConflict,
-    CandidateIdentityConflict,
+    EngineIdentityConflict,
     UnsupportedExecutionProvider,
     InvalidEngineDescriptor,
     LanguageNotDeclared,
     InvalidThreadCount,
     InvalidInputBound,
     ParameterDigestConflict,
-    LockedCandidateConflict,
+    LockedEngineConflict,
 }
 
 impl fmt::Display for SherpaConfigError {
@@ -399,7 +336,7 @@ impl fmt::Display for SherpaConfigError {
             Self::PackageLockDigestConflict => {
                 "package-lock digest conflicts with the engine descriptor"
             }
-            Self::CandidateIdentityConflict => {
+            Self::EngineIdentityConflict => {
                 "engine, runtime, model, license, or quantization identity differs from the lock"
             }
             Self::UnsupportedExecutionProvider => "only the CPU execution provider is supported",
@@ -408,7 +345,7 @@ impl fmt::Display for SherpaConfigError {
             Self::InvalidThreadCount => "the native thread count is outside the supported range",
             Self::InvalidInputBound => "the backend input bound is outside the supported range",
             Self::ParameterDigestConflict => "adapter parameters differ from the descriptor digest",
-            Self::LockedCandidateConflict => "configuration differs from the sealed candidate",
+            Self::LockedEngineConflict => "configuration differs from the sealed local engine",
         })
     }
 }
@@ -449,7 +386,7 @@ impl SherpaNativeBackend {
         }
         #[cfg(feature = "native-sherpa")]
         {
-            config.validate_locked_candidate()?;
+            config.validate_locked_engine()?;
             Ok(Self {
                 config,
                 port: default_inference_port(),
@@ -470,19 +407,6 @@ impl SherpaNativeBackend {
             assets_verified: false,
             initialized: false,
             verification: VerificationMode::LocalMvp,
-            sealed_model_assets: None,
-        })
-    }
-
-    #[cfg(feature = "native-quality-sample")]
-    fn new_quality_sample(config: SherpaNativeConfig) -> Result<Self, SherpaConfigError> {
-        config.validate_locked_quality_candidate()?;
-        Ok(Self {
-            config,
-            port: default_inference_port(),
-            assets_verified: false,
-            initialized: false,
-            verification: VerificationMode::LockedProduction,
             sealed_model_assets: None,
         })
     }
@@ -514,14 +438,6 @@ impl SherpaNativeBackend {
             .recognize(&samples)
             .map_err(|_| AdapterFailure::ResultUnavailable)?
             .ok_or(AdapterFailure::ResultUnavailable)
-    }
-
-    #[cfg(feature = "native-quality-sample")]
-    fn recognize_quality_sample_text(
-        &mut self,
-        chunks: &[AudioChunk],
-    ) -> Result<String, AdapterFailure> {
-        self.recognize_text(chunks)
     }
 
     #[cfg(test)]
@@ -1382,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_locked_config_is_the_exact_zh_cpu_candidate() {
+    fn realtime_locked_config_is_the_exact_zh_cpu_engine() {
         let assets = TestAssets::new();
         let config = realtime::locked_zh_cpu_config(&realtime_paths(&assets))
             .expect("locked realtime config");
@@ -1397,7 +1313,7 @@ mod tests {
             config.expected_tokens_sha256,
             locked_digest(LOCKED_TOKENS_SHA256_HEX)
         );
-        assert_eq!(config.validate_locked_candidate(), Ok(()));
+        assert_eq!(config.validate_locked_engine(), Ok(()));
     }
 
     #[test]
@@ -1573,22 +1489,22 @@ mod tests {
     fn production_lock_rejects_caller_selected_provenance() {
         let assets = TestAssets::new();
         let locked = locked_config(&assets);
-        assert_eq!(locked.validate_locked_candidate(), Ok(()));
+        assert_eq!(locked.validate_locked_engine(), Ok(()));
 
         let mut caller_selected = locked;
         caller_selected.expected_asset_lock_sha256 = digest(77);
         caller_selected.descriptor.model_manifest_sha256 = digest(77);
         assert_eq!(caller_selected.validate(), Ok(()));
         assert_eq!(
-            caller_selected.validate_locked_candidate(),
-            Err(SherpaConfigError::LockedCandidateConflict)
+            caller_selected.validate_locked_engine(),
+            Err(SherpaConfigError::LockedEngineConflict)
         );
 
         let mut relative = locked_config(&assets);
         relative.model_path = PathBuf::from("model.int8.onnx");
         assert_eq!(
-            relative.validate_locked_candidate(),
-            Err(SherpaConfigError::LockedCandidateConflict)
+            relative.validate_locked_engine(),
+            Err(SherpaConfigError::LockedEngineConflict)
         );
     }
 
@@ -1621,20 +1537,20 @@ mod tests {
     }
 
     #[test]
-    fn candidate_identity_and_parameter_drift_are_rejected() {
+    fn engine_identity_and_parameter_drift_are_rejected() {
         let assets = TestAssets::new();
         let mut identity_drift = config(&assets);
         identity_drift.descriptor.runtime_version = id("1.17.1");
         assert_eq!(
             identity_drift.validate(),
-            Err(SherpaConfigError::CandidateIdentityConflict)
+            Err(SherpaConfigError::EngineIdentityConflict)
         );
 
         let mut stale_license = config(&assets);
         stale_license.descriptor.model_license_id = id("LicenseRef-FunASR-Model-1.1-Pending");
         assert_eq!(
             stale_license.validate(),
-            Err(SherpaConfigError::CandidateIdentityConflict)
+            Err(SherpaConfigError::EngineIdentityConflict)
         );
 
         let mut parameter_drift = config(&assets);

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use super::{
     AdapterFailure, LOCKED_PARAMETER_SHA256_HEX, LOCKED_TOKENS_SHA256_HEX, REQUIRED_CHANNELS,
     REQUIRED_SAMPLE_RATE_HZ, SherpaConfigError, SherpaNativeBackend, SherpaNativeConfig,
-    locked_digest, locked_engine_descriptor,
+    descriptor::locked_engine_descriptor, locked_digest,
 };
 
 #[cfg(feature = "native-sherpa")]
@@ -20,13 +20,13 @@ use super::sha256_file;
 /// Sample rate accepted by [`LockedSherpaRealtime::transcribe_mono_16khz_pcm16`].
 pub const LOCKED_REALTIME_SAMPLE_RATE_HZ: u32 = REQUIRED_SAMPLE_RATE_HZ;
 
-/// Maximum PCM16 payload admitted by the locked native candidate.
+/// Maximum PCM16 payload admitted by the local realtime engine.
 pub const LOCKED_REALTIME_MAX_PCM16_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Local paths to the five sealed inputs required by the locked candidate.
+/// Local paths to the five verified inputs required by the realtime engine.
 ///
 /// Callers supply locations only. All expected digests, the language, the CPU
-/// provider, and inference parameters remain fixed by the committed candidate.
+/// provider, and inference parameters remain fixed by the committed engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockedSherpaRealtimePaths {
     pub model_path: PathBuf,
@@ -89,7 +89,7 @@ pub struct LockedSherpaRealtime {
 }
 
 impl LockedSherpaRealtime {
-    /// Verifies and prepares the locked zh/CPU candidate once.
+    /// Verifies and prepares the locked zh/CPU engine once.
     pub fn prepare(paths: LockedSherpaRealtimePaths) -> Result<Self, LockedSherpaRealtimeError> {
         let config = locked_zh_cpu_config(&paths)?;
         let backend = SherpaNativeBackend::new(config).map_err(map_config_error)?;
@@ -99,10 +99,8 @@ impl LockedSherpaRealtime {
     /// Prepares the same sealed model/runtime for the desktop MVP while binding
     /// provenance to the workspace's current package lock.
     ///
-    /// This deliberately does not claim formal-candidate identity: adding the
-    /// desktop audio dependency changes `Cargo.lock`, while the already-attested
-    /// candidate remains frozen. Model, tokens, asset-lock, runtime inventory,
-    /// language, provider, and inference parameters remain verified and fixed.
+    /// This binds the model/runtime verification to the workspace's current
+    /// package lock, without relying on archived formal evidence.
     #[cfg(feature = "native-sherpa")]
     pub fn prepare_local_mvp(
         paths: LockedSherpaRealtimePaths,

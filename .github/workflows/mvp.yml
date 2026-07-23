@@ -156,6 +156,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed" }
           cargo test --workspace --all-targets --offline --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+          cargo test -p meetingrelay-model-worker-sherpa-native --test native_sherpa_smoke --features native-sherpa --offline --locked -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "native sherpa smoke failed" }
         timeout-minutes: 20
 
       - name: Build the package-local personal release

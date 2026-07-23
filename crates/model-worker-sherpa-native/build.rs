@@ -90,7 +90,7 @@ fn require_target() -> Result<(), Box<dyn Error>> {
         Ok(())
     } else {
         Err(format!(
-            "WP-0.4.3b is locked to x86_64-pc-windows-msvc, got os={os} arch={arch} env={target_env}"
+            "MeetingRelay's local Sherpa runtime is locked to x86_64-pc-windows-msvc, got os={os} arch={arch} env={target_env}"
         )
         .into())
     }

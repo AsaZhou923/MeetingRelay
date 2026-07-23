@@ -1,6 +1,6 @@
 [package]
 name = "meetingrelay-model-worker-contract"
-description = "Transport-neutral model worker contract for MeetingRelay Phase 0"
+description = "Lightweight local ASR backend contract for MeetingRelay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
