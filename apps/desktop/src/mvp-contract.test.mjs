@@ -16,6 +16,9 @@ import {
   parseMvpRecognitionLanguage,
   parseMvpSnapshot,
   parseMvpTranscriptText,
+  parseTranslationPreference,
+  parseTranslationProbe,
+  requiresInsecureRemoteHttpAcknowledgement,
   resolveAudioDeviceSelection,
 } from "./mvp-contract.ts";
 
@@ -49,6 +52,10 @@ const finalSegment = (sequence, text = `saved ${sequence}`) => ({
   endedAtMs: String(sequence * 1000 + 900),
   committedAt: String(sequence * 1000 + 950),
   commitId: `commit-${sequence}`,
+  translationStatus: "disabled",
+  translationTarget: null,
+  translationText: null,
+  translationError: null,
 });
 
 const snapshot = {
@@ -73,8 +80,93 @@ const snapshot = {
   interim: null,
   finals: [],
   queueDepth: 0,
+  translationQueueDepth: 0,
   error: null,
 };
+
+test("parses completed translation state and rejects inconsistent shapes", () => {
+  const translated = finalSegment(1);
+  translated.translationStatus = "completed";
+  translated.translationTarget = "ja";
+  translated.translationText = "保存済み";
+  assert.equal(
+    parseMvpSnapshot({ ...snapshot, finals: [translated] }).finals[0].translationText,
+    "保存済み",
+  );
+  assert.throws(
+    () =>
+      parseMvpSnapshot({
+        ...snapshot,
+        finals: [{ ...translated, translationText: null }],
+      }),
+    /translation state/,
+  );
+});
+
+test("parses non-secret local translation preferences and probe results", () => {
+  assert.deepEqual(
+    parseTranslationPreference(
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "qwen2.5:7b",
+        targetLanguage: "zh",
+      }),
+    ),
+    {
+      version: 1,
+      enabled: true,
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "qwen2.5:7b",
+      targetLanguage: "zh",
+      allowInsecureHttp: false,
+    },
+  );
+  assert.equal(
+    parseTranslationPreference(
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        baseUrl: "http://192.168.1.3:11434/v1",
+        model: "qwen2.5:7b",
+        targetLanguage: "ja",
+        allowInsecureHttp: true,
+      }),
+    )?.allowInsecureHttp,
+    true,
+  );
+  assert.equal(parseTranslationPreference('{"version":1,"apiKey":"secret"}'), null);
+  assert.deepEqual(
+    parseTranslationProbe({
+      endpoint: "http://127.0.0.1:11434/v1/chat/completions",
+      model: "qwen2.5:7b",
+      targetLanguage: "zh",
+      latencyMs: 42,
+      preview: "连接成功",
+    }),
+    {
+      endpoint: "http://127.0.0.1:11434/v1/chat/completions",
+      model: "qwen2.5:7b",
+      targetLanguage: "zh",
+      latencyMs: 42,
+      preview: "连接成功",
+    },
+  );
+});
+
+test("requires explicit acknowledgement only for non-loopback HTTP providers", () => {
+  assert.equal(
+    requiresInsecureRemoteHttpAcknowledgement("http://192.168.1.3:11434/v1"),
+    true,
+  );
+  assert.equal(requiresInsecureRemoteHttpAcknowledgement("http://example.com/v1"), true);
+  assert.equal(requiresInsecureRemoteHttpAcknowledgement("http://localhost:11434/v1"), false);
+  assert.equal(requiresInsecureRemoteHttpAcknowledgement("http://127.0.0.1:11434/v1"), false);
+  assert.equal(requiresInsecureRemoteHttpAcknowledgement("http://[::1]:1234/v1"), false);
+  assert.equal(requiresInsecureRemoteHttpAcknowledgement("https://api.example.com/v1"), false);
+  assert.equal(requiresInsecureRemoteHttpAcknowledgement("not a URL"), false);
+});
 
 test("parses the strict durable ready snapshot and formats elapsed time", () => {
   assert.deepEqual(parseMvpSnapshot(snapshot), snapshot);
@@ -248,6 +340,11 @@ test("turns recoverable runtime error codes into actionable product messages", (
   assert.match(formatMvpErrorMessage(new Error("ASR_WORKER_STOPPED")), /自动重建引擎/);
   assert.match(formatMvpErrorMessage("SHERPA_ASSET_MISSING"), /模型或运行时路径/);
   assert.match(formatMvpErrorMessage("MVP_RESUME_TIMEOUT"), /停止会议后重新开始/);
+  assert.match(
+    formatMvpErrorMessage("TRANSLATION_BASE_URL_HTTPS_REQUIRED"),
+    /显式确认风险/,
+  );
+  assert.match(formatMvpErrorMessage("TRANSLATION_BASE_URL_INVALID"), /Base URL 无效/);
   assert.equal(formatMvpErrorMessage("CUSTOM_FAILURE"), "CUSTOM_FAILURE");
   assert.match(
     formatMvpSnapshotError({

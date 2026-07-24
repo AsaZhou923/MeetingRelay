@@ -13,9 +13,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::contract::{MAX_FINAL_SEGMENTS, MVP_CONTRACT_VERSION, TranscriptSegment};
 
-pub const MVP_SCHEMA_VERSION: i64 = 1;
-pub const MVP_SCHEMA_CHECKSUM: &str =
+const MVP_SCHEMA_V1_CHECKSUM: &str =
     "meetingrelay.mvp.sqlite.v1:meetings/finals/events/export-snapshots/exports";
+const MVP_SCHEMA_V2_CHECKSUM: &str =
+    "meetingrelay.mvp.sqlite.v2:meetings/finals/translations/events/export-snapshots/exports";
+pub const MVP_SCHEMA_VERSION: i64 = 3;
+pub const MVP_SCHEMA_CHECKSUM: &str =
+    "meetingrelay.mvp.sqlite.v3:durable-same-language-translation-status";
 pub const STORAGE_QUEUE_DEPTH: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +49,10 @@ pub struct DurableFinal {
     pub content_sha256: String,
     pub committed_at: String,
     pub commit_id: String,
+    pub translation_status: String,
+    pub translation_target: Option<String>,
+    pub translation_text: Option<String>,
+    pub translation_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +64,26 @@ pub struct FinalCandidate {
     pub text: String,
     pub started_at_ms: String,
     pub ended_at_ms: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslationCandidate {
+    pub meeting_id: String,
+    pub segment_id: String,
+    pub source_revision: u32,
+    pub target_language: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslationCompletion {
+    pub meeting_id: String,
+    pub segment_id: String,
+    pub source_revision: u32,
+    pub target_language: String,
+    pub translated_text: Option<String>,
+    pub error_code: Option<String>,
+    pub skipped_same_language: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,6 +255,14 @@ impl MvpStorageWriter {
         self.request(|reply| StorageRequest::CommitFinal(candidate, reply))
     }
 
+    pub fn begin_translation(&self, candidate: TranslationCandidate) -> Result<(), String> {
+        self.request(|reply| StorageRequest::BeginTranslation(candidate, reply))
+    }
+
+    pub fn finish_translation(&self, completion: TranslationCompletion) -> Result<(), String> {
+        self.request(|reply| StorageRequest::FinishTranslation(completion, reply))
+    }
+
     pub fn record_export_snapshot(
         &self,
         snapshot: MeetingSnapshot,
@@ -367,6 +403,8 @@ enum StorageRequest {
         reply: SyncSender<Result<MeetingSnapshot, String>>,
     },
     CommitFinal(FinalCandidate, SyncSender<Result<CommitAck, String>>),
+    BeginTranslation(TranslationCandidate, SyncSender<Result<(), String>>),
+    FinishTranslation(TranslationCompletion, SyncSender<Result<(), String>>),
     RecordExportSnapshot {
         snapshot: MeetingSnapshot,
         exports: Vec<CompletedExport>,
@@ -428,6 +466,12 @@ fn storage_writer_loop(
             StorageRequest::CommitFinal(candidate, reply) => {
                 let _ = reply.send(commit_final_on_writer(&mut connection, candidate));
             }
+            StorageRequest::BeginTranslation(candidate, reply) => {
+                let _ = reply.send(begin_translation_on_writer(&mut connection, candidate));
+            }
+            StorageRequest::FinishTranslation(completion, reply) => {
+                let _ = reply.send(finish_translation_on_writer(&mut connection, completion));
+            }
             StorageRequest::RecordExportSnapshot {
                 snapshot,
                 exports,
@@ -473,6 +517,10 @@ pub fn segment_from_durable(final_segment: &DurableFinal) -> TranscriptSegment {
         ended_at_ms: Some(final_segment.ended_at_ms.clone()),
         committed_at: Some(final_segment.committed_at.clone()),
         commit_id: Some(final_segment.commit_id.clone()),
+        translation_status: final_segment.translation_status.clone(),
+        translation_target: final_segment.translation_target.clone(),
+        translation_text: final_segment.translation_text.clone(),
+        translation_error: final_segment.translation_error.clone(),
     }
 }
 
@@ -548,6 +596,85 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
     if current == MVP_SCHEMA_VERSION {
         return validate_schema_checksum(connection);
     }
+    if current == 1 {
+        validate_schema_checksum_version(connection, 1, MVP_SCHEMA_V1_CHECKSUM)?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS mvp_translations (
+                meeting_id TEXT NOT NULL,
+                segment_id TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                target_language TEXT NOT NULL CHECK (target_language IN ('zh','ja','en')),
+                model TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending','completed','failed','skipped')),
+                translated_text TEXT,
+                error_code TEXT,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY (meeting_id, segment_id, source_revision),
+                FOREIGN KEY (meeting_id) REFERENCES mvp_meetings(id) ON DELETE RESTRICT
+            );
+            PRAGMA user_version = 3;
+            ",
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
+             VALUES (?1, ?2, ?3)",
+            params![MVP_SCHEMA_VERSION, MVP_SCHEMA_CHECKSUM, now_ms_string()],
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.commit()
+            .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+        return validate_schema_checksum(connection);
+    }
+    if current == 2 {
+        validate_schema_checksum_version(connection, 2, MVP_SCHEMA_V2_CHECKSUM)?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+        tx.execute_batch(
+            "
+            ALTER TABLE mvp_translations RENAME TO mvp_translations_v2;
+            CREATE TABLE mvp_translations (
+                meeting_id TEXT NOT NULL,
+                segment_id TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                target_language TEXT NOT NULL CHECK (target_language IN ('zh','ja','en')),
+                model TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending','completed','failed','skipped')),
+                translated_text TEXT,
+                error_code TEXT,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY (meeting_id, segment_id, source_revision),
+                FOREIGN KEY (meeting_id) REFERENCES mvp_meetings(id) ON DELETE RESTRICT
+            );
+            INSERT INTO mvp_translations (
+                meeting_id, segment_id, source_revision, target_language, model,
+                status, translated_text, error_code, requested_at, completed_at
+            )
+            SELECT meeting_id, segment_id, source_revision, target_language, model,
+                   status, translated_text, error_code, requested_at, completed_at
+            FROM mvp_translations_v2;
+            DROP TABLE mvp_translations_v2;
+            PRAGMA user_version = 3;
+            ",
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
+             VALUES (?1, ?2, ?3)",
+            params![MVP_SCHEMA_VERSION, MVP_SCHEMA_CHECKSUM, now_ms_string()],
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.commit()
+            .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+        return validate_schema_checksum(connection);
+    }
     if current != 0 {
         return Err("MVP_STORAGE_SCHEMA_UNSUPPORTED".to_owned());
     }
@@ -593,6 +720,20 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
                 UNIQUE (meeting_id, sequence),
                 FOREIGN KEY (meeting_id) REFERENCES mvp_meetings(id) ON DELETE RESTRICT
             );
+            CREATE TABLE IF NOT EXISTS mvp_translations (
+                meeting_id TEXT NOT NULL,
+                segment_id TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                target_language TEXT NOT NULL CHECK (target_language IN ('zh','ja','en')),
+                model TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending','completed','failed','skipped')),
+                translated_text TEXT,
+                error_code TEXT,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY (meeting_id, segment_id, source_revision),
+                FOREIGN KEY (meeting_id) REFERENCES mvp_meetings(id) ON DELETE RESTRICT
+            );
             CREATE TABLE IF NOT EXISTS mvp_events (
                 meeting_id TEXT,
                 event_sequence INTEGER NOT NULL,
@@ -623,7 +764,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
                 validation_manifest_json TEXT NOT NULL,
                 FOREIGN KEY (snapshot_id) REFERENCES mvp_export_snapshots(snapshot_id) ON DELETE RESTRICT
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 3;
             ",
         )
         .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
@@ -639,16 +780,24 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
 }
 
 fn validate_schema_checksum(connection: &Connection) -> Result<(), String> {
+    validate_schema_checksum_version(connection, MVP_SCHEMA_VERSION, MVP_SCHEMA_CHECKSUM)
+}
+
+fn validate_schema_checksum_version(
+    connection: &Connection,
+    version: i64,
+    expected: &str,
+) -> Result<(), String> {
     let checksum = connection
         .query_row(
             "SELECT checksum FROM mvp_schema_migrations WHERE version=?1",
-            params![MVP_SCHEMA_VERSION],
+            params![version],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|_| "MVP_STORAGE_SCHEMA_QUERY_FAILED".to_owned())?
         .ok_or_else(|| "MVP_STORAGE_SCHEMA_CHECKSUM_MISSING".to_owned())?;
-    if checksum != MVP_SCHEMA_CHECKSUM {
+    if checksum != expected {
         return Err("MVP_STORAGE_SCHEMA_CHECKSUM_MISMATCH".to_owned());
     }
     Ok(())
@@ -686,6 +835,14 @@ fn recover_interrupted_on_writer(connection: &mut Connection) -> Result<usize, S
             &now,
         )?;
     }
+    tx.execute(
+        "UPDATE mvp_translations
+         SET status='failed', translated_text=NULL,
+             error_code='TRANSLATION_INTERRUPTED', completed_at=?1
+         WHERE status='pending'",
+        params![now],
+    )
+    .map_err(|_| "MVP_STORAGE_RECOVERY_FAILED".to_owned())?;
     tx.commit()
         .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
     Ok(ids.len())
@@ -904,6 +1061,175 @@ fn commit_final_on_writer(
     })
 }
 
+fn begin_translation_on_writer(
+    connection: &mut Connection,
+    candidate: TranslationCandidate,
+) -> Result<(), String> {
+    validate_translation_identity(
+        &candidate.meeting_id,
+        &candidate.segment_id,
+        candidate.source_revision,
+        &candidate.target_language,
+    )?;
+    if candidate.model.is_empty()
+        || candidate.model.len() > 256
+        || candidate.model.chars().any(char::is_control)
+    {
+        return Err("MVP_STORAGE_TRANSLATION_MODEL_INVALID".to_owned());
+    }
+    let now = now_ms_string();
+    let tx = connection
+        .transaction()
+        .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+    let final_exists = tx
+        .query_row(
+            "SELECT 1 FROM mvp_final_segments
+             WHERE meeting_id=?1 AND segment_id=?2 AND source_revision=?3",
+            params![
+                candidate.meeting_id,
+                candidate.segment_id,
+                i64::from(candidate.source_revision)
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| "MVP_STORAGE_FINAL_QUERY_FAILED".to_owned())?
+        .is_some();
+    if !final_exists {
+        return Err("MVP_STORAGE_TRANSLATION_FINAL_MISSING".to_owned());
+    }
+    tx.execute(
+        "INSERT INTO mvp_translations (
+            meeting_id, segment_id, source_revision, target_language, model,
+            status, translated_text, error_code, requested_at, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, NULL, ?6, NULL)
+         ON CONFLICT(meeting_id, segment_id, source_revision) DO UPDATE SET
+            target_language=excluded.target_language,
+            model=excluded.model,
+            status='pending',
+            translated_text=NULL,
+            error_code=NULL,
+            requested_at=excluded.requested_at,
+            completed_at=NULL",
+        params![
+            candidate.meeting_id,
+            candidate.segment_id,
+            i64::from(candidate.source_revision),
+            candidate.target_language,
+            candidate.model,
+            now
+        ],
+    )
+    .map_err(|_| "MVP_STORAGE_TRANSLATION_BEGIN_FAILED".to_owned())?;
+    insert_event(
+        &tx,
+        Some(&candidate.meeting_id),
+        "translation.started",
+        &format!(
+            "{}:{}:{}",
+            candidate.segment_id, candidate.source_revision, candidate.target_language
+        ),
+        &now,
+    )?;
+    tx.commit()
+        .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())
+}
+
+fn finish_translation_on_writer(
+    connection: &mut Connection,
+    completion: TranslationCompletion,
+) -> Result<(), String> {
+    validate_translation_identity(
+        &completion.meeting_id,
+        &completion.segment_id,
+        completion.source_revision,
+        &completion.target_language,
+    )?;
+    match (
+        completion.translated_text.as_deref(),
+        completion.error_code.as_deref(),
+        completion.skipped_same_language,
+    ) {
+        (Some(text), None, false)
+            if !text.is_empty()
+                && text.len() <= 16_384
+                && !text.contains('\0')
+                && !text.chars().any(|character| character == '\r') => {}
+        (None, Some(error), false)
+            if !error.is_empty() && error.len() <= 128 && !error.chars().any(char::is_control) => {}
+        (None, None, true) => {}
+        _ => return Err("MVP_STORAGE_TRANSLATION_RESULT_INVALID".to_owned()),
+    }
+    let status = if completion.skipped_same_language {
+        "skipped"
+    } else if completion.translated_text.is_some() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let now = now_ms_string();
+    let tx = connection
+        .transaction()
+        .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+    let changed = tx
+        .execute(
+            "UPDATE mvp_translations
+             SET status=?5, translated_text=?6, error_code=?7, completed_at=?8
+             WHERE meeting_id=?1 AND segment_id=?2 AND source_revision=?3
+               AND target_language=?4",
+            params![
+                completion.meeting_id,
+                completion.segment_id,
+                i64::from(completion.source_revision),
+                completion.target_language,
+                status,
+                completion.translated_text,
+                completion.error_code,
+                now
+            ],
+        )
+        .map_err(|_| "MVP_STORAGE_TRANSLATION_FINISH_FAILED".to_owned())?;
+    if changed != 1 {
+        return Err("MVP_STORAGE_TRANSLATION_PENDING_MISSING".to_owned());
+    }
+    insert_event(
+        &tx,
+        Some(&completion.meeting_id),
+        if status == "completed" {
+            "translation.completed"
+        } else {
+            "translation.failed"
+        },
+        &format!(
+            "{}:{}:{}",
+            completion.segment_id, completion.source_revision, completion.target_language
+        ),
+        &now,
+    )?;
+    tx.commit()
+        .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())
+}
+
+fn validate_translation_identity(
+    meeting_id: &str,
+    segment_id: &str,
+    source_revision: u32,
+    target_language: &str,
+) -> Result<(), String> {
+    if meeting_id.is_empty()
+        || meeting_id.len() > 128
+        || segment_id.is_empty()
+        || segment_id.len() > 128
+        || source_revision == 0
+        || !matches!(target_language, "zh" | "ja" | "en")
+        || meeting_id.chars().any(char::is_control)
+        || segment_id.chars().any(char::is_control)
+    {
+        return Err("MVP_STORAGE_TRANSLATION_IDENTITY_INVALID".to_owned());
+    }
+    Ok(())
+}
+
 fn record_export_snapshot_on_writer(
     connection: &mut Connection,
     snapshot: &MeetingSnapshot,
@@ -1083,10 +1409,15 @@ fn select_final_by_key(
     source_revision: u32,
 ) -> Result<Option<DurableFinal>, String> {
     tx.query_row(
-        "SELECT meeting_id, segment_id, sequence, revision, text, started_at_ms, ended_at_ms,
-                content_sha256, committed_at, commit_id
-         FROM mvp_final_segments
-         WHERE meeting_id=?1 AND segment_id=?2 AND transcript_generation=?3 AND source_revision=?4",
+        "SELECT f.meeting_id, f.segment_id, f.sequence, f.revision, f.text,
+                f.started_at_ms, f.ended_at_ms, f.content_sha256, f.committed_at, f.commit_id,
+                COALESCE(t.status, 'disabled'), t.target_language, t.translated_text, t.error_code
+         FROM mvp_final_segments f
+         LEFT JOIN mvp_translations t
+           ON t.meeting_id=f.meeting_id AND t.segment_id=f.segment_id
+          AND t.source_revision=f.source_revision
+         WHERE f.meeting_id=?1 AND f.segment_id=?2
+           AND f.transcript_generation=?3 AND f.source_revision=?4",
         params![
             meeting_id,
             segment_id,
@@ -1105,10 +1436,14 @@ fn select_final_by_sequence(
     sequence: u64,
 ) -> Result<Option<DurableFinal>, String> {
     tx.query_row(
-        "SELECT meeting_id, segment_id, sequence, revision, text, started_at_ms, ended_at_ms,
-                content_sha256, committed_at, commit_id
-         FROM mvp_final_segments
-         WHERE meeting_id=?1 AND sequence=?2",
+        "SELECT f.meeting_id, f.segment_id, f.sequence, f.revision, f.text,
+                f.started_at_ms, f.ended_at_ms, f.content_sha256, f.committed_at, f.commit_id,
+                COALESCE(t.status, 'disabled'), t.target_language, t.translated_text, t.error_code
+         FROM mvp_final_segments f
+         LEFT JOIN mvp_translations t
+           ON t.meeting_id=f.meeting_id AND t.segment_id=f.segment_id
+          AND t.source_revision=f.source_revision
+         WHERE f.meeting_id=?1 AND f.sequence=?2",
         params![
             meeting_id,
             i64::try_from(sequence).map_err(|_| "MVP_STORAGE_SEQUENCE_OVERFLOW".to_owned())?
@@ -1122,11 +1457,16 @@ fn select_final_by_sequence(
 fn select_finals(tx: &Transaction<'_>, meeting_id: &str) -> Result<Vec<DurableFinal>, String> {
     let mut statement = tx
         .prepare(
-            "SELECT meeting_id, segment_id, sequence, revision, text, started_at_ms, ended_at_ms,
-                    content_sha256, committed_at, commit_id
-             FROM mvp_final_segments
-             WHERE meeting_id=?1
-             ORDER BY sequence ASC",
+            "SELECT f.meeting_id, f.segment_id, f.sequence, f.revision, f.text,
+                    f.started_at_ms, f.ended_at_ms, f.content_sha256, f.committed_at, f.commit_id,
+                    COALESCE(t.status, 'disabled'), t.target_language,
+                    t.translated_text, t.error_code
+             FROM mvp_final_segments f
+             LEFT JOIN mvp_translations t
+               ON t.meeting_id=f.meeting_id AND t.segment_id=f.segment_id
+              AND t.source_revision=f.source_revision
+             WHERE f.meeting_id=?1
+             ORDER BY f.sequence ASC",
         )
         .map_err(|_| "MVP_STORAGE_FINAL_QUERY_FAILED".to_owned())?;
     let rows = statement
@@ -1177,6 +1517,10 @@ fn durable_final_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DurableFi
         content_sha256: row.get(7)?,
         committed_at: row.get(8)?,
         commit_id: row.get(9)?,
+        translation_status: row.get(10)?,
+        translation_target: row.get(11)?,
+        translation_text: row.get(12)?,
+        translation_error: row.get(13)?,
     })
 }
 
@@ -1218,12 +1562,20 @@ pub fn semantic_digest(meeting: &MeetingRecord, finals: &[DurableFinal]) -> Stri
     );
     for final_segment in finals {
         material.push_str(&format!(
-            "{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             final_segment.sequence,
             final_segment.segment_id,
             final_segment.revision,
             final_segment.started_at_ms,
-            final_segment.content_sha256
+            final_segment.content_sha256,
+            final_segment.translation_status,
+            final_segment.translation_target.as_deref().unwrap_or(""),
+            final_segment
+                .translation_text
+                .as_deref()
+                .map(|text| sha256_hex(text.as_bytes()))
+                .unwrap_or_default(),
+            final_segment.translation_error.as_deref().unwrap_or("")
         ));
     }
     sha256_hex(material.as_bytes())
@@ -1392,8 +1744,8 @@ mod tests {
             .unwrap();
         let checksum: String = connection
             .query_row(
-                "SELECT checksum FROM mvp_schema_migrations WHERE version=1",
-                [],
+                "SELECT checksum FROM mvp_schema_migrations WHERE version=?1",
+                params![MVP_SCHEMA_VERSION],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1404,14 +1756,47 @@ mod tests {
     }
 
     #[test]
+    fn existing_v1_database_migrates_in_place_to_translation_schema_v3() {
+        let db = temp_db("migration-v1");
+        let connection = open_writer_connection(&db).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE mvp_translations;
+                 DELETE FROM mvp_schema_migrations WHERE version=3;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO mvp_schema_migrations(version, checksum, applied_at)
+                 VALUES (1, ?1, ?2)",
+                params![MVP_SCHEMA_V1_CHECKSUM, now_ms_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = open_writer_connection(&db).unwrap();
+        assert_eq!(user_version(&migrated).unwrap(), 3);
+        let translation_table: String = migrated
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='mvp_translations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(translation_table, "mvp_translations");
+        validate_schema_checksum(&migrated).unwrap();
+    }
+
+    #[test]
     fn checksum_tamper_fails_closed() {
         let db = temp_db("checksum-tamper");
         drop(open_writer_connection(&db).unwrap());
         let connection = Connection::open(&db).unwrap();
         connection
             .execute(
-                "UPDATE mvp_schema_migrations SET checksum='tampered' WHERE version=1",
-                [],
+                "UPDATE mvp_schema_migrations SET checksum='tampered' WHERE version=?1",
+                params![MVP_SCHEMA_VERSION],
             )
             .unwrap();
         assert_eq!(
@@ -1477,6 +1862,71 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn translation_status_and_text_are_durable_without_replacing_the_original() {
+        let (storage, writer) = storage_and_writer("translation");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 1, "original text"))
+            .unwrap();
+        writer
+            .begin_translation(TranslationCandidate {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                source_revision: 1,
+                target_language: "ja".to_owned(),
+                model: "local-translator".to_owned(),
+            })
+            .unwrap();
+        let pending = storage.snapshot(&meeting.id).unwrap();
+        assert_eq!(pending.finals[0].text, "original text");
+        assert_eq!(pending.finals[0].translation_status, "pending");
+        writer
+            .finish_translation(TranslationCompletion {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                source_revision: 1,
+                target_language: "ja".to_owned(),
+                translated_text: Some("翻訳済み".to_owned()),
+                error_code: None,
+                skipped_same_language: false,
+            })
+            .unwrap();
+        let completed = storage.snapshot(&meeting.id).unwrap();
+        assert_eq!(completed.finals[0].text, "original text");
+        assert_eq!(completed.finals[0].translation_status, "completed");
+        assert_eq!(
+            completed.finals[0].translation_text.as_deref(),
+            Some("翻訳済み")
+        );
+        assert_ne!(pending.semantic_sha256, completed.semantic_sha256);
+
+        writer
+            .begin_translation(TranslationCandidate {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                source_revision: 1,
+                target_language: "en".to_owned(),
+                model: "same-language-pass-through".to_owned(),
+            })
+            .unwrap();
+        writer
+            .finish_translation(TranslationCompletion {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                source_revision: 1,
+                target_language: "en".to_owned(),
+                translated_text: None,
+                error_code: None,
+                skipped_same_language: true,
+            })
+            .unwrap();
+        let skipped = storage.snapshot(&meeting.id).unwrap();
+        assert_eq!(skipped.finals[0].translation_status, "skipped");
+        assert_eq!(skipped.finals[0].translation_target.as_deref(), Some("en"));
+        assert!(skipped.finals[0].translation_text.is_none());
     }
 
     #[test]

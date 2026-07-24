@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-pub const MVP_CONTRACT_VERSION: &str = "meetingrelay.mvp.durable.v1";
+pub const MVP_CONTRACT_VERSION: &str = "meetingrelay.mvp.durable.v2";
 pub const MAX_FINAL_SEGMENTS: usize = 64;
 pub const MAX_INFERENCE_QUEUE_DEPTH: usize = 8;
 
@@ -73,6 +73,10 @@ pub struct TranscriptSegment {
     pub ended_at_ms: Option<String>,
     pub committed_at: Option<String>,
     pub commit_id: Option<String>,
+    pub translation_status: String,
+    pub translation_target: Option<String>,
+    pub translation_text: Option<String>,
+    pub translation_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -99,6 +103,7 @@ pub struct MvpSnapshot {
     pub interim: Option<TranscriptSegment>,
     pub finals: Vec<TranscriptSegment>,
     pub queue_depth: usize,
+    pub translation_queue_depth: usize,
     pub error: Option<String>,
 }
 
@@ -126,6 +131,7 @@ impl MvpSnapshot {
             interim: None,
             finals: Vec::new(),
             queue_depth: 0,
+            translation_queue_depth: 0,
             error: None,
         }
     }
@@ -145,6 +151,7 @@ impl MvpSnapshot {
                 .unwrap_or_else(|| "1".to_owned())
         };
         self.queue_depth = self.queue_depth.min(MAX_INFERENCE_QUEUE_DEPTH);
+        self.translation_queue_depth = self.translation_queue_depth.min(32);
         self.system.peak = self.system.peak.clamp(0.0, 1.0);
         self.microphone.peak = self.microphone.peak.clamp(0.0, 1.0);
     }
@@ -163,7 +170,7 @@ mod tests {
         else {
             panic!("snapshot must use a JSON response body");
         };
-        assert!(json.contains(r#""contractVersion":"meetingrelay.mvp.durable.v1""#));
+        assert!(json.contains(r#""contractVersion":"meetingrelay.mvp.durable.v2""#));
         assert!(json.contains(r#""lifecycle":"booting""#));
         assert!(json.contains(r#""localOnly":true,"memoryOnly":false"#));
         assert!(json.contains(r#""durabilityStatus":"initializing""#));
@@ -187,6 +194,10 @@ mod tests {
                 ended_at_ms: Some("1".to_owned()),
                 committed_at: Some("2".to_owned()),
                 commit_id: Some(format!("commit-{index}")),
+                translation_status: "disabled".to_owned(),
+                translation_target: None,
+                translation_text: None,
+                translation_error: None,
             })
             .collect();
         snapshot.saved_final_count = snapshot.finals.len().to_string();

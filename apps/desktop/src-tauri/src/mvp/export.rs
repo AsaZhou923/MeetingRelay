@@ -656,8 +656,8 @@ fn validate_render(format: &str, content: &str) -> Result<(), String> {
 fn render_json(snapshot: &MeetingSnapshot) -> String {
     let mut output = String::new();
     output.push_str("{\n");
-    output.push_str("  \"schemaVersion\": 1,\n");
-    output.push_str("  \"contractVersion\": \"meetingrelay.mvp.durable.v1\",\n");
+    output.push_str("  \"schemaVersion\": 2,\n");
+    output.push_str("  \"contractVersion\": \"meetingrelay.mvp.durable.v2\",\n");
     output.push_str(&format!(
         "  \"meetingId\": {},\n  \"snapshotId\": {},\n  \"state\": {},\n  \"finalCount\": {},\n",
         json_string(&snapshot.meeting.id),
@@ -672,7 +672,7 @@ fn render_json(snapshot: &MeetingSnapshot) -> String {
     for (index, final_segment) in snapshot.finals.iter().enumerate() {
         output.push_str("    {\n");
         output.push_str(&format!(
-            "      \"sequence\": {},\n      \"segmentId\": {},\n      \"revision\": {},\n      \"startedAtMs\": {},\n      \"endedAtMs\": {},\n      \"committedAt\": {},\n      \"commitId\": {},\n      \"text\": {}\n",
+            "      \"sequence\": {},\n      \"segmentId\": {},\n      \"revision\": {},\n      \"startedAtMs\": {},\n      \"endedAtMs\": {},\n      \"committedAt\": {},\n      \"commitId\": {},\n      \"text\": {},\n      \"translationStatus\": {},\n      \"translationTarget\": {},\n      \"translationText\": {},\n      \"translationError\": {}\n",
             final_segment.sequence,
             json_string(&final_segment.segment_id),
             final_segment.revision,
@@ -680,7 +680,11 @@ fn render_json(snapshot: &MeetingSnapshot) -> String {
             json_string(&final_segment.ended_at_ms),
             json_string(&final_segment.committed_at),
             json_string(&final_segment.commit_id),
-            json_string(&final_segment.text)
+            json_string(&final_segment.text),
+            json_string(&final_segment.translation_status),
+            json_nullable(final_segment.translation_target.as_deref()),
+            json_nullable(final_segment.translation_text.as_deref()),
+            json_nullable(final_segment.translation_error.as_deref())
         ));
         output.push_str(if index + 1 == snapshot.finals.len() {
             "    }\n"
@@ -711,6 +715,28 @@ fn render_markdown(snapshot: &MeetingSnapshot) -> String {
             escape_markdown_inline(&final_segment.ended_at_ms),
             escape_markdown_text(&final_segment.text)
         ));
+        if let Some(translation) = final_segment.translation_text.as_deref() {
+            output.push_str(&format!(
+                "   - Translation ({})：{}\n\n",
+                escape_markdown_inline(
+                    final_segment
+                        .translation_target
+                        .as_deref()
+                        .unwrap_or("unknown")
+                ),
+                escape_markdown_text(translation)
+            ));
+        } else if final_segment.translation_status == "failed" {
+            output.push_str(&format!(
+                "   - Translation failed: `{}`\n\n",
+                escape_markdown_inline(
+                    final_segment
+                        .translation_error
+                        .as_deref()
+                        .unwrap_or("TRANSLATION_FAILED")
+                )
+            ));
+        }
     }
     output
 }
@@ -739,6 +765,28 @@ fn render_txt(snapshot: &MeetingSnapshot) -> String {
             sanitize_plain(&final_segment.ended_at_ms),
             sanitize_plain(&final_segment.text)
         ));
+        if let Some(translation) = final_segment.translation_text.as_deref() {
+            output.push_str(&format!(
+                "  Translation ({}): {}\n",
+                sanitize_plain(
+                    final_segment
+                        .translation_target
+                        .as_deref()
+                        .unwrap_or("unknown")
+                ),
+                sanitize_plain(translation)
+            ));
+        } else if final_segment.translation_status == "failed" {
+            output.push_str(&format!(
+                "  Translation failed: {}\n",
+                sanitize_plain(
+                    final_segment
+                        .translation_error
+                        .as_deref()
+                        .unwrap_or("TRANSLATION_FAILED")
+                )
+            ));
+        }
     }
     output
 }
@@ -754,6 +802,16 @@ fn render_transcript_text(snapshot: &MeetingSnapshot) -> String {
             "[{}] {}\n",
             final_segment.sequence, final_segment.text
         ));
+        if let Some(translation) = final_segment.translation_text.as_deref() {
+            output.push_str(&format!(
+                "    译文 ({}): {}\n",
+                final_segment
+                    .translation_target
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                translation
+            ));
+        }
     }
     output
 }
@@ -773,6 +831,10 @@ fn json_string(value: &str) -> String {
     }
     output.push('"');
     output
+}
+
+fn json_nullable(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_owned(), json_string)
 }
 
 fn escape_markdown_inline(value: &str) -> String {

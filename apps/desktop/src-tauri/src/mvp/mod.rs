@@ -6,6 +6,7 @@ pub mod dsp;
 pub mod export;
 mod service;
 pub mod storage;
+pub mod translation;
 
 pub(crate) use service::MVP_SHUTDOWN_TIMEOUT;
 pub use service::MvpService;
@@ -13,6 +14,7 @@ pub use service::MvpService;
 use audio::{AudioDeviceInventory, AudioDeviceSelection};
 use contract::MvpSnapshot;
 use export::ExportResult;
+use translation::{TranslationConfig, TranslationProbe};
 
 #[tauri::command(async)]
 pub fn mvp_preflight(service: tauri::State<'_, MvpService>) -> Result<MvpSnapshot, String> {
@@ -33,6 +35,7 @@ pub fn mvp_start(
     system_output_device_id: Option<String>,
     microphone_device_id: Option<String>,
     language: Option<String>,
+    translation: Option<TranslationConfig>,
 ) -> Result<MvpSnapshot, String> {
     service.start_with_devices_and_language(
         consent_accepted,
@@ -41,6 +44,7 @@ pub fn mvp_start(
             microphone_device_id,
         },
         language.as_deref().unwrap_or("zh"),
+        translation,
     )
 }
 
@@ -50,6 +54,11 @@ pub fn mvp_prepare_language(
     language: String,
 ) -> Result<MvpSnapshot, String> {
     service.prepare_language(&language)
+}
+
+#[tauri::command(async)]
+pub fn mvp_test_translation(config: TranslationConfig) -> Result<TranslationProbe, String> {
+    translation::test_translation(&config)
 }
 
 #[tauri::command(async)]

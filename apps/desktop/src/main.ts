@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import {
   AUDIO_DEVICE_PREFERENCE_KEY,
+  TRANSLATION_PREFERENCE_KEY,
   formatMvpErrorMessage,
   formatMvpSnapshotError,
   formatElapsed,
@@ -14,6 +15,9 @@ import {
   parseMvpExportResult,
   parseMvpRecognitionLanguage,
   parseMvpSnapshot,
+  parseTranslationPreference,
+  parseTranslationProbe,
+  requiresInsecureRemoteHttpAcknowledgement,
   resolveAudioDeviceSelection,
   type AudioDeviceInventory,
   type AudioSourceSnapshot,
@@ -21,7 +25,11 @@ import {
   type MvpExportResult,
   type MvpRecognitionLanguage,
   type MvpSnapshot,
+  type TranscriptSegment,
+  type TranslationConfig,
+  type TranslationPreference,
 } from "./mvp-contract";
+import { planTranscriptReconciliation } from "./transcript-render";
 import "./styles.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -30,13 +38,13 @@ if (!app) throw new Error("MeetingRelay app root is missing.");
 app.innerHTML = `
   <main class="relay-shell">
     <header class="masthead">
-      <div>
-        <p class="kicker">LOCAL TRANSCRIPTION CONSOLE / MVP</p>
+      <div class="brand-lockup">
+        <p class="kicker">PRIVATE MEETING CAPTURE / WINDOWS</p>
         <h1>Meeting<span>Relay</span></h1>
       </div>
       <div class="privacy-stamp" aria-label="Privacy and storage mode">
         <span class="privacy-dot"></span>
-        本地处理 · SQLite/WAL 持久保存
+        <span><strong>本地识别</strong>音频与记录留在此电脑；启用云端翻译时，仅 final 原文发往所选服务</span>
       </div>
     </header>
 
@@ -90,8 +98,68 @@ app.innerHTML = `
           <strong id="model-status">正在校验本地模型…</strong>
         </div>
 
+        <section class="translation-panel" aria-label="OpenAI-compatible translation">
+          <div class="translation-heading">
+            <div>
+              <div class="rail-index">02 / TRANSLATION</div>
+              <strong>OpenAI-compatible 翻译</strong>
+            </div>
+            <label class="translation-toggle">
+              <input id="translation-enabled" type="checkbox" />
+              <span>启用</span>
+            </label>
+          </div>
+          <div class="translation-grid">
+            <label class="device-picker">
+              <span>服务预设</span>
+              <select id="translation-provider">
+                <option value="ollama">Ollama</option>
+                <option value="lmstudio">LM Studio</option>
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="xai">xAI</option>
+                <option value="dashscope">阿里云百炼 / DashScope</option>
+                <option value="custom">其他兼容服务</option>
+              </select>
+            </label>
+            <label class="device-picker">
+              <span>译文语言</span>
+              <select id="translation-language">
+                <option value="zh">中文 · ZH</option>
+                <option value="ja">日本語 · JA</option>
+                <option value="en">English · EN</option>
+              </select>
+            </label>
+          </div>
+          <label class="device-picker">
+            <span>OpenAI-compatible Base URL</span>
+            <input id="translation-base-url" type="url" value="http://127.0.0.1:11434/v1" spellcheck="false" />
+          </label>
+          <label class="device-picker">
+            <span>模型名称</span>
+            <input id="translation-model" type="text" placeholder="填写供应商提供的模型 ID" spellcheck="false" />
+          </label>
+          <label class="device-picker translation-api-key">
+            <span>API Token（多数云服务必填，不保存）</span>
+            <input id="translation-api-key" type="password" autocomplete="off" spellcheck="false" />
+          </label>
+          <label id="translation-insecure-http-row" class="translation-insecure-http" hidden>
+            <input id="translation-allow-insecure-http" type="checkbox" />
+            <span>
+              <strong>允许不安全的远程 HTTP</strong>
+              <small>API Token 和 final 原文将以明文传输，可能被网络中的第三方读取或篡改。</small>
+            </span>
+          </label>
+          <div class="translation-actions">
+            <button id="test-translation" class="secondary-button" type="button">测试连接</button>
+            <p id="translation-status" aria-live="polite">关闭；原文照常保存。</p>
+          </div>
+          <small class="translation-privacy">本机回环地址可直接使用 HTTP；远程 HTTP 必须显式确认风险，仍建议优先配置 HTTPS。API Token 不保存。</small>
+        </section>
+
         <section class="storage-panel" aria-label="Durable storage">
-          <div class="rail-index">02 / STORAGE</div>
+          <div class="rail-index">03 / STORAGE</div>
           <div class="storage-row">
             <span id="storage-indicator" class="storage-indicator" data-status="initializing"></span>
             <div>
@@ -108,7 +176,7 @@ app.innerHTML = `
 
         <label class="consent-row">
           <input id="consent" type="checkbox" />
-          <span>我确认本次会议允许录音转写，并同意转写文本以 SQLite/WAL 形式保存在本机应用数据目录。</span>
+          <span>我确认本次会议允许录音转写，并同意原文与可用译文保存在本机；启用翻译时，final 原文会发送给所选服务，其中第三方云端服务受其隐私与计费规则约束。</span>
         </label>
 
         <div class="session-actions">
@@ -121,7 +189,7 @@ app.innerHTML = `
         <p id="error" class="error-line" role="alert"></p>
 
         <section class="history-panel" aria-label="Recent meetings">
-          <div class="rail-index">03 / RECENT</div>
+          <div class="rail-index">04 / RECENT</div>
           <button id="open-recent" class="secondary-button" type="button" disabled>重新打开最近会议</button>
           <p id="recent-summary" class="recent-summary">暂无已打开会议。</p>
         </section>
@@ -129,21 +197,32 @@ app.innerHTML = `
 
       <section class="transcript-stage" aria-labelledby="transcript-title">
         <div class="stage-heading">
-          <div>
-            <div class="rail-index">04 / LIVE TRANSCRIPT</div>
+          <div class="stage-copy">
+            <div class="rail-index">05 / LIVE TRANSCRIPT</div>
             <h2 id="transcript-title">实时文字</h2>
+            <p>原文先持久保存；若启用翻译，译文随后对齐显示，失败不会影响原文。</p>
           </div>
-          <div class="session-clock"><span id="lifecycle">BOOTING</span><strong id="elapsed">00:00:00</strong></div>
+          <div class="session-clock">
+            <span id="lifecycle">BOOTING</span>
+            <strong id="elapsed">00:00:00</strong>
+          </div>
         </div>
-        <div id="empty-state" class="empty-state">
-          <div class="signal-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-          <p>声音就绪后点击开始。interim 只显示在屏幕上；final 必须先提交到本地 SQLite，才会进入已保存列表和导出。</p>
+        <div class="transcript-viewport">
+          <div id="empty-state" class="empty-state">
+            <div class="signal-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <strong>等待会议声音</strong>
+            <p>确认设备和识别语言后开始。只有成功写入本地 SQLite 的 final 内容才会进入记录。</p>
+          </div>
+          <ol id="transcript" class="transcript-list" aria-label="已保存的实时转写"></ol>
+          <p id="transcript-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+          <div id="interim" class="interim-line" hidden>
+            <span>正在识别</span>
+            <p></p>
+          </div>
         </div>
-        <ol id="transcript" class="transcript-list" aria-live="polite"></ol>
-        <div id="interim" class="interim-line" hidden><span>INTERIM</span><p></p></div>
         <section class="export-panel" aria-label="Exports">
           <div class="export-actions">
-            <span>导出已保存会议</span>
+            <span>会议完成后可用</span>
             <button id="copy-transcript" class="secondary-button" type="button" disabled>复制全部转写</button>
             <button id="export-all" class="secondary-button" type="button" disabled>导出 JSON / Markdown / TXT</button>
           </div>
@@ -153,6 +232,7 @@ app.innerHTML = `
         </section>
         <footer class="stage-footer">
           <span>队列 <strong id="queue-depth">0 / 8</strong></span>
+          <span>翻译 <strong id="translation-queue-depth">关闭</strong></span>
           <span>识别语言 <strong id="footer-language">中文 · ZH</strong></span>
           <span>存储 <strong id="footer-storage">初始化</strong></span>
         </footer>
@@ -171,6 +251,18 @@ const controls = {
   systemDevice: element<HTMLSelectElement>("#system-device"),
   microphoneDevice: element<HTMLSelectElement>("#microphone-device"),
   recognitionLanguage: element<HTMLSelectElement>("#recognition-language"),
+  translationEnabled: element<HTMLInputElement>("#translation-enabled"),
+  translationProvider: element<HTMLSelectElement>("#translation-provider"),
+  translationLanguage: element<HTMLSelectElement>("#translation-language"),
+  translationBaseUrl: element<HTMLInputElement>("#translation-base-url"),
+  translationModel: element<HTMLInputElement>("#translation-model"),
+  translationApiKey: element<HTMLInputElement>("#translation-api-key"),
+  translationAllowInsecureHttp: element<HTMLInputElement>(
+    "#translation-allow-insecure-http",
+  ),
+  translationInsecureHttpRow: element<HTMLElement>("#translation-insecure-http-row"),
+  testTranslation: element<HTMLButtonElement>("#test-translation"),
+  translationStatus: element<HTMLParagraphElement>("#translation-status"),
   deviceStatus: element<HTMLParagraphElement>("#device-status"),
   consent: element<HTMLInputElement>("#consent"),
   start: element<HTMLButtonElement>("#start"),
@@ -182,9 +274,11 @@ const controls = {
   model: element<HTMLElement>("#model-status"),
   empty: element<HTMLElement>("#empty-state"),
   transcript: element<HTMLOListElement>("#transcript"),
+  transcriptAnnouncer: element<HTMLParagraphElement>("#transcript-announcer"),
   interim: element<HTMLElement>("#interim"),
   interimText: element<HTMLParagraphElement>("#interim p"),
   queue: element<HTMLElement>("#queue-depth"),
+  translationQueue: element<HTMLElement>("#translation-queue-depth"),
   storageIndicator: element<HTMLElement>("#storage-indicator"),
   storageStatus: element<HTMLElement>("#storage-status"),
   storageDetail: element<HTMLElement>("#storage-detail"),
@@ -209,6 +303,7 @@ let audioDevices: AudioDeviceInventory | null = null;
 let audioDeviceLoadError: string | null = null;
 let preparedLanguage: MvpRecognitionLanguage = "zh";
 let languagePreparing = false;
+let translationTesting = false;
 let lastClipboardText: string | null = null;
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 
@@ -226,8 +321,131 @@ const LANGUAGE_LABELS: Record<MvpRecognitionLanguage, string> = {
   en: "English · EN",
 };
 
+const TRANSLATION_PROVIDER_URLS = {
+  ollama: "http://127.0.0.1:11434/v1",
+  lmstudio: "http://127.0.0.1:1234/v1",
+  openai: "https://api.openai.com/v1",
+  deepseek: "https://api.deepseek.com",
+  openrouter: "https://openrouter.ai/api/v1",
+  xai: "https://api.x.ai/v1",
+  dashscope: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+} as const;
+
 function currentRecognitionLanguage(): MvpRecognitionLanguage {
   return parseMvpRecognitionLanguage(controls.recognitionLanguage.value);
+}
+
+function currentTranslationConfig(): TranslationConfig {
+  return {
+    enabled: controls.translationEnabled.checked,
+    baseUrl: controls.translationBaseUrl.value.trim(),
+    model: controls.translationModel.value.trim(),
+    apiKey: controls.translationApiKey.value.trim() || null,
+    targetLanguage: parseMvpRecognitionLanguage(controls.translationLanguage.value),
+    allowInsecureHttp: controls.translationAllowInsecureHttp.checked,
+  };
+}
+
+function translationConfigReady(): boolean {
+  const config = currentTranslationConfig();
+  const insecureHttpAcknowledged =
+    !requiresInsecureRemoteHttpAcknowledgement(config.baseUrl) || config.allowInsecureHttp;
+  return (
+    !config.enabled ||
+    (config.baseUrl.length > 0 && config.model.length > 0 && insecureHttpAcknowledged)
+  );
+}
+
+function readTranslationPreference(): TranslationPreference | null {
+  try {
+    const serialized = window.localStorage.getItem(TRANSLATION_PREFERENCE_KEY);
+    const preference = parseTranslationPreference(serialized);
+    if (serialized !== null && preference === null) {
+      window.localStorage.removeItem(TRANSLATION_PREFERENCE_KEY);
+    }
+    return preference;
+  } catch {
+    return null;
+  }
+}
+
+function persistTranslationPreference(): void {
+  const config = currentTranslationConfig();
+  if (config.baseUrl.length === 0 || config.model.length === 0) return;
+  try {
+    window.localStorage.setItem(
+      TRANSLATION_PREFERENCE_KEY,
+      JSON.stringify({
+        version: 1,
+        enabled: config.enabled,
+        baseUrl: config.baseUrl,
+        model: config.model,
+        targetLanguage: config.targetLanguage,
+        allowInsecureHttp: config.allowInsecureHttp,
+      }),
+    );
+  } catch {
+    // Non-secret settings remain valid for this run when local storage is unavailable.
+  }
+}
+
+function applyTranslationPreference(preference: TranslationPreference | null): void {
+  if (preference === null) return;
+  controls.translationEnabled.checked = preference.enabled;
+  controls.translationBaseUrl.value = preference.baseUrl;
+  controls.translationModel.value = preference.model;
+  controls.translationLanguage.value = preference.targetLanguage;
+  controls.translationAllowInsecureHttp.checked = preference.allowInsecureHttp;
+  const provider = Object.entries(TRANSLATION_PROVIDER_URLS).find(
+    ([, url]) => url === preference.baseUrl,
+  )?.[0];
+  controls.translationProvider.value = provider ?? "custom";
+}
+
+function renderTranslationControls(active: boolean): void {
+  const config = currentTranslationConfig();
+  const requiresInsecureHttp = requiresInsecureRemoteHttpAcknowledgement(config.baseUrl);
+  controls.translationQueue.textContent = config.enabled
+    ? `${latest?.translationQueueDepth ?? 0} / 32`
+    : "关闭";
+  const locked = active || translationTesting;
+  controls.translationEnabled.disabled = active;
+  controls.translationProvider.disabled = locked || !config.enabled;
+  controls.translationLanguage.disabled = locked || !config.enabled;
+  controls.translationBaseUrl.disabled = locked || !config.enabled;
+  controls.translationModel.disabled = locked || !config.enabled;
+  controls.translationApiKey.disabled = locked || !config.enabled;
+  controls.translationInsecureHttpRow.hidden = !config.enabled || !requiresInsecureHttp;
+  controls.translationAllowInsecureHttp.disabled =
+    locked || !config.enabled || !requiresInsecureHttp;
+  controls.testTranslation.disabled =
+    locked || !config.enabled || !translationConfigReady();
+  if (!config.enabled) {
+    controls.translationStatus.dataset.status = "idle";
+    controls.translationStatus.textContent = "关闭；原文照常保存。";
+  } else if (config.targetLanguage === currentRecognitionLanguage()) {
+    controls.translationStatus.dataset.status = "skipped";
+    controls.translationStatus.textContent = "译文语言与识别语言相同，本次将跳过模型请求。";
+  } else if (!translationConfigReady()) {
+    controls.translationStatus.dataset.status = "error";
+    controls.translationStatus.textContent =
+      requiresInsecureHttp && !config.allowInsecureHttp
+        ? "远程 HTTP 会明文传输 Token 和会议文字；请勾选风险确认，或改用 HTTPS。"
+        : "请填写 Base URL 和模型名称。";
+  } else if (active) {
+    controls.translationStatus.dataset.status = requiresInsecureHttp ? "warning" : "ready";
+    controls.translationStatus.textContent = requiresInsecureHttp
+      ? "会议进行中，已允许远程明文 HTTP；Token 和 final 原文可能被读取或篡改。"
+      : "会议进行中，翻译配置已锁定。";
+  } else if (
+    !translationTesting &&
+    !["success", "error"].includes(controls.translationStatus.dataset.status ?? "")
+  ) {
+    controls.translationStatus.dataset.status = requiresInsecureHttp ? "warning" : "ready";
+    controls.translationStatus.textContent = requiresInsecureHttp
+      ? "已允许远程明文 HTTP；Token 和 final 原文可能被读取或篡改。"
+      : "配置已就绪；建议开始前测试连接。";
+  }
 }
 
 function currentAudioDeviceSelection(): {
@@ -352,6 +570,7 @@ function canExport(snapshot: MvpSnapshot): boolean {
     snapshot.meetingId !== null &&
     !isActive(snapshot) &&
     hasCompleteMvpTranscript(snapshot) &&
+    snapshot.translationQueueDepth === 0 &&
     ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus) &&
     hasAllMvpExportFormats(snapshot.availableExports) &&
     BigInt(snapshot.savedFinalCount) > 0n
@@ -363,6 +582,7 @@ function canCopyTranscript(snapshot: MvpSnapshot): boolean {
     snapshot.meetingId !== null &&
     !isActive(snapshot) &&
     hasCompleteMvpTranscript(snapshot) &&
+    snapshot.translationQueueDepth === 0 &&
     ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus) &&
     BigInt(snapshot.savedFinalCount) > 0n
   );
@@ -418,6 +638,125 @@ function renderExports(snapshot: MvpSnapshot): void {
   );
 }
 
+function transcriptRow(key: string): HTMLLIElement {
+  const item = document.createElement("li");
+  const order = document.createElement("span");
+  const content = document.createElement("div");
+  const body = document.createElement("p");
+  const translation = document.createElement("p");
+  const badge = document.createElement("span");
+  item.className = "saved-final";
+  item.dataset.sequence = key;
+  item.dataset.enter = "true";
+  order.className = "transcript-sequence";
+  order.dataset.role = "sequence";
+  content.className = "transcript-content";
+  body.dataset.role = "text";
+  translation.className = "translation-line";
+  translation.dataset.role = "translation";
+  translation.hidden = true;
+  badge.className = "saved-badge";
+  badge.dataset.role = "saved";
+  badge.textContent = "已保存";
+  content.append(body, translation);
+  item.append(order, content, badge);
+  item.addEventListener(
+    "animationend",
+    () => {
+      delete item.dataset.enter;
+    },
+    { once: true },
+  );
+  return item;
+}
+
+function updateTranscriptRow(item: HTMLLIElement, segment: TranscriptSegment): void {
+  const order = item.querySelector<HTMLElement>('[data-role="sequence"]');
+  const body = item.querySelector<HTMLParagraphElement>('[data-role="text"]');
+  const translation = item.querySelector<HTMLParagraphElement>('[data-role="translation"]');
+  if (!order || !body || !translation) throw new Error("Transcript row structure is invalid.");
+  const sequence = segment.sequence.padStart(2, "0");
+  if (order.textContent !== sequence) order.textContent = sequence;
+  if (body.textContent !== segment.text) body.textContent = segment.text;
+  translation.dataset.status = segment.translationStatus;
+  translation.title = "";
+  if (segment.translationStatus === "completed") {
+    translation.hidden = false;
+    translation.textContent = `${LANGUAGE_LABELS[segment.translationTarget ?? "zh"]} 译文 · ${segment.translationText ?? ""}`;
+  } else if (segment.translationStatus === "pending") {
+    translation.hidden = false;
+    translation.textContent = "正在通过所选服务翻译…";
+  } else if (segment.translationStatus === "failed") {
+    translation.hidden = false;
+    translation.textContent = "翻译失败，原文已安全保存。";
+    translation.title = segment.translationError ?? "";
+  } else if (segment.translationStatus === "skipped") {
+    translation.hidden = false;
+    translation.textContent = "译文语言与识别语言相同，已跳过翻译。";
+  } else {
+    translation.hidden = true;
+    translation.textContent = "";
+  }
+  item.dataset.revision = String(segment.revision);
+}
+
+function renderTranscript(finals: readonly TranscriptSegment[]): void {
+  const currentRows = Array.from(controls.transcript.children).map((child) => {
+    if (!(child instanceof HTMLLIElement) || !child.dataset.sequence) {
+      throw new Error("Transcript list contains an invalid row.");
+    }
+    return child;
+  });
+  const currentKeys = currentRows.map((row) => row.dataset.sequence as string);
+  const desiredKeys = finals.map((segment) => segment.sequence);
+  const plan = planTranscriptReconciliation(currentKeys, desiredKeys);
+  const rowByKey = new Map(currentRows.map((row) => [row.dataset.sequence as string, row]));
+  const followLatest =
+    controls.transcript.scrollHeight -
+      controls.transcript.scrollTop -
+      controls.transcript.clientHeight <
+    72;
+  const previousScrollHeight = controls.transcript.scrollHeight;
+
+  for (const key of plan.removals) {
+    rowByKey.get(key)?.remove();
+    rowByKey.delete(key);
+  }
+
+  for (const [index, segment] of finals.entries()) {
+    let item = rowByKey.get(segment.sequence);
+    if (!item) {
+      item = transcriptRow(segment.sequence);
+      rowByKey.set(segment.sequence, item);
+    }
+    updateTranscriptRow(item, segment);
+    const currentAtIndex = controls.transcript.children.item(index);
+    if (currentAtIndex !== item) {
+      controls.transcript.insertBefore(item, currentAtIndex);
+    }
+  }
+
+  if (plan.insertions.length > 0) {
+    const inserted = new Set(plan.insertions);
+    let latestInserted: TranscriptSegment | undefined;
+    for (let index = finals.length - 1; index >= 0; index -= 1) {
+      if (inserted.has(finals[index].sequence)) {
+        latestInserted = finals[index];
+        break;
+      }
+    }
+    if (latestInserted) {
+      controls.transcriptAnnouncer.textContent = `已保存第 ${latestInserted.sequence} 条：${latestInserted.text}`;
+    }
+    if (followLatest) {
+      controls.transcript.scrollTop = controls.transcript.scrollHeight;
+    } else {
+      controls.transcript.scrollTop +=
+        controls.transcript.scrollHeight - previousScrollHeight;
+    }
+  }
+}
+
 async function writeClipboardText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText === undefined) {
     throw new Error("当前窗口无法访问剪贴板 API");
@@ -445,6 +784,8 @@ function render(snapshot: MvpSnapshot): void {
   controls.start.disabled =
     !ready ||
     languagePreparing ||
+    translationTesting ||
+    !translationConfigReady() ||
     preparedLanguage !== currentRecognitionLanguage() ||
     !controls.consent.checked ||
     currentAudioDeviceSelection() === null;
@@ -461,7 +802,11 @@ function render(snapshot: MvpSnapshot): void {
     !snapshot.modelReady;
   controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
   renderAudioDeviceControls(active);
+  renderTranslationControls(active);
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
+  controls.translationQueue.textContent = controls.translationEnabled.checked
+    ? `${snapshot.translationQueueDepth} / 32`
+    : "关闭";
   controls.error.textContent = formatMvpSnapshotError(snapshot);
   controls.storageIndicator.dataset.status =
     snapshot.durabilityStatus === "error"
@@ -503,21 +848,7 @@ function render(snapshot: MvpSnapshot): void {
   renderSource(snapshot.system, paused);
   renderSource(snapshot.microphone, paused);
 
-  controls.transcript.replaceChildren(
-    ...snapshot.finals.map((segment) => {
-      const item = document.createElement("li");
-      const order = document.createElement("time");
-      const body = document.createElement("p");
-      const badge = document.createElement("span");
-      item.className = "saved-final";
-      order.textContent = segment.sequence?.padStart(2, "0") ?? "??";
-      body.textContent = segment.text;
-      badge.className = "saved-badge";
-      badge.textContent = "已保存";
-      item.append(order, body, badge);
-      return item;
-    }),
-  );
+  renderTranscript(snapshot.finals);
   controls.empty.hidden = snapshot.finals.length > 0 || snapshot.interim !== null || active;
   controls.interim.hidden = snapshot.interim === null;
   controls.interimText.textContent = snapshot.interim?.text ?? "";
@@ -557,7 +888,7 @@ async function transcriptTextForMeeting(meetingId: string): Promise<string> {
 
 function schedulePoll(): void {
   if (pollTimer !== null) window.clearTimeout(pollTimer);
-  if (!latest || !isActive(latest)) return;
+  if (!latest || (!isActive(latest) && latest.translationQueueDepth === 0)) return;
   pollTimer = window.setTimeout(async () => {
     try {
       render(await call("mvp_snapshot"));
@@ -583,6 +914,72 @@ for (const select of [controls.systemDevice, controls.microphoneDevice]) {
     }
   });
 }
+
+function translationSettingsChanged(): void {
+  persistTranslationPreference();
+  controls.translationStatus.dataset.status = "ready";
+  controls.translationStatus.textContent = "配置已更新；建议开始前测试连接。";
+  if (latest) {
+    render(latest);
+  } else {
+    renderTranslationControls(false);
+  }
+}
+
+controls.translationProvider.addEventListener("change", () => {
+  const provider = controls.translationProvider.value as keyof typeof TRANSLATION_PROVIDER_URLS;
+  const preset = TRANSLATION_PROVIDER_URLS[provider];
+  if (preset !== undefined) controls.translationBaseUrl.value = preset;
+  translationSettingsChanged();
+});
+
+controls.translationBaseUrl.addEventListener("input", () => {
+  const matchesPreset = Object.values(TRANSLATION_PROVIDER_URLS).includes(
+    controls.translationBaseUrl.value.trim() as (typeof TRANSLATION_PROVIDER_URLS)[keyof typeof TRANSLATION_PROVIDER_URLS],
+  );
+  if (!matchesPreset) controls.translationProvider.value = "custom";
+  translationSettingsChanged();
+});
+
+controls.translationModel.addEventListener("input", translationSettingsChanged);
+
+for (const control of [
+  controls.translationEnabled,
+  controls.translationLanguage,
+  controls.translationBaseUrl,
+  controls.translationModel,
+  controls.translationAllowInsecureHttp,
+]) {
+  control.addEventListener("change", translationSettingsChanged);
+}
+
+controls.translationApiKey.addEventListener("input", () => {
+  controls.translationStatus.dataset.status = "ready";
+  controls.translationStatus.textContent = "Token 仅用于当前进程；建议开始前测试连接。";
+});
+
+controls.testTranslation.addEventListener("click", async () => {
+  translationTesting = true;
+  controls.translationStatus.dataset.status = "testing";
+  controls.translationStatus.textContent = "正在连接所选服务并请求一条测试译文…";
+  if (latest) render(latest);
+  try {
+    const probe = parseTranslationProbe(
+      await invoke<unknown>("mvp_test_translation", {
+        config: currentTranslationConfig(),
+      }),
+    );
+    controls.translationStatus.dataset.status = "success";
+    controls.translationStatus.textContent = `连接成功 · ${probe.model} · ${probe.latencyMs} ms · ${probe.preview}`;
+    persistTranslationPreference();
+  } catch (error) {
+    controls.translationStatus.dataset.status = "error";
+    controls.translationStatus.textContent = `连接失败：${message(error)}`;
+  } finally {
+    translationTesting = false;
+    if (latest) render(latest);
+  }
+});
 
 controls.recognitionLanguage.addEventListener("change", async () => {
   const language = currentRecognitionLanguage();
@@ -628,6 +1025,7 @@ controls.start.addEventListener("click", async () => {
       await call("mvp_start", {
         consentAccepted: controls.consent.checked,
         language: currentRecognitionLanguage(),
+        translation: currentTranslationConfig(),
         ...selection,
       }),
     );
@@ -727,6 +1125,9 @@ controls.copyTranscript.addEventListener("click", async () => {
     controls.copyTranscript.disabled = latest === null || !canCopyTranscript(latest);
   }
 });
+
+applyTranslationPreference(readTranslationPreference());
+renderTranslationControls(false);
 
 void (async () => {
   try {

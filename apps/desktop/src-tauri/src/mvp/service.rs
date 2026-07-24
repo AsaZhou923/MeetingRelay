@@ -11,6 +11,7 @@ use super::{
         DurableFinal, FinalCandidate, MvpStorage, MvpStorageWriter, segment_from_durable,
         visible_window_start_sequence,
     },
+    translation::{TranslationConfig, TranslationSubmitter, TranslationWorker},
 };
 
 pub(crate) const MVP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
@@ -52,6 +53,7 @@ pub struct MvpService {
     snapshot: Arc<Mutex<MvpSnapshot>>,
     storage: Option<MvpStorage>,
     storage_writer: Option<Arc<MvpStorageWriter>>,
+    translation: Mutex<Option<TranslationWorker>>,
     inner: Mutex<ServiceInner>,
     shutdown_started: AtomicBool,
 }
@@ -135,10 +137,15 @@ impl MvpService {
             snapshot.durability_status = "error".to_owned();
             snapshot.error = storage_error.clone();
         }
+        let snapshot = Arc::new(Mutex::new(snapshot));
+        let translation = storage_writer.as_ref().and_then(|writer| {
+            TranslationWorker::start(Arc::clone(&snapshot), Arc::clone(writer)).ok()
+        });
         Self {
-            snapshot: Arc::new(Mutex::new(snapshot)),
+            snapshot,
             storage,
             storage_writer,
+            translation: Mutex::new(translation),
             inner: Mutex::new(ServiceInner::default()),
             shutdown_started: AtomicBool::new(false),
         }
@@ -146,15 +153,17 @@ impl MvpService {
     pub fn snapshot(&self) -> MvpSnapshot {
         let inner = lock(&self.inner);
         #[cfg(windows)]
-        {
-            self.snapshot_locked(&inner)
-        }
+        let mut snapshot = { self.snapshot_locked(&inner) };
         #[cfg(not(windows))]
-        {
+        let mut snapshot = {
             let mut snapshot = lock(&self.snapshot).clone();
             snapshot.enforce_bounds();
             snapshot
-        }
+        };
+        snapshot.translation_queue_depth = lock(&self.translation)
+            .as_ref()
+            .map_or(0, TranslationWorker::queue_depth);
+        snapshot
     }
 
     pub fn preflight(&self) -> Result<MvpSnapshot, String> {
@@ -187,6 +196,7 @@ impl MvpService {
             consent_accepted,
             AudioDeviceSelection::default(),
             "zh",
+            None,
         )
     }
 
@@ -195,19 +205,24 @@ impl MvpService {
         consent_accepted: bool,
         selection: AudioDeviceSelection,
         language: &str,
+        translation: Option<TranslationConfig>,
     ) -> Result<MvpSnapshot, String> {
         if !consent_accepted {
             return Err("CONSENT_REQUIRED".to_owned());
         }
         let language = RecognitionLanguage::parse(language)?;
+        let translation = translation.unwrap_or_default();
+        if translation.enabled {
+            translation.validate_enabled()?;
+        }
 
         #[cfg(windows)]
         {
-            self.start_windows(selection, language)
+            self.start_windows(selection, language, translation)
         }
         #[cfg(not(windows))]
         {
-            let _ = (selection, language);
+            let _ = (selection, language, translation);
             Err("MVP_WINDOWS_ONLY".to_owned())
         }
     }
@@ -325,14 +340,13 @@ impl MvpService {
         }
 
         #[cfg(windows)]
-        {
-            self.shutdown_windows(deadline)
-        }
+        let runtime_error = self.shutdown_windows(deadline).err();
         #[cfg(not(windows))]
-        {
-            let _ = deadline;
-            Ok(())
-        }
+        let runtime_error: Option<String> = None;
+        let translation_error = lock(&self.translation)
+            .take()
+            .and_then(|translation| translation.shutdown_before(deadline).err());
+        runtime_error.or(translation_error).map_or(Ok(()), Err)
     }
 
     fn fail(&self, error: &str) {
@@ -392,10 +406,14 @@ impl MvpService {
         language: RecognitionLanguage,
     ) -> Result<InferenceWorker, String> {
         let paths = resolve_model_paths().inspect_err(|error| self.fail(error))?;
+        let translation = lock(&self.translation)
+            .as_ref()
+            .map(TranslationWorker::submitter);
         InferenceWorker::prepare(
             Arc::clone(&self.snapshot),
             paths,
             self.storage_writer.clone(),
+            translation,
             language,
         )
         .inspect_err(|error| self.fail(error))
@@ -507,6 +525,7 @@ impl MvpService {
         &self,
         selection: AudioDeviceSelection,
         language: RecognitionLanguage,
+        translation_config: TranslationConfig,
     ) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
@@ -520,8 +539,21 @@ impl MvpService {
             return Err("MVP_NOT_READY".to_owned());
         }
         self.ensure_inference_worker(&mut inner, language)?;
+        if translation_config.enabled && lock(&self.translation).is_none() {
+            return Err("TRANSLATION_WORKER_UNAVAILABLE".to_owned());
+        }
         let model_label = language.model_label();
         let meeting = writer.start_meeting(true, &model_label)?;
+        if let Some(translation) = lock(&self.translation).as_ref()
+            && let Err(error) = translation.submitter().configure_session(
+                &meeting.id,
+                language.code(),
+                &translation_config,
+            )
+        {
+            let _ = writer.interrupt_meeting(&meeting.id);
+            return Err(error);
+        }
 
         if let Some(inference) = inner.inference.as_ref() {
             inference
@@ -725,6 +757,9 @@ impl MvpService {
                 .barrier_before(deadline)
                 .inspect_err(|error| self.fail(error))?;
         }
+        if let Some(translation) = lock(&self.translation).as_ref() {
+            translation.submitter().clear_session(&session.meeting_id);
+        }
         let writer = self
             .storage_writer
             .as_ref()
@@ -750,7 +785,11 @@ impl MvpService {
         if completion_error.is_some() {
             snapshot.error = completion_error;
         }
-        Ok(public_snapshot(&mut snapshot, submitter.as_ref()))
+        let mut public = public_snapshot(&mut snapshot, submitter.as_ref());
+        public.translation_queue_depth = lock(&self.translation)
+            .as_ref()
+            .map_or(0, TranslationWorker::queue_depth);
+        Ok(public)
     }
 
     #[cfg(windows)]
@@ -1276,6 +1315,7 @@ impl InferenceWorker {
         snapshot: Arc<Mutex<MvpSnapshot>>,
         paths: LockedSherpaRealtimePaths,
         storage_writer: Option<Arc<MvpStorageWriter>>,
+        translation: Option<TranslationSubmitter>,
         language: RecognitionLanguage,
     ) -> Result<Self, String> {
         let (ready_sender, ready_receiver) = sync_channel(1);
@@ -1302,6 +1342,7 @@ impl InferenceWorker {
                         worker_shared,
                         snapshot,
                         storage_writer,
+                        translation,
                     );
                 }
             })
@@ -1373,7 +1414,12 @@ fn inference_loop(
     shared: Arc<InferenceShared>,
     snapshot: Arc<Mutex<MvpSnapshot>>,
     storage_writer: Option<Arc<MvpStorageWriter>>,
+    translation: Option<TranslationSubmitter>,
 ) {
+    let sinks = InferenceSinks {
+        storage_writer: storage_writer.as_deref(),
+        translation: translation.as_ref(),
+    };
     loop {
         let scheduled = match finals.try_recv() {
             Ok(final_task) => Some((None, final_task)),
@@ -1387,7 +1433,7 @@ fn inference_loop(
                 &profile,
                 &shared,
                 &snapshot,
-                storage_writer.as_deref(),
+                sinks,
                 interim_generation,
                 task,
             );
@@ -1399,6 +1445,13 @@ fn inference_loop(
         }
         thread::park_timeout(Duration::from_millis(20));
     }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct InferenceSinks<'a> {
+    storage_writer: Option<&'a MvpStorageWriter>,
+    translation: Option<&'a TranslationSubmitter>,
 }
 
 #[cfg(windows)]
@@ -1456,7 +1509,7 @@ fn process_inference_task(
     profile: &RecognizerProfile,
     shared: &InferenceShared,
     snapshot: &Mutex<MvpSnapshot>,
-    storage_writer: Option<&MvpStorageWriter>,
+    sinks: InferenceSinks<'_>,
     interim_generation: Option<u64>,
     task: InferenceTask,
 ) {
@@ -1480,7 +1533,7 @@ fn process_inference_task(
             }
             if task.is_final {
                 let sequence = shared.next_durable_sequence_candidate();
-                let Some(storage_writer) = storage_writer else {
+                let Some(storage_writer) = sinks.storage_writer else {
                     task.session_errors
                         .mark_incomplete("MVP_STORAGE_UNAVAILABLE");
                     let _ = publish_if_current(
@@ -1503,7 +1556,13 @@ fn process_inference_task(
                 }) {
                     Ok(ack) => {
                         shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);
-                        Some(Ok((ack.final_segment, ack.duplicate)))
+                        let mut final_segment = ack.final_segment;
+                        if !ack.duplicate
+                            && let Some(translation) = sinks.translation
+                        {
+                            translation.decorate_and_submit(&mut final_segment);
+                        }
+                        Some(Ok((final_segment, ack.duplicate)))
                     }
                     Err(error) => {
                         task.session_errors.mark_incomplete(&error);
@@ -1522,6 +1581,10 @@ fn process_inference_task(
                     ended_at_ms: None,
                     committed_at: None,
                     commit_id: None,
+                    translation_status: "disabled".to_owned(),
+                    translation_target: None,
+                    translation_text: None,
+                    translation_error: None,
                 };
                 let _ = publish_if_current(
                     shared,
@@ -2489,6 +2552,10 @@ mod tests {
             ended_at_ms: None,
             committed_at: None,
             commit_id: None,
+            translation_status: "disabled".to_owned(),
+            translation_target: None,
+            translation_text: None,
+            translation_error: None,
         });
 
         let returned = public_snapshot(&mut snapshot, Some(&submitter));

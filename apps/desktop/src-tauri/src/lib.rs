@@ -53,6 +53,7 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
             mvp::mvp_preflight,
             mvp::mvp_audio_devices,
             mvp::mvp_prepare_language,
+            mvp::mvp_test_translation,
             mvp::mvp_start,
             mvp::mvp_stop,
             mvp::mvp_pause,
@@ -103,7 +104,7 @@ mod tests {
         let tauri::ipc::InvokeResponseBody::Json(body) = response else {
             panic!("MVP snapshot returned a raw IPC body");
         };
-        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.durable.v1""#));
+        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.durable.v2""#));
         assert!(body.contains(r#""lifecycle":"booting""#));
         assert!(body.contains(r#""localOnly":true,"memoryOnly":false"#));
     }
