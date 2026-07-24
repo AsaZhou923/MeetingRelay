@@ -86,9 +86,9 @@ DashScope: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 实现参考了 `E:\Project Code\ref_repo\LiveTranslate` 的通用 `api_base + api_key + model` 配置方式，但没有照搬其明文密钥持久化。供应商协议参考：[Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)、[LM Studio OpenAI-compatible endpoints](https://lmstudio.ai/docs/developer/openai-compat)、[OpenRouter Quickstart](https://openrouter.ai/docs/quickstart)、[DeepSeek API Docs](https://api-docs.deepseek.com/)、[xAI REST API](https://docs.x.ai/developers/rest-api-reference/inference)、[阿里云百炼 OpenAI-compatible API](https://www.alibabacloud.com/help/en/model-studio/deepseek-api)。
 
-### 预发布 EXE
+### 正式 Release EXE
 
-[`v0.0.1` 预发布版](https://github.com/AsaZhou923/MeetingRelay/releases/tag/v0.0.1) 提供当前源码构建的 `MeetingRelay.exe`，SHA-256 为 `2D8042763C3319E42A6BEB47953A4D1A5F6A1F3FE2EBA1A3FFE97ED0BF3C64BB`，包含稳定实时字幕、三语识别选择、OpenAI-compatible 翻译和显式确认后的远程 HTTP 支持。该文件未签名，也不包含模型和 Sherpa DLL，不能作为独立的一键安装包使用；完整同机运行目录仍应使用下面的 personal release 命令生成。
+[`v0.0.1` 正式 Release](https://github.com/AsaZhou923/MeetingRelay/releases/tag/v0.0.1) 提供当前源码构建的 `MeetingRelay.exe`，SHA-256 为 `2D8042763C3319E42A6BEB47953A4D1A5F6A1F3FE2EBA1A3FFE97ED0BF3C64BB`，包含稳定实时字幕、三语识别选择、OpenAI-compatible 翻译和显式确认后的远程 HTTP 支持。该文件未签名，也不包含模型和 Sherpa DLL，不能作为独立的一键安装包使用；完整同机运行目录仍应使用下面的 personal release 命令生成。
 
 生成个人 release：
 
@@ -121,7 +121,7 @@ pnpm mvp:release:personal:test
 - 60 分钟麦克风链路已完成真实设备耐久验收；设备热插拔、系统输出回环，以及有代表性会议内容下的延迟和准确率仍需继续验收。
 - 尚未加入独立 fallback；只有真实故障证明当前 Sherpa 恢复能力不足时再增加。
 - 当前翻译以每条 final 的非流式 Chat Completions 请求实现；尚未提供 token 级流式显示、手动重试、上下文窗口、代理、自定义请求体/Headers 或完整 provider provenance/version。本机服务需由用户安装模型，云端服务需自行准备账户、模型权限和 API Token。
-- `v0.0.1` 仍是个人内部评估用预发布；附件未签名、不包含模型和 Sherpa runtime，发布页必须与 README 中的 SHA-256 保持一致。
+- `v0.0.1` 是 GitHub 正式 Release，但附件仍是未签名的个人内部评估构建，不包含模型和 Sherpa runtime；发布页必须与 README 中的 SHA-256 保持一致。
 - main 分支不再维护企业审计、完整 provenance、formal evidence 或每个微小 schema 的文档门禁。
 
 ## 仓库结构
