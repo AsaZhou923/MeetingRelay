@@ -27,12 +27,54 @@ pub const DEFAULT_STATUS_QUEUE_CAPACITY: usize = 16;
 pub const MAX_DEVICE_ID_LENGTH: usize = 1024;
 
 /// Stable identifiers for the two MVP capture sources.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AudioSourceId {
     /// Audio currently rendered by the default Windows output endpoint.
     SystemOutput,
     /// Audio captured by the default Windows input endpoint.
     Microphone,
+}
+
+/// Capture source set requested for a session.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioSourceMode {
+    SystemOnly,
+    MicrophoneOnly,
+    #[default]
+    Both,
+}
+
+impl AudioSourceMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SystemOnly => "system_only",
+            Self::MicrophoneOnly => "microphone_only",
+            Self::Both => "both",
+        }
+    }
+
+    #[must_use]
+    pub const fn captures_system(self) -> bool {
+        matches!(self, Self::SystemOnly | Self::Both)
+    }
+
+    #[must_use]
+    pub const fn captures_microphone(self) -> bool {
+        matches!(self, Self::MicrophoneOnly | Self::Both)
+    }
+
+    #[must_use]
+    pub fn active_sources(self) -> Vec<AudioSourceId> {
+        match self {
+            Self::SystemOnly => vec![AudioSourceId::SystemOutput],
+            Self::MicrophoneOnly => vec![AudioSourceId::Microphone],
+            Self::Both => vec![AudioSourceId::SystemOutput, AudioSourceId::Microphone],
+        }
+    }
 }
 
 impl fmt::Display for AudioSourceId {
@@ -103,6 +145,11 @@ pub struct RawAudioPacket {
     pub source: AudioSourceId,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Monotonic source-clock frame offset assigned before queue delivery.
+    ///
+    /// A jump from the previous packet end identifies an exact capture gap,
+    /// including packets dropped by the bounded delivery queue.
+    pub captured_frame_start: u64,
     pub samples: Vec<f32>,
 }
 
@@ -388,14 +435,23 @@ impl AudioCapture {
         options: AudioCaptureOptions,
         selection: AudioDeviceSelection,
     ) -> Result<(Self, AudioCaptureOutput), AudioCaptureError> {
+        Self::start_with_mode(options, selection, AudioSourceMode::default())
+    }
+
+    /// Start capture for the requested source mode.
+    pub fn start_with_mode(
+        options: AudioCaptureOptions,
+        selection: AudioDeviceSelection,
+        mode: AudioSourceMode,
+    ) -> Result<(Self, AudioCaptureOutput), AudioCaptureError> {
         let options = options.validate()?;
         #[cfg(windows)]
         {
-            platform::start(options, selection)
+            platform::start(options, selection, mode)
         }
         #[cfg(not(windows))]
         {
-            let _ = (options, selection);
+            let _ = (options, selection, mode);
             Err(AudioCaptureError::UnsupportedPlatform)
         }
     }
@@ -544,17 +600,20 @@ fn publish_samples<T: Copy>(
     counters: &SourceCounters,
 ) {
     let samples: Vec<f32> = input.iter().copied().map(convert).collect();
+    let channels_usize = usize::from(channels);
+    let frames =
+        u64::try_from(samples.len().checked_div(channels_usize).unwrap_or(0)).unwrap_or(u64::MAX);
+    let captured_frame_start = counters
+        .captured_frames
+        .fetch_add(frames, Ordering::Relaxed);
     let packet = RawAudioPacket {
         source,
         sample_rate,
         channels,
+        captured_frame_start,
         samples,
     };
 
-    let frames = u64::try_from(packet.frame_count()).unwrap_or(u64::MAX);
-    counters
-        .captured_frames
-        .fetch_add(frames, Ordering::Relaxed);
     counters.set_peak(packet_peak(&packet.samples));
 
     let drop_reason = match packet_sender.try_send(packet) {
@@ -606,15 +665,13 @@ mod platform {
     };
 
     struct Endpoints {
-        system_output: Device,
-        system_output_config: SupportedStreamConfig,
-        microphone: Device,
-        microphone_config: SupportedStreamConfig,
+        system_output: Option<(Device, SupportedStreamConfig)>,
+        microphone: Option<(Device, SupportedStreamConfig)>,
         preflight: AudioCapturePreflight,
     }
 
     pub(super) fn preflight_default_devices() -> Result<AudioCapturePreflight, AudioCaptureError> {
-        Ok(query_endpoints(AudioDeviceSelection::default())?.preflight)
+        Ok(query_endpoints(AudioDeviceSelection::default(), AudioSourceMode::Both)?.preflight)
     }
 
     pub(super) fn device_inventory() -> Result<AudioDeviceInventory, AudioCaptureError> {
@@ -668,33 +725,41 @@ mod platform {
     pub(super) fn start(
         options: AudioCaptureOptions,
         selection: AudioDeviceSelection,
+        mode: AudioSourceMode,
     ) -> Result<(AudioCapture, AudioCaptureOutput), AudioCaptureError> {
-        let endpoints = query_endpoints(selection)?;
+        let endpoints = query_endpoints(selection, mode)?;
         let (packet_sender, packets) = sync_channel(options.packet_queue_capacity);
         let (status_sender, statuses) = sync_channel(options.status_queue_capacity);
         let metrics = AudioCaptureMetrics::default();
+        let mut streams = Vec::new();
 
-        let system_output_stream = build_stream(
-            &endpoints.system_output,
-            &endpoints.system_output_config,
-            AudioSourceId::SystemOutput,
-            &packet_sender,
-            &status_sender,
-            &metrics,
-        )?;
-        let microphone_stream = build_stream(
-            &endpoints.microphone,
-            &endpoints.microphone_config,
-            AudioSourceId::Microphone,
-            &packet_sender,
-            &status_sender,
-            &metrics,
-        )?;
+        if let Some((device, config)) = endpoints.system_output.as_ref() {
+            let stream = build_stream(
+                device,
+                config,
+                AudioSourceId::SystemOutput,
+                &packet_sender,
+                &status_sender,
+                &metrics,
+            )?;
+            play_stream(&stream, AudioSourceId::SystemOutput)?;
+            streams.push(stream);
+        }
+        if let Some((device, config)) = endpoints.microphone.as_ref() {
+            let stream = build_stream(
+                device,
+                config,
+                AudioSourceId::Microphone,
+                &packet_sender,
+                &status_sender,
+                &metrics,
+            )?;
+            play_stream(&stream, AudioSourceId::Microphone)?;
+            streams.push(stream);
+        }
 
-        play_stream(&system_output_stream, AudioSourceId::SystemOutput)?;
-        play_stream(&microphone_stream, AudioSourceId::Microphone)?;
-
-        for source in [AudioSourceId::SystemOutput, AudioSourceId::Microphone] {
+        let active_sources = mode.active_sources();
+        for source in active_sources.iter().copied() {
             let counters = metrics.counters(source);
             try_emit_status(
                 &status_sender,
@@ -707,8 +772,8 @@ mod platform {
         }
 
         let capture = AudioCapture {
-            streams: Some(vec![system_output_stream, microphone_stream]),
-            active_sources: vec![AudioSourceId::SystemOutput, AudioSourceId::Microphone],
+            streams: Some(streams),
+            active_sources,
             status_sender,
             metrics: metrics.clone(),
             stopped: false,
@@ -722,37 +787,58 @@ mod platform {
         Ok((capture, output))
     }
 
-    fn query_endpoints(selection: AudioDeviceSelection) -> Result<Endpoints, AudioCaptureError> {
+    fn query_endpoints(
+        selection: AudioDeviceSelection,
+        mode: AudioSourceMode,
+    ) -> Result<Endpoints, AudioCaptureError> {
         let host = cpal::default_host();
-        let (system_output, system_output_config) = query_endpoint(
-            &host,
-            selection.system_output_device_id.as_deref(),
-            AudioSourceId::SystemOutput,
-        )?;
-        let (microphone, microphone_config) = query_endpoint(
-            &host,
-            selection.microphone_device_id.as_deref(),
-            AudioSourceId::Microphone,
-        )?;
+        let system_output = if mode.captures_system() {
+            Some(query_endpoint(
+                &host,
+                selection.system_output_device_id.as_deref(),
+                AudioSourceId::SystemOutput,
+            )?)
+        } else {
+            None
+        };
+        let microphone = if mode.captures_microphone() {
+            Some(query_endpoint(
+                &host,
+                selection.microphone_device_id.as_deref(),
+                AudioSourceId::Microphone,
+            )?)
+        } else {
+            None
+        };
 
-        let system_output_preflight = describe_device(
-            &system_output,
-            &system_output_config,
-            AudioSourceId::SystemOutput,
-        )?;
-        let microphone_preflight =
-            describe_device(&microphone, &microphone_config, AudioSourceId::Microphone)?;
+        let system_output_preflight = match system_output.as_ref() {
+            Some((device, config)) => describe_device(device, config, AudioSourceId::SystemOutput)?,
+            None => disabled_preflight(AudioSourceId::SystemOutput),
+        };
+        let microphone_preflight = match microphone.as_ref() {
+            Some((device, config)) => describe_device(device, config, AudioSourceId::Microphone)?,
+            None => disabled_preflight(AudioSourceId::Microphone),
+        };
 
         Ok(Endpoints {
             system_output,
-            system_output_config,
             microphone,
-            microphone_config,
             preflight: AudioCapturePreflight {
                 system_output: system_output_preflight,
                 microphone: microphone_preflight,
             },
         })
+    }
+
+    fn disabled_preflight(source: AudioSourceId) -> AudioDevicePreflight {
+        AudioDevicePreflight {
+            source,
+            device_id: String::new(),
+            name: String::new(),
+            sample_rate: 16_000,
+            channels: 1,
+            sample_format: AudioSampleFormat::F32,
+        }
     }
 
     fn query_endpoint(
@@ -1184,6 +1270,39 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn audio_source_mode_defaults_to_both_and_serializes_snake_case() {
+        assert_eq!(AudioSourceMode::default(), AudioSourceMode::Both);
+        assert_eq!(
+            serde_json::to_string(&AudioSourceMode::SystemOnly).unwrap(),
+            r#""system_only""#
+        );
+        assert_eq!(
+            serde_json::from_str::<AudioSourceMode>(r#""microphone_only""#).unwrap(),
+            AudioSourceMode::MicrophoneOnly
+        );
+    }
+
+    #[test]
+    fn audio_source_mode_selects_expected_active_sources() {
+        assert_eq!(
+            AudioSourceMode::SystemOnly.active_sources(),
+            vec![AudioSourceId::SystemOutput]
+        );
+        assert_eq!(
+            AudioSourceMode::MicrophoneOnly.active_sources(),
+            vec![AudioSourceId::Microphone]
+        );
+        assert_eq!(
+            AudioSourceMode::Both.active_sources(),
+            vec![AudioSourceId::SystemOutput, AudioSourceId::Microphone]
+        );
+        assert!(AudioSourceMode::Both.captures_system());
+        assert!(AudioSourceMode::Both.captures_microphone());
+        assert!(!AudioSourceMode::SystemOnly.captures_microphone());
+        assert!(!AudioSourceMode::MicrophoneOnly.captures_system());
     }
 
     #[test]

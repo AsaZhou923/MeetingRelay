@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -12,12 +13,26 @@ import {
   isMvpActiveSession,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
+  parseDeletePreview,
+  parseDeleteResult,
+  parseDiagnosticBundleResult,
+  parseExportOptions,
+  parseInterruptedMeetings,
+  parseMeetingDetail,
+  parseMeetingListPage,
+  parseMvpAudioSourceMode,
   parseMvpExportResult,
   parseMvpRecognitionLanguage,
   parseMvpSnapshot,
   parseMvpTranscriptText,
+  parseProviderProfiles,
+  parseProviderProfileDraft,
+  parseSegmentAudioLocation,
+  parseSegmentSearchPage,
+  parseSummaryJob,
   parseTranslationPreference,
   parseTranslationProbe,
+  parseTranslationRetryProgress,
   requiresInsecureRemoteHttpAcknowledgement,
   resolveAudioDeviceSelection,
 } from "./mvp-contract.ts";
@@ -28,6 +43,13 @@ test("accepts only the per-meeting Chinese Japanese and English choices", () => 
   assert.equal(parseMvpRecognitionLanguage("en"), "en");
   assert.throws(() => parseMvpRecognitionLanguage("auto"), /recognition language/);
   assert.throws(() => parseMvpRecognitionLanguage("ko"), /recognition language/);
+});
+
+test("accepts only the three R2 audio source modes", () => {
+  assert.equal(parseMvpAudioSourceMode("system_only"), "system_only");
+  assert.equal(parseMvpAudioSourceMode("microphone_only"), "microphone_only");
+  assert.equal(parseMvpAudioSourceMode("both"), "both");
+  assert.throws(() => parseMvpAudioSourceMode("none"), /audio source mode/);
 });
 
 const source = (id) => ({
@@ -81,6 +103,13 @@ const snapshot = {
   finals: [],
   queueDepth: 0,
   translationQueueDepth: 0,
+  disk: {
+    status: "ok",
+    dataDir: "C:\\Users\\Example\\AppData\\Local\\MeetingRelay",
+    freeBytes: "104857600",
+    requiredBytes: "52428800",
+    warning: null,
+  },
   error: null,
 };
 
@@ -109,7 +138,8 @@ test("parses non-secret local translation preferences and probe results", () => 
       JSON.stringify({
         version: 1,
         enabled: true,
-        baseUrl: "http://127.0.0.1:11434/v1",
+        provider: "ollama",
+        baseUrl: "",
         model: "qwen2.5:7b",
         targetLanguage: "zh",
       }),
@@ -117,7 +147,8 @@ test("parses non-secret local translation preferences and probe results", () => 
     {
       version: 1,
       enabled: true,
-      baseUrl: "http://127.0.0.1:11434/v1",
+      provider: "ollama",
+      baseUrl: "",
       model: "qwen2.5:7b",
       targetLanguage: "zh",
       allowInsecureHttp: false,
@@ -128,7 +159,8 @@ test("parses non-secret local translation preferences and probe results", () => 
       JSON.stringify({
         version: 1,
         enabled: true,
-        baseUrl: "http://192.168.1.3:11434/v1",
+        provider: "custom",
+        baseUrl: "",
         model: "qwen2.5:7b",
         targetLanguage: "ja",
         allowInsecureHttp: true,
@@ -137,6 +169,32 @@ test("parses non-secret local translation preferences and probe results", () => 
     true,
   );
   assert.equal(parseTranslationPreference('{"version":1,"apiKey":"secret"}'), null);
+  assert.equal(
+    parseTranslationPreference(
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        provider: "custom",
+        baseUrl: "https://api.example.test/v1",
+        model: "model",
+        targetLanguage: "zh",
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseTranslationPreference(
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        provider: "openai",
+        Authorization: "Bearer mr-test-token-r1-r2",
+        model: "model",
+        targetLanguage: "zh",
+      }),
+    ),
+    null,
+  );
   assert.deepEqual(
     parseTranslationProbe({
       endpoint: "http://127.0.0.1:11434/v1/chat/completions",
@@ -152,6 +210,117 @@ test("parses non-secret local translation preferences and probe results", () => 
       latencyMs: 42,
       preview: "连接成功",
     },
+  );
+});
+
+test("does not persist translation secrets or sensitive URLs in ordinary localStorage", () => {
+  const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+  const storageWrites = [...mainSource.matchAll(/localStorage\.setItem\(([\s\S]*?)\);\n/g)]
+    .map((match) => match[1])
+    .join("\n");
+  assert.doesNotMatch(storageWrites, /apiKey|Authorization|Bearer mr-test-token-r1-r2/);
+  assert.doesNotMatch(storageWrites, /baseUrl:\s*config\.baseUrl/);
+  assert.match(mainSource, /API Token 不写入普通设置或 SQLite/);
+  assert.match(mainSource, /Windows Credential Manager/);
+  assert.doesNotMatch(mainSource, /API Token[^`\n]*不保存/);
+  assert.doesNotMatch(mainSource, /밑균/);
+  assert.match(mainSource, /id="provider-remove-secret"/);
+  assert.match(mainSource, /"mvp_delete_provider_secret"/);
+  assert.match(mainSource, /not_required/);
+  assert.match(mainSource, /profile\.class === "local"/);
+});
+
+test("parses disk health and retry/recovery R1 R2 command result shapes", () => {
+  assert.equal(
+    parseMvpSnapshot({
+      ...snapshot,
+      disk: { ...snapshot.disk, status: "warning", warning: "low space" },
+    }).disk.status,
+    "warning",
+  );
+  assert.deepEqual(
+    parseTranslationRetryProgress({
+      batchId: "retry-20260725-001",
+      status: "running",
+      total: 3,
+      progress: 1,
+      succeeded: 1,
+      failed: 0,
+      cancelled: 0,
+      costRiskAccepted: true,
+      message: null,
+    }),
+    {
+      batchId: "retry-20260725-001",
+      status: "running",
+      total: 3,
+      progress: 1,
+      succeeded: 1,
+      failed: 0,
+      cancelled: 0,
+      costRiskAccepted: true,
+      message: null,
+    },
+  );
+  assert.throws(
+    () =>
+      parseTranslationRetryProgress({
+        batchId: null,
+        status: "running",
+        total: 1,
+        progress: 2,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        costRiskAccepted: true,
+        message: null,
+      }),
+    /counters/,
+  );
+  assert.deepEqual(
+    parseDiagnosticBundleResult({
+      path: "C:\\Users\\Example\\Desktop\\meetingrelay-diagnostics.zip",
+      byteLength: 2048,
+      sha256: "c".repeat(64),
+      redacted: true,
+    }).redacted,
+    true,
+  );
+  assert.equal(
+    parseInterruptedMeetings([
+      {
+        meetingId: "meeting-20260725-001",
+        startedAt: "2026-07-25T09:00:00Z",
+        updatedAt: "2026-07-25T09:30:00Z",
+        savedFinalCount: "12",
+        pendingFinalCount: "1",
+        translationFailedCount: 2,
+        reason: "POWER_LOSS",
+        recommendedAction: "recover",
+      },
+    ])[0].recommendedAction,
+    "recover",
+  );
+  assert.equal(
+    parseSegmentAudioLocation({
+      available: true,
+      path: "C:\\Users\\Example\\AppData\\Local\\MeetingRelay\\raw.wav",
+      offsetMs: "1200",
+      durationMs: "900",
+      reason: null,
+    }).offsetMs,
+    "1200",
+  );
+  assert.throws(
+    () =>
+      parseSegmentAudioLocation({
+        available: true,
+        path: null,
+        offsetMs: null,
+        durationMs: null,
+        reason: null,
+      }),
+    /available segment audio/,
   );
 });
 
@@ -281,10 +450,279 @@ test("parses the Rust export result artifact shape", () => {
 });
 
 test("requires the full JSON Markdown TXT export capability set for UI export", () => {
-  assert.equal(hasAllMvpExportFormats(["json", "markdown", "txt"]), true);
-  assert.equal(hasAllMvpExportFormats(["txt", "json", "markdown"]), true);
-  assert.equal(hasAllMvpExportFormats(["json", "markdown"]), false);
-  assert.equal(hasAllMvpExportFormats(["json", "json", "txt"]), false);
+  assert.equal(hasAllMvpExportFormats(["json", "markdown", "txt", "docx", "pdf"]), true);
+  assert.equal(hasAllMvpExportFormats(["txt", "json", "markdown", "pdf", "docx"]), true);
+  assert.equal(hasAllMvpExportFormats(["json", "markdown", "txt"]), false);
+  assert.equal(hasAllMvpExportFormats(["json", "json", "txt", "docx", "pdf"]), false);
+});
+
+test("parses R3 meeting library pages details and tags with bounded shapes", () => {
+  const meeting = {
+    meetingId: "meeting-20260725-001",
+    title: "Design sync",
+    status: "completed",
+    startedAt: "2026-07-25T01:00:00Z",
+    updatedAt: "2026-07-25T02:00:00Z",
+    durationMs: "3600000",
+    language: "zh",
+    savedFinalCount: "2",
+    translationFailedCount: 0,
+    summaryStatus: "completed",
+    tags: ["client", "roadmap"],
+  };
+  assert.equal(
+    parseMeetingListPage({
+      items: [meeting],
+      nextCursor: "cursor-2",
+      total: 10000,
+      pageSize: 50,
+      elapsedMs: 19,
+    }).items[0].title,
+    "Design sync",
+  );
+  assert.equal(
+    parseMeetingListPage({
+      items: [{ ...meeting, language: "unknown" }],
+      nextCursor: null,
+      total: 1,
+      pageSize: 50,
+      elapsedMs: 1,
+    }).items[0].language,
+    "unknown",
+  );
+  assert.equal(
+    parseMeetingDetail({
+      meeting,
+      segments: [finalSegment(1), finalSegment(2)],
+      summary: null,
+    }).segments[1].sequence,
+    "2",
+  );
+  assert.throws(
+    () =>
+      parseMeetingListPage({
+        items: [meeting],
+        nextCursor: null,
+        total: 1,
+        pageSize: 0,
+        elapsedMs: 1,
+      }),
+    /pageSize/,
+  );
+  assert.throws(
+    () =>
+      parseMeetingListPage({
+        items: [{ ...meeting, tags: ["dup", "dup"] }],
+        nextCursor: null,
+        total: 1,
+        pageSize: 50,
+        elapsedMs: 1,
+      }),
+    /duplicates/,
+  );
+});
+
+test("parses R3 full text search hits with scope and exact jump targets", () => {
+  const page = parseSegmentSearchPage({
+    hits: [
+      {
+        meetingId: "meeting-20260725-001",
+        meetingTitle: "Design sync",
+        segmentId: "segment-42",
+        sequence: "42",
+        scope: "translation",
+        snippet: "命中的译文片段",
+        score: 12.5,
+      },
+      {
+        meetingId: "meeting-20260725-001",
+        meetingTitle: "Design sync",
+        segmentId: null,
+        sequence: null,
+        scope: "summary",
+        snippet: "摘要命中",
+        score: 3,
+      },
+    ],
+    nextCursor: null,
+    total: 2,
+    elapsedMs: 8,
+  });
+  assert.equal(page.hits[0].scope, "translation");
+  assert.equal(page.hits[0].segmentId, "segment-42");
+  assert.equal(page.hits[1].sequence, null);
+  assert.throws(
+    () =>
+      parseSegmentSearchPage({
+        hits: [
+          {
+            meetingId: "meeting-20260725-001",
+            meetingTitle: "Design sync",
+            segmentId: "segment-1",
+            sequence: "1",
+            scope: "unknown",
+            snippet: "bad",
+            score: 1,
+          },
+        ],
+        nextCursor: null,
+        total: 1,
+        elapsedMs: 1,
+      }),
+    /scope/,
+  );
+});
+
+test("parses R3 provider profiles and deletion preview without accepting secrets", () => {
+  const profiles = parseProviderProfiles([
+    {
+      profileId: "provider-local",
+      label: "Ollama",
+      class: "local",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "qwen2.5:7b",
+      policyUrl: null,
+      dataFlow: "Loopback only.",
+      configVersion: 1,
+      secretState: "not_required",
+      lastTestStatus: "untested",
+      lastTestAt: null,
+      lastError: null,
+    },
+  ]);
+  assert.equal(profiles[0].class, "local");
+  assert.equal(profiles[0].secretState, "not_required");
+  assert.equal(Object.keys(profiles[0]).some((key) => /secret/i.test(key) && key !== "secretState"), false);
+  assert.deepEqual(
+    parseProviderProfileDraft({
+      profileId: "provider-local",
+      label: "Ollama",
+      class: "local",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "qwen2.5:7b",
+      policyUrl: null,
+      dataFlow: "Loopback only.",
+      configVersion: 2,
+    }),
+    {
+      profileId: "provider-local",
+      label: "Ollama",
+      class: "local",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "qwen2.5:7b",
+      policyUrl: null,
+      dataFlow: "Loopback only.",
+      configVersion: 2,
+    },
+  );
+  assert.throws(
+    () =>
+      parseProviderProfileDraft({
+        profileId: "provider-local",
+        label: "Ollama",
+        class: "cloud",
+        baseUrl: "https://api.example.test/v1",
+        model: "model",
+        policyUrl: null,
+        dataFlow: "Cloud provider.",
+        configVersion: 0,
+      }),
+    /configVersion/,
+  );
+  assert.equal(
+    parseDeletePreview({
+      meetingId: "meeting-20260725-001",
+      recoveryWindowSeconds: 600,
+      includeRaw: true,
+      includeDerived: true,
+      entries: [
+        {
+          type: "raw",
+          path: "C:\\MeetingRelay\\raw.wav",
+          byteLength: "1024",
+          description: "raw audio",
+        },
+      ],
+      willDeleteBytes: "1024",
+      canRestore: true,
+    }).entries[0].type,
+    "raw",
+  );
+  assert.equal(
+    parseDeleteResult({
+      meetingId: "meeting-20260725-001",
+      deleted: true,
+      restoredUntil: "2026-07-25T02:10:00Z",
+      entriesDeleted: 3,
+      bytesDeleted: "2048",
+    }).bytesDeleted,
+    "2048",
+  );
+});
+
+test("parses R4 summary jobs, citation links, and selectable export options", () => {
+  const job = parseSummaryJob({
+    jobId: "summary-job-1",
+    meetingId: "meeting-20260725-001",
+    status: "completed",
+    version: 2,
+    totalChunks: 4,
+    completedChunks: 4,
+    canCancel: false,
+    canRetry: true,
+    message: null,
+    result: {
+      summaryId: "summary-2",
+      version: 2,
+      language: "zh",
+      overview: "本次会议确认路线图。",
+      actions: ["修复 R0 环境问题"],
+      decisions: ["R3/R4 先完成"],
+      openQuestions: ["是否启用云端摘要？"],
+      citations: [
+        { segmentId: "segment-1", sequence: "1", label: "segment 1" },
+        { segmentId: null, sequence: null, label: "model-generated grouping" },
+      ],
+      createdAt: "2026-07-25T02:00:00Z",
+    },
+  });
+  assert.equal(job.result?.version, 2);
+  assert.equal(job.result?.citations[1].sequence, null);
+  assert.throws(
+    () =>
+      parseSummaryJob({
+        ...job,
+        result: null,
+        totalChunks: 1,
+        completedChunks: 2,
+      }),
+    /chunk counters/,
+  );
+  assert.deepEqual(
+    parseExportOptions({
+      formats: ["json", "docx", "pdf"],
+      includeOriginal: true,
+      includeTranslation: true,
+      bilingual: true,
+      includeSpeaker: true,
+      includeSummary: true,
+      includeTimestamp: true,
+    }).formats,
+    ["json", "docx", "pdf"],
+  );
+  assert.throws(
+    () =>
+      parseExportOptions({
+        formats: ["json", "json"],
+        includeOriginal: true,
+        includeTranslation: false,
+        bilingual: false,
+        includeSpeaker: false,
+        includeSummary: false,
+        includeTimestamp: true,
+      }),
+    /duplicate/,
+  );
 });
 
 test("parses paused snapshots and treats paused as an active session", () => {
@@ -352,6 +790,18 @@ test("turns recoverable runtime error codes into actionable product messages", (
       error: "ASR_WORKER_STOPPED",
     }),
     /自动重建引擎/,
+  );
+  assert.equal(
+    formatMvpSnapshotError({
+      ...snapshot,
+      error: null,
+      microphone: {
+        ...snapshot.microphone,
+        status: "disabled",
+        error: "AUDIO_SOURCE_DISABLED",
+      },
+    }),
+    "",
   );
 });
 

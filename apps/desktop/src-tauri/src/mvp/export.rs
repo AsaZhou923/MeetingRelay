@@ -7,6 +7,7 @@ use std::{
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
 
+use super::document_export::{DocumentModel, Section, render_docx, render_pdf};
 use super::storage::{
     CompletedExport, MeetingSnapshot, MvpStorage, MvpStorageWriter, now_ms_string, sha256_hex,
 };
@@ -27,6 +28,80 @@ pub struct ExportResult {
     pub snapshot_id: String,
     pub final_count: usize,
     pub artifacts: Vec<ExportArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOptions {
+    pub formats: Vec<String>,
+    #[serde(default)]
+    pub include_original: bool,
+    #[serde(default)]
+    pub include_translation: bool,
+    #[serde(default)]
+    pub bilingual: bool,
+    #[serde(default)]
+    pub include_speaker: bool,
+    #[serde(default)]
+    pub include_summary: bool,
+    #[serde(default)]
+    pub include_timestamp: bool,
+    #[serde(default)]
+    pub summary_version: Option<u32>,
+    #[serde(default)]
+    pub summary: Option<ExportSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    #[serde(default)]
+    pub version: Option<u32>,
+    #[serde(default)]
+    pub sections: Vec<ExportSummarySection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummarySection {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub heading: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub citation_segment_ids: Vec<String>,
+}
+
+impl ExportOptions {
+    fn legacy() -> Self {
+        Self {
+            formats: vec!["json".to_owned(), "markdown".to_owned(), "txt".to_owned()],
+            include_original: true,
+            include_translation: true,
+            bilingual: true,
+            include_speaker: false,
+            include_summary: false,
+            include_timestamp: true,
+            summary_version: None,
+            summary: None,
+        }
+    }
+
+    fn is_legacy_projection(&self) -> bool {
+        self.formats.len() == 3
+            && self.formats[0] == "json"
+            && self.formats[1] == "markdown"
+            && self.formats[2] == "txt"
+            && self.include_original
+            && self.include_translation
+            && self.bilingual
+            && !self.include_speaker
+            && !self.include_summary
+            && self.include_timestamp
+            && self.summary_version.is_none()
+            && self.summary.is_none()
+    }
 }
 
 /// Returns a complete, storage-backed transcript suitable for the clipboard.
@@ -53,6 +128,23 @@ pub fn export_meeting(
     meeting_id: &str,
     target_dir: impl AsRef<Path>,
 ) -> Result<ExportResult, String> {
+    export_meeting_with_options(
+        storage,
+        writer,
+        meeting_id,
+        target_dir,
+        ExportOptions::legacy(),
+    )
+}
+
+pub fn export_meeting_with_options(
+    storage: &MvpStorage,
+    writer: &MvpStorageWriter,
+    meeting_id: &str,
+    target_dir: impl AsRef<Path>,
+    options: ExportOptions,
+) -> Result<ExportResult, String> {
+    validate_export_options(&options)?;
     let snapshot = storage.snapshot(meeting_id)?;
     if snapshot.meeting.state == "recording" {
         return Err("MVP_EXPORT_RECORDING_NOT_ALLOWED".to_owned());
@@ -82,22 +174,19 @@ pub fn export_meeting(
     }
     validate_existing_dir_non_reparse(&target_dir)?;
 
-    let renders = [
-        ("json", render_json(&snapshot)),
-        ("markdown", render_markdown(&snapshot)),
-        ("txt", render_txt(&snapshot)),
-    ];
+    let renders = render_exports(&snapshot, &options)?;
     let staging_dir = create_staging_dir(&snapshot, &target_dir)?;
     let mut staged = Vec::new();
-    for (format, content) in renders {
-        validate_render(format, &content)?;
+    for render in renders {
+        validate_rendered_export(&render)?;
         let staged_export = match stage_export(
             &snapshot,
-            format,
+            &render.format,
             &export_root,
             &target_dir,
             &staging_dir,
-            content.as_bytes(),
+            &render.bytes,
+            &render.manifest_json,
         ) {
             Ok(staged_export) => staged_export,
             Err(error) => {
@@ -138,6 +227,14 @@ pub fn export_meeting(
 struct StagedExport {
     completed: CompletedExport,
     staging_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct RenderedExport {
+    format: String,
+    bytes: Vec<u8>,
+    manifest_json: String,
+    text_kind: bool,
 }
 
 fn resolve_target_dir(export_root: &Path, requested: &Path) -> Result<PathBuf, String> {
@@ -271,11 +368,14 @@ fn stage_export(
     target_dir: &Path,
     staging_dir: &Path,
     bytes: &[u8],
+    manifest_json: &str,
 ) -> Result<StagedExport, String> {
     let extension = match format {
         "json" => "json",
         "markdown" => "md",
         "txt" => "txt",
+        "docx" => "docx",
+        "pdf" => "pdf",
         _ => return Err("MVP_EXPORT_FORMAT_UNSUPPORTED".to_owned()),
     };
     let safe_meeting = safe_file_component(&snapshot.meeting.id);
@@ -333,12 +433,7 @@ fn stage_export(
             byte_length: bytes.len(),
             sha256: sha256.clone(),
             completed_at,
-            validation_manifest_json: format!(
-                "{{\"format\":\"{}\",\"utf8\":true,\"lf\":true,\"sha256\":\"{}\",\"byteLength\":{}}}",
-                format,
-                sha256,
-                bytes.len()
-            ),
+            validation_manifest_json: manifest_with_integrity(manifest_json, &sha256, bytes.len()),
         },
         staging_path: temp,
     })
@@ -640,6 +735,95 @@ fn record_exports_for_test(completed: Vec<CompletedExport>) -> Vec<CompletedExpo
     completed
 }
 
+fn validate_export_options(options: &ExportOptions) -> Result<(), String> {
+    if options.formats.is_empty() {
+        return Err("MVP_EXPORT_FORMAT_REQUIRED".to_owned());
+    }
+    let mut seen = Vec::<&str>::new();
+    for format in &options.formats {
+        if !matches!(
+            format.as_str(),
+            "json" | "markdown" | "txt" | "docx" | "pdf"
+        ) {
+            return Err("MVP_EXPORT_FORMAT_UNSUPPORTED".to_owned());
+        }
+        if seen.contains(&format.as_str()) {
+            return Err("MVP_EXPORT_FORMAT_DUPLICATE".to_owned());
+        }
+        seen.push(format);
+    }
+    if !options.include_original && !options.include_translation && !options.include_summary {
+        return Err("MVP_EXPORT_EMPTY_PROJECTION".to_owned());
+    }
+    Ok(())
+}
+
+fn render_exports(
+    snapshot: &MeetingSnapshot,
+    options: &ExportOptions,
+) -> Result<Vec<RenderedExport>, String> {
+    let mut renders = Vec::with_capacity(options.formats.len());
+    for format in &options.formats {
+        let projection = projection_id(options);
+        let manifest_json = validation_manifest_base(snapshot, format, options, &projection);
+        let (bytes, text_kind) = match format.as_str() {
+            "json" if options.is_legacy_projection() => (render_json(snapshot).into_bytes(), true),
+            "markdown" if options.is_legacy_projection() => {
+                (render_markdown(snapshot).into_bytes(), true)
+            }
+            "txt" if options.is_legacy_projection() => (render_txt(snapshot).into_bytes(), true),
+            "json" => (
+                render_json_with_options(snapshot, options).into_bytes(),
+                true,
+            ),
+            "markdown" => (
+                render_markdown_with_options(snapshot, options).into_bytes(),
+                true,
+            ),
+            "txt" => (
+                render_txt_with_options(snapshot, options).into_bytes(),
+                true,
+            ),
+            "docx" => (
+                render_docx(&document_model(snapshot, options))
+                    .map_err(|_| "MVP_EXPORT_DOCUMENT_RENDER_FAILED".to_owned())?,
+                false,
+            ),
+            "pdf" => (
+                render_pdf(&document_model(snapshot, options))
+                    .map_err(|_| "MVP_EXPORT_DOCUMENT_RENDER_FAILED".to_owned())?,
+                false,
+            ),
+            _ => return Err("MVP_EXPORT_FORMAT_UNSUPPORTED".to_owned()),
+        };
+        renders.push(RenderedExport {
+            format: format.clone(),
+            bytes,
+            manifest_json,
+            text_kind,
+        });
+    }
+    Ok(renders)
+}
+
+fn validate_rendered_export(render: &RenderedExport) -> Result<(), String> {
+    if render.text_kind {
+        let content = std::str::from_utf8(&render.bytes)
+            .map_err(|_| "MVP_EXPORT_UTF8_REQUIRED".to_owned())?;
+        validate_render(&render.format, content)?;
+        return Ok(());
+    }
+    if render.bytes.is_empty() {
+        return Err("MVP_EXPORT_EMPTY_BINARY".to_owned());
+    }
+    match render.format.as_str() {
+        "docx" if render.bytes.starts_with(b"PK\x03\x04") => Ok(()),
+        "pdf" if render.bytes.starts_with(b"%PDF-") => Ok(()),
+        "docx" | "pdf" => Err("MVP_EXPORT_BINARY_SIGNATURE_INVALID".to_owned()),
+        _ => Err("MVP_EXPORT_FORMAT_UNSUPPORTED".to_owned()),
+    }
+}
+
 fn validate_render(format: &str, content: &str) -> Result<(), String> {
     if !matches!(format, "json" | "markdown" | "txt") {
         return Err("MVP_EXPORT_FORMAT_UNSUPPORTED".to_owned());
@@ -651,6 +835,453 @@ fn validate_render(format: &str, content: &str) -> Result<(), String> {
         return Err("MVP_EXPORT_LF_TERMINATOR_REQUIRED".to_owned());
     }
     Ok(())
+}
+
+fn render_json_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) -> String {
+    let mut output = String::new();
+    output.push_str("{\n");
+    output.push_str("  \"schemaVersion\": 3,\n");
+    output.push_str("  \"contractVersion\": \"meetingrelay.mvp.export.v3\",\n");
+    output.push_str(&format!(
+        "  \"meetingId\": {},\n  \"snapshotId\": {},\n  \"state\": {},\n  \"finalCount\": {},\n  \"semanticSha256\": {},\n",
+        json_string(&snapshot.meeting.id),
+        json_string(&snapshot.snapshot_id),
+        json_string(&snapshot.meeting.state),
+        snapshot.finals.len(),
+        json_string(&snapshot.semantic_sha256)
+    ));
+    output.push_str(&format!(
+        "  \"projection\": {},\n",
+        json_string(&projection_id(options))
+    ));
+    output.push_str("  \"segments\": [\n");
+    for (index, final_segment) in snapshot.finals.iter().enumerate() {
+        output.push_str("    {\n");
+        output.push_str(&format!(
+            "      \"sequence\": {},\n      \"segmentId\": {},\n",
+            final_segment.sequence,
+            json_string(&final_segment.segment_id)
+        ));
+        if options.include_timestamp {
+            output.push_str(&format!(
+                "      \"startedAtMs\": {},\n      \"endedAtMs\": {},\n",
+                json_string(&final_segment.started_at_ms),
+                json_string(&final_segment.ended_at_ms)
+            ));
+        }
+        if options.include_speaker {
+            output.push_str("      \"speaker\": null,\n");
+        }
+        if options.include_original {
+            output.push_str(&format!(
+                "      \"original\": {},\n",
+                json_string(&final_segment.text)
+            ));
+        }
+        if options.include_translation || options.bilingual {
+            output.push_str(&format!(
+                "      \"translationTarget\": {},\n      \"translationText\": {},\n",
+                json_nullable(final_segment.translation_target.as_deref()),
+                json_nullable(final_segment.translation_text.as_deref())
+            ));
+        }
+        trim_trailing_json_comma(&mut output);
+        output.push_str(if index + 1 == snapshot.finals.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
+    }
+    output.push_str("  ]");
+    if options.include_summary {
+        output.push_str(",\n  \"summary\": ");
+        push_summary_json(&mut output, options.summary.as_ref());
+    }
+    output.push_str("\n}\n");
+    output
+}
+
+fn render_markdown_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) -> String {
+    let mut output = String::new();
+    output.push_str("# MeetingRelay Export\n\n");
+    output.push_str(&format!(
+        "- Meeting ID: `{}`\n- Snapshot ID: `{}`\n- State: `{}`\n- Final count: `{}`\n- Projection: `{}`\n\n",
+        escape_markdown_inline(&snapshot.meeting.id),
+        escape_markdown_inline(&snapshot.snapshot_id),
+        escape_markdown_inline(&snapshot.meeting.state),
+        snapshot.finals.len(),
+        escape_markdown_inline(&projection_id(options))
+    ));
+    if options.include_summary {
+        push_summary_markdown(&mut output, options.summary.as_ref());
+    }
+    output.push_str("## Transcript\n\n");
+    for final_segment in &snapshot.finals {
+        let mut prefix = final_segment.sequence.to_string();
+        if options.include_timestamp {
+            prefix.push_str(&format!(
+                " [{}-{} ms]",
+                sanitize_plain(&final_segment.started_at_ms),
+                sanitize_plain(&final_segment.ended_at_ms)
+            ));
+        }
+        if options.include_speaker {
+            prefix.push_str(" [speaker: unassigned]");
+        }
+        if options.include_original {
+            output.push_str(&format!(
+                "{prefix} {}\n\n",
+                escape_markdown_text(&final_segment.text)
+            ));
+        }
+        if (options.include_translation || options.bilingual)
+            && let Some(translation) = final_segment.translation_text.as_deref()
+        {
+            output.push_str(&format!(
+                "{prefix} Translation ({}): {}\n\n",
+                escape_markdown_inline(
+                    final_segment
+                        .translation_target
+                        .as_deref()
+                        .unwrap_or("unknown")
+                ),
+                escape_markdown_text(translation)
+            ));
+        }
+    }
+    output
+}
+
+fn render_txt_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) -> String {
+    let mut output = String::new();
+    output.push_str("MeetingRelay Export\n");
+    output.push_str(&format!(
+        "Meeting ID: {}\n",
+        sanitize_plain(&snapshot.meeting.id)
+    ));
+    output.push_str(&format!(
+        "Snapshot ID: {}\n",
+        sanitize_plain(&snapshot.snapshot_id)
+    ));
+    output.push_str(&format!(
+        "State: {}\n",
+        sanitize_plain(&snapshot.meeting.state)
+    ));
+    output.push_str(&format!("Final count: {}\n", snapshot.finals.len()));
+    output.push_str(&format!("Projection: {}\n\n", projection_id(options)));
+    if options.include_summary {
+        push_summary_txt(&mut output, options.summary.as_ref());
+    }
+    output.push_str("Transcript\n");
+    for final_segment in &snapshot.finals {
+        let mut prefix = final_segment.sequence.to_string();
+        if options.include_timestamp {
+            prefix.push_str(&format!(
+                " [{}-{} ms]",
+                sanitize_plain(&final_segment.started_at_ms),
+                sanitize_plain(&final_segment.ended_at_ms)
+            ));
+        }
+        if options.include_speaker {
+            prefix.push_str(" [speaker: unassigned]");
+        }
+        if options.include_original {
+            output.push_str(&format!(
+                "{prefix} {}\n",
+                sanitize_plain(&final_segment.text)
+            ));
+        }
+        if (options.include_translation || options.bilingual)
+            && let Some(translation) = final_segment.translation_text.as_deref()
+        {
+            output.push_str(&format!(
+                "{prefix} Translation ({}): {}\n",
+                sanitize_plain(
+                    final_segment
+                        .translation_target
+                        .as_deref()
+                        .unwrap_or("unknown")
+                ),
+                sanitize_plain(translation)
+            ));
+        }
+    }
+    output
+}
+
+fn document_model(snapshot: &MeetingSnapshot, options: &ExportOptions) -> DocumentModel {
+    let mut document = DocumentModel::new(format!("MeetingRelay {}", snapshot.meeting.id));
+    let metadata = Section::new("Manifest")
+        .with_paragraph(format!("Meeting ID: {}", snapshot.meeting.id))
+        .with_paragraph(format!("Snapshot ID: {}", snapshot.snapshot_id))
+        .with_paragraph(format!("State: {}", snapshot.meeting.state))
+        .with_paragraph(format!("Projection: {}", projection_id(options)));
+    document = document.with_section(metadata);
+    if options.include_summary {
+        document = document.with_section(summary_document_section(options.summary.as_ref()));
+    }
+    let mut transcript = Section::new("Transcript");
+    for final_segment in &snapshot.finals {
+        if options.include_original {
+            transcript = transcript.with_paragraph(projected_segment_line(
+                final_segment.sequence,
+                options,
+                &final_segment.started_at_ms,
+                &final_segment.ended_at_ms,
+                "Original",
+                &final_segment.text,
+            ));
+        }
+        if (options.include_translation || options.bilingual)
+            && let Some(translation) = final_segment.translation_text.as_deref()
+        {
+            transcript = transcript.with_paragraph(projected_segment_line(
+                final_segment.sequence,
+                options,
+                &final_segment.started_at_ms,
+                &final_segment.ended_at_ms,
+                &format!(
+                    "Translation ({})",
+                    final_segment
+                        .translation_target
+                        .as_deref()
+                        .unwrap_or("unknown")
+                ),
+                translation,
+            ));
+        }
+    }
+    document.with_section(transcript)
+}
+
+fn projected_segment_line(
+    sequence: u64,
+    options: &ExportOptions,
+    started_at_ms: &str,
+    ended_at_ms: &str,
+    label: &str,
+    text: &str,
+) -> String {
+    let mut prefix = format!("#{sequence}");
+    if options.include_timestamp {
+        prefix.push_str(&format!(" [{started_at_ms}-{ended_at_ms} ms]"));
+    }
+    if options.include_speaker {
+        prefix.push_str(" [speaker: unassigned]");
+    }
+    format!("{prefix} {label}: {text}")
+}
+
+fn summary_document_section(summary: Option<&ExportSummary>) -> Section {
+    let mut section = Section::new("Summary");
+    match summary {
+        Some(summary) if !summary.sections.is_empty() => {
+            for item in &summary.sections {
+                section = section.with_paragraph(summary_line(item));
+            }
+        }
+        _ => {
+            section = section.with_paragraph(
+                "Summary requested but no completed summary version is linked to this export.",
+            );
+        }
+    }
+    section
+}
+
+fn push_summary_json(output: &mut String, summary: Option<&ExportSummary>) {
+    match summary {
+        Some(summary) => {
+            output.push_str("{\"version\":");
+            match summary.version {
+                Some(version) => output.push_str(&version.to_string()),
+                None => output.push_str("null"),
+            }
+            output.push_str(",\"sections\":[");
+            for (index, section) in summary.sections.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str("{\"kind\":");
+                output.push_str(&json_nullable(section.kind.as_deref()));
+                output.push_str(",\"heading\":");
+                output.push_str(&json_nullable(section.heading.as_deref()));
+                output.push_str(",\"text\":");
+                output.push_str(&json_string(&section.text));
+                output.push_str(",\"citationSegmentIds\":[");
+                for (citation_index, segment_id) in section.citation_segment_ids.iter().enumerate()
+                {
+                    if citation_index > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(&json_string(segment_id));
+                }
+                output.push_str("]}");
+            }
+            output.push_str("]}");
+        }
+        None => output.push_str(
+            "{\"version\":null,\"sections\":[{\"kind\":\"unlinked\",\"heading\":\"Summary\",\"text\":\"Summary requested but no completed summary version is linked to this export.\",\"citationSegmentIds\":[]}]}",
+        ),
+    }
+}
+
+fn push_summary_markdown(output: &mut String, summary: Option<&ExportSummary>) {
+    output.push_str("## Summary\n\n");
+    match summary {
+        Some(summary) if !summary.sections.is_empty() => {
+            for section in &summary.sections {
+                output.push_str(&format!(
+                    "- {}{}\n",
+                    escape_markdown_text(
+                        section
+                            .heading
+                            .as_deref()
+                            .or(section.kind.as_deref())
+                            .unwrap_or("Summary")
+                    ),
+                    summary_text_with_citations(section, true)
+                ));
+            }
+        }
+        _ => output.push_str(
+            "- Summary requested but no completed summary version is linked to this export.\n",
+        ),
+    }
+    output.push('\n');
+}
+
+fn push_summary_txt(output: &mut String, summary: Option<&ExportSummary>) {
+    output.push_str("Summary\n");
+    match summary {
+        Some(summary) if !summary.sections.is_empty() => {
+            for section in &summary.sections {
+                output.push_str(&format!(
+                    "- {}{}\n",
+                    sanitize_plain(
+                        section
+                            .heading
+                            .as_deref()
+                            .or(section.kind.as_deref())
+                            .unwrap_or("Summary")
+                    ),
+                    summary_text_with_citations(section, false)
+                ));
+            }
+        }
+        _ => output.push_str(
+            "- Summary requested but no completed summary version is linked to this export.\n",
+        ),
+    }
+    output.push('\n');
+}
+
+fn summary_line(section: &ExportSummarySection) -> String {
+    format!(
+        "{}{}",
+        section
+            .heading
+            .as_deref()
+            .or(section.kind.as_deref())
+            .unwrap_or("Summary"),
+        summary_text_with_citations(section, false)
+    )
+}
+
+fn summary_text_with_citations(section: &ExportSummarySection, markdown: bool) -> String {
+    let text = if markdown {
+        escape_markdown_text(&section.text)
+    } else {
+        sanitize_plain(&section.text)
+    };
+    if section.citation_segment_ids.is_empty() {
+        format!(": {text} (unlinked)")
+    } else {
+        format!(
+            ": {text} [segments: {}]",
+            section
+                .citation_segment_ids
+                .iter()
+                .map(|id| {
+                    if markdown {
+                        escape_markdown_inline(id)
+                    } else {
+                        sanitize_plain(id)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn trim_trailing_json_comma(output: &mut String) {
+    if output.ends_with(",\n") {
+        output.truncate(output.len() - 2);
+        output.push('\n');
+    }
+}
+
+fn projection_id(options: &ExportOptions) -> String {
+    let mut parts = Vec::new();
+    if options.include_original {
+        parts.push("original");
+    }
+    if options.include_translation {
+        parts.push("translation");
+    }
+    if options.bilingual {
+        parts.push("bilingual");
+    }
+    if options.include_speaker {
+        parts.push("speaker");
+    }
+    if options.include_summary {
+        parts.push("summary");
+    }
+    if options.include_timestamp {
+        parts.push("timestamp");
+    }
+    parts.join("+")
+}
+
+fn validation_manifest_base(
+    snapshot: &MeetingSnapshot,
+    format: &str,
+    options: &ExportOptions,
+    projection: &str,
+) -> String {
+    let summary_version = options
+        .summary
+        .as_ref()
+        .and_then(|summary| summary.version)
+        .or(options.summary_version);
+    format!(
+        "{{\"format\":{},\"renderer\":\"meetingrelay.export.v4\",\"snapshotId\":{},\"meetingId\":{},\"semanticSha256\":{},\"projection\":{},\"summaryVersion\":{}}}",
+        json_string(format),
+        json_string(&snapshot.snapshot_id),
+        json_string(&snapshot.meeting.id),
+        json_string(&snapshot.semantic_sha256),
+        json_string(projection),
+        summary_version.map_or_else(|| "null".to_owned(), |version| version.to_string())
+    )
+}
+
+fn manifest_with_integrity(manifest_json: &str, sha256: &str, byte_length: usize) -> String {
+    let mut manifest = manifest_json.trim_end().to_owned();
+    if manifest.ends_with('}') {
+        manifest.pop();
+        manifest.push_str(&format!(
+            ",\"sha256\":{},\"byteLength\":{byte_length}}}",
+            json_string(sha256)
+        ));
+        manifest
+    } else {
+        format!(
+            "{{\"renderer\":\"meetingrelay.export.v4\",\"sha256\":{},\"byteLength\":{byte_length}}}",
+            json_string(sha256)
+        )
+    }
 }
 
 fn render_json(snapshot: &MeetingSnapshot) -> String {
@@ -909,11 +1540,142 @@ mod tests {
                     },
                     started_at_ms: (sequence * 10).to_string(),
                     ended_at_ms: (sequence * 10 + 5).to_string(),
+                    meeting_sample_start: sequence.saturating_mul(160),
+                    meeting_sample_end: sequence.saturating_mul(160).saturating_add(80),
+                    timeline_revision: 1,
                 })
                 .unwrap();
         }
         writer.complete_meeting(&meeting.id).unwrap();
         meeting.id
+    }
+
+    fn snapshot_for_options() -> MeetingSnapshot {
+        MeetingSnapshot {
+            meeting: crate::mvp::storage::MeetingRecord {
+                id: "meeting-options".to_owned(),
+                state: "completed".to_owned(),
+                started_at: "2026-07-25T00:00:00Z".to_owned(),
+                ended_at: Some("2026-07-25T01:00:00Z".to_owned()),
+                last_final_sequence: 2,
+                completion_error: None,
+            },
+            finals: vec![
+                crate::mvp::storage::DurableFinal {
+                    meeting_id: "meeting-options".to_owned(),
+                    segment_id: "segment-1".to_owned(),
+                    sequence: 1,
+                    revision: 1,
+                    text: "中文记录 English line".to_owned(),
+                    started_at_ms: "0".to_owned(),
+                    ended_at_ms: "1000".to_owned(),
+                    content_sha256: sha256_hex("中文记录 English line".as_bytes()),
+                    committed_at: "2026-07-25T00:00:01Z".to_owned(),
+                    commit_id: "commit-1".to_owned(),
+                    meeting_sample_start: 0,
+                    meeting_sample_end: 16_000,
+                    timeline_revision: 1,
+                    translation_status: "completed".to_owned(),
+                    translation_target: Some("ja".to_owned()),
+                    translation_text: Some("日本語の翻訳 English".to_owned()),
+                    translation_error: None,
+                },
+                crate::mvp::storage::DurableFinal {
+                    meeting_id: "meeting-options".to_owned(),
+                    segment_id: "segment-2".to_owned(),
+                    sequence: 2,
+                    revision: 1,
+                    text: "long ".repeat(200),
+                    started_at_ms: "1000".to_owned(),
+                    ended_at_ms: "2000".to_owned(),
+                    content_sha256: sha256_hex("long".as_bytes()),
+                    committed_at: "2026-07-25T00:00:02Z".to_owned(),
+                    commit_id: "commit-2".to_owned(),
+                    meeting_sample_start: 16_000,
+                    meeting_sample_end: 32_000,
+                    timeline_revision: 1,
+                    translation_status: "pending".to_owned(),
+                    translation_target: None,
+                    translation_text: None,
+                    translation_error: None,
+                },
+            ],
+            snapshot_id: "snapshot-options".to_owned(),
+            snapshot_generation: 1,
+            semantic_sha256: sha256_hex("snapshot-options".as_bytes()),
+        }
+    }
+
+    fn rich_export_options() -> ExportOptions {
+        ExportOptions {
+            formats: vec![
+                "json".to_owned(),
+                "markdown".to_owned(),
+                "txt".to_owned(),
+                "docx".to_owned(),
+                "pdf".to_owned(),
+            ],
+            include_original: true,
+            include_translation: true,
+            bilingual: true,
+            include_speaker: true,
+            include_summary: true,
+            include_timestamp: true,
+            summary_version: Some(7),
+            summary: Some(ExportSummary {
+                version: Some(7),
+                sections: vec![ExportSummarySection {
+                    kind: Some("decision".to_owned()),
+                    heading: Some("决定".to_owned()),
+                    text: "采用本地优先导出，并保留引用。".to_owned(),
+                    citation_segment_ids: vec!["segment-1".to_owned()],
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn selected_exports_render_text_docx_pdf_with_projection_manifest_and_cjk() {
+        let snapshot = snapshot_for_options();
+        let options = rich_export_options();
+        let renders = render_exports(&snapshot, &options).unwrap();
+        assert_eq!(renders.len(), 5);
+        for render in &renders {
+            validate_rendered_export(render).unwrap();
+            assert!(
+                render
+                    .manifest_json
+                    .contains("\"renderer\":\"meetingrelay.export.v4\"")
+            );
+            assert!(render.manifest_json.contains("\"projection\""));
+            assert!(render.manifest_json.contains("\"summaryVersion\":7"));
+        }
+        let json = renders
+            .iter()
+            .find(|render| render.format == "json")
+            .unwrap();
+        let json_text = String::from_utf8(json.bytes.clone()).unwrap();
+        assert!(json_text.contains("\"speaker\": null"));
+        assert!(json_text.contains("segment-1"));
+        assert!(json_text.contains("中文记录"));
+
+        let docx = renders
+            .iter()
+            .find(|render| render.format == "docx")
+            .unwrap();
+        assert!(docx.bytes.starts_with(b"PK\x03\x04"));
+        let docx_text = String::from_utf8_lossy(&docx.bytes);
+        assert!(docx_text.contains("MeetingRelay"));
+        assert!(docx_text.contains("segment-1"));
+
+        let pdf = renders
+            .iter()
+            .find(|render| render.format == "pdf")
+            .unwrap();
+        assert!(pdf.bytes.starts_with(b"%PDF-"));
+        let pdf_text = String::from_utf8_lossy(&pdf.bytes);
+        assert!(pdf_text.contains("source-manifest.json"));
+        assert!(pdf_text.contains("segment-1"));
     }
 
     #[test]
@@ -999,6 +1761,9 @@ mod tests {
                 text: "saved before overload".to_owned(),
                 started_at_ms: "0".to_owned(),
                 ended_at_ms: "1000".to_owned(),
+                meeting_sample_start: 0,
+                meeting_sample_end: 16_000,
+                timeline_revision: 1,
             })
             .unwrap();
         writer
@@ -1031,6 +1796,9 @@ mod tests {
                     text: format!("完整片段 {sequence}"),
                     started_at_ms: sequence.to_string(),
                     ended_at_ms: (sequence + 1).to_string(),
+                    meeting_sample_start: sequence.saturating_mul(16),
+                    meeting_sample_end: sequence.saturating_add(1).saturating_mul(16),
+                    timeline_revision: 1,
                 })
                 .unwrap();
         }

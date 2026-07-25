@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 
 use super::{
     contract::MvpSnapshot,
-    storage::{DurableFinal, MvpStorageWriter, TranslationCandidate, TranslationCompletion},
+    storage::{
+        DurableFinal, MvpStorageWriter, TranslationCandidate, TranslationCompletion, sha256_hex,
+    },
 };
 
 const MAX_BASE_URL_LENGTH: usize = 512;
@@ -25,6 +27,10 @@ const MAX_TRANSLATION_INPUT_LENGTH: usize = 16_384;
 const MAX_TRANSLATION_OUTPUT_BYTES: u64 = 256 * 1_024;
 const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSLATION_QUEUE_DEPTH: usize = 32;
+const TRANSLATION_PROVIDER_OPENAI_COMPATIBLE: &str = "openai-compatible";
+const TRANSLATION_CONFIG_VERSION: &str = "meetingrelay.translation.config.v1";
+const TRANSLATION_PROMPT_VERSION: &str = "meetingrelay.translation.prompt.v1";
+const TRANSLATION_REQUEST_SCHEMA_VERSION: &str = "openai.chat.completions.v1";
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -40,6 +46,8 @@ pub struct TranslationConfig {
 #[derive(Clone, Debug)]
 pub struct ValidatedTranslationConfig {
     pub endpoint: String,
+    pub endpoint_origin: String,
+    pub endpoint_hash: String,
     pub model: String,
     pub api_key: Option<String>,
     pub target_language: String,
@@ -53,6 +61,29 @@ pub struct TranslationProbe {
     pub target_language: String,
     pub latency_ms: u128,
     pub preview: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct TranslationFailureClass {
+    pub error_code: String,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct TranslationRetryProgress {
+    pub total: usize,
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub cancelled: bool,
+}
+
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct TranslationRetryCancellation {
+    cancelled: Arc<AtomicBool>,
 }
 
 pub struct TranslationWorker {
@@ -105,11 +136,25 @@ impl TranslationConfig {
             .map(|value| bounded_clean(value, MAX_API_KEY_LENGTH, "TRANSLATION_API_KEY_INVALID"))
             .transpose()?;
         Ok(ValidatedTranslationConfig {
+            endpoint_origin: endpoint_origin(&endpoint)?,
+            endpoint_hash: sha256_hex(endpoint.as_bytes()),
             endpoint,
             model,
             api_key,
             target_language,
         })
+    }
+}
+
+impl TranslationRetryCancellation {
+    #[allow(dead_code)]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -278,16 +323,25 @@ fn process_translation_job(
         source_revision: job.final_segment.revision,
         target_language: job.config.target_language.clone(),
         model: job.config.model.clone(),
+        provider: TRANSLATION_PROVIDER_OPENAI_COMPATIBLE.to_owned(),
+        config_version: TRANSLATION_CONFIG_VERSION.to_owned(),
+        endpoint_origin: Some(job.config.endpoint_origin.clone()),
+        endpoint_hash: job.config.endpoint_hash.clone(),
+        prompt_version: TRANSLATION_PROMPT_VERSION.to_owned(),
+        request_schema_version: TRANSLATION_REQUEST_SCHEMA_VERSION.to_owned(),
     };
-    if let Err(error) = storage_writer.begin_translation(candidate) {
-        publish_translation(
-            snapshot,
-            &job.final_segment,
-            &job.config.target_language,
-            TranslationOutcome::Failed(error),
-        );
-        return;
-    }
+    let attempt = match storage_writer.begin_translation(candidate) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            publish_translation(
+                snapshot,
+                &job.final_segment,
+                &job.config.target_language,
+                TranslationOutcome::Failed(error),
+            );
+            return;
+        }
+    };
     let result = if job.source_language == job.config.target_language {
         TranslationOutcome::Skipped
     } else {
@@ -301,6 +355,7 @@ fn process_translation_job(
         segment_id: job.final_segment.segment_id.clone(),
         source_revision: job.final_segment.revision,
         target_language: job.config.target_language.clone(),
+        attempt: attempt.attempt,
         translated_text: match &result {
             TranslationOutcome::Completed(text) => Some(text.clone()),
             TranslationOutcome::Failed(_) | TranslationOutcome::Skipped => None,
@@ -308,6 +363,10 @@ fn process_translation_job(
         error_code: match &result {
             TranslationOutcome::Failed(error) => Some(error.clone()),
             TranslationOutcome::Completed(_) | TranslationOutcome::Skipped => None,
+        },
+        retryable: match &result {
+            TranslationOutcome::Failed(error) => translation_error_retryable(error),
+            TranslationOutcome::Completed(_) | TranslationOutcome::Skipped => false,
         },
         skipped_same_language: matches!(&result, TranslationOutcome::Skipped),
     };
@@ -454,6 +513,33 @@ fn map_http_error(error: ureq::Error) -> String {
     }
 }
 
+#[allow(dead_code)]
+pub fn classify_translation_error_code(error_code: &str) -> TranslationFailureClass {
+    TranslationFailureClass {
+        error_code: error_code.to_owned(),
+        retryable: translation_error_retryable(error_code),
+    }
+}
+
+pub fn translation_error_retryable(error_code: &str) -> bool {
+    if matches!(
+        error_code,
+        "TRANSLATION_CONNECTION_FAILED"
+            | "TRANSLATION_RESPONSE_READ_FAILED"
+            | "TRANSLATION_TIMEOUT"
+            | "TRANSLATION_INTERRUPTED"
+    ) {
+        return true;
+    }
+    let Some(status) = error_code
+        .strip_prefix("TRANSLATION_HTTP_STATUS_")
+        .and_then(|status| status.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
 fn completion_endpoint(base_url: &str, allow_insecure_http: bool) -> Result<String, String> {
     let base_url = bounded_clean(
         base_url,
@@ -493,6 +579,22 @@ fn completion_endpoint(base_url: &str, allow_insecure_http: bool) -> Result<Stri
     } else {
         Ok(format!("{base}/chat/completions"))
     }
+}
+
+fn endpoint_origin(endpoint: &str) -> Result<String, String> {
+    let (scheme, remainder) = if let Some(remainder) = endpoint.strip_prefix("https://") {
+        ("https", remainder)
+    } else if let Some(remainder) = endpoint.strip_prefix("http://") {
+        ("http", remainder)
+    } else {
+        return Err("TRANSLATION_BASE_URL_INVALID".to_owned());
+    };
+    let authority = remainder
+        .split('/')
+        .next()
+        .ok_or_else(|| "TRANSLATION_BASE_URL_INVALID".to_owned())?;
+    validate_authority(authority)?;
+    Ok(format!("{scheme}://{authority}"))
 }
 
 fn validate_authority(authority: &str) -> Result<&str, String> {
@@ -603,6 +705,53 @@ mod tests {
         }
     }
 
+    fn live_translation_config(target_language: &str) -> TranslationConfig {
+        TranslationConfig {
+            enabled: true,
+            base_url: std::env::var("MEETINGRELAY_LIVE_TRANSLATION_BASE_URL")
+                .expect("MEETINGRELAY_LIVE_TRANSLATION_BASE_URL is required"),
+            model: std::env::var("MEETINGRELAY_LIVE_TRANSLATION_MODEL")
+                .expect("MEETINGRELAY_LIVE_TRANSLATION_MODEL is required"),
+            api_key: Some(
+                std::env::var("MEETINGRELAY_LIVE_TRANSLATION_API_KEY")
+                    .expect("MEETINGRELAY_LIVE_TRANSLATION_API_KEY is required"),
+            ),
+            target_language: target_language.to_owned(),
+            allow_insecure_http: std::env::var("MEETINGRELAY_LIVE_TRANSLATION_ALLOW_INSECURE_HTTP")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+        }
+    }
+
+    fn live_translation_sample_count_from_env() -> usize {
+        parse_live_translation_sample_count(
+            std::env::var("MEETINGRELAY_LIVE_TRANSLATION_SAMPLE_COUNT").ok(),
+        )
+        .expect("MEETINGRELAY_LIVE_TRANSLATION_SAMPLE_COUNT must be an integer from 1 to 20")
+    }
+
+    fn parse_live_translation_sample_count(value: Option<String>) -> Result<usize, String> {
+        const DEFAULT_SAMPLE_COUNT: usize = 3;
+        const MAX_SAMPLE_COUNT: usize = 20;
+        let Some(value) = value else {
+            return Ok(DEFAULT_SAMPLE_COUNT);
+        };
+        let parsed = value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| "invalid sample count".to_owned())?;
+        if (1..=MAX_SAMPLE_COUNT).contains(&parsed) {
+            Ok(parsed)
+        } else {
+            Err("sample count must be from 1 to 20".to_owned())
+        }
+    }
+
+    fn latency_percentile(sorted_latency_ms: &[u128], percentile: usize) -> u128 {
+        assert!(!sorted_latency_ms.is_empty());
+        let index = ((sorted_latency_ms.len() - 1) * percentile).div_ceil(100);
+        sorted_latency_ms[index]
+    }
+
     #[test]
     fn accepts_loopback_http_and_remote_https_openai_compatible_endpoints() {
         assert_eq!(
@@ -663,20 +812,7 @@ mod tests {
     #[test]
     #[ignore = "requires explicitly supplied live provider credentials"]
     fn live_openai_compatible_translation_when_configured() {
-        let config = TranslationConfig {
-            enabled: true,
-            base_url: std::env::var("MEETINGRELAY_LIVE_TRANSLATION_BASE_URL")
-                .expect("MEETINGRELAY_LIVE_TRANSLATION_BASE_URL is required"),
-            model: std::env::var("MEETINGRELAY_LIVE_TRANSLATION_MODEL")
-                .expect("MEETINGRELAY_LIVE_TRANSLATION_MODEL is required"),
-            api_key: Some(
-                std::env::var("MEETINGRELAY_LIVE_TRANSLATION_API_KEY")
-                    .expect("MEETINGRELAY_LIVE_TRANSLATION_API_KEY is required"),
-            ),
-            target_language: "zh".to_owned(),
-            allow_insecure_http: std::env::var("MEETINGRELAY_LIVE_TRANSLATION_ALLOW_INSECURE_HTTP")
-                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
-        };
+        let config = live_translation_config("zh");
 
         let probe = test_translation(&config).expect("live translation probe must succeed");
         assert!(!probe.preview.trim().is_empty());
@@ -684,6 +820,98 @@ mod tests {
             "live translation passed: model={}, target={}, latency_ms={}, preview={}",
             probe.model, probe.target_language, probe.latency_ms, probe.preview
         );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied live provider credentials"]
+    fn live_openai_compatible_translation_matrix_when_configured() {
+        let sample_count = live_translation_sample_count_from_env();
+        for (source_language, target_language, text) in [
+            ("ja", "zh", "明日の会議は午前九時から始まります。"),
+            ("zh", "en", "明天的会议从上午九点开始。"),
+        ] {
+            let config = live_translation_config(target_language)
+                .validate_enabled()
+                .expect("live translation config must be valid");
+            let mut successes = 0_usize;
+            let mut failures = 0_usize;
+            let mut latencies_ms = Vec::with_capacity(sample_count);
+            let mut failure_codes = Vec::new();
+
+            for _ in 0..sample_count {
+                let started = Instant::now();
+                match translate_text(&config, text, source_language) {
+                    Ok(translation) if !translation.trim().is_empty() => {
+                        successes += 1;
+                        latencies_ms.push(started.elapsed().as_millis());
+                    }
+                    Ok(_) => {
+                        failures += 1;
+                        failure_codes.push("EMPTY_TRANSLATION".to_owned());
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        failure_codes.push(error);
+                    }
+                }
+            }
+
+            latencies_ms.sort_unstable();
+            if !latencies_ms.is_empty() {
+                println!(
+                    "live translation matrix: model={}, direction={}→{}, samples={}, success={}, failure={}, p50_ms={}, p95_ms={}, max_ms={}, endpoint_hash={}",
+                    config.model,
+                    source_language,
+                    target_language,
+                    sample_count,
+                    successes,
+                    failures,
+                    latency_percentile(&latencies_ms, 50),
+                    latency_percentile(&latencies_ms, 95),
+                    latencies_ms.last().unwrap(),
+                    config.endpoint_hash
+                );
+            } else {
+                println!(
+                    "live translation matrix: model={}, direction={}→{}, samples={}, success=0, failure={}, endpoint_hash={}",
+                    config.model,
+                    source_language,
+                    target_language,
+                    sample_count,
+                    failures,
+                    config.endpoint_hash
+                );
+            }
+
+            assert_eq!(
+                failures, 0,
+                "live translation failures for {source_language}→{target_language}: {failure_codes:?}"
+            );
+            assert_eq!(successes, sample_count);
+        }
+    }
+
+    #[test]
+    fn live_translation_sample_count_defaults_and_bounds_are_stable() {
+        assert_eq!(parse_live_translation_sample_count(None).unwrap(), 3);
+        assert_eq!(
+            parse_live_translation_sample_count(Some("1".to_owned())).unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_live_translation_sample_count(Some("20".to_owned())).unwrap(),
+            20
+        );
+        assert!(parse_live_translation_sample_count(Some("0".to_owned())).is_err());
+        assert!(parse_live_translation_sample_count(Some("21".to_owned())).is_err());
+        assert!(parse_live_translation_sample_count(Some("abc".to_owned())).is_err());
+    }
+
+    #[test]
+    fn latency_percentile_uses_nearest_rank_for_sorted_samples() {
+        let samples = [10, 20, 30, 40, 50];
+        assert_eq!(latency_percentile(&samples, 50), 30);
+        assert_eq!(latency_percentile(&samples, 95), 50);
     }
 
     #[test]
@@ -744,6 +972,40 @@ mod tests {
     }
 
     #[test]
+    fn retry_classifier_only_retries_timeout_rate_limit_and_server_errors() {
+        for code in [
+            "TRANSLATION_CONNECTION_FAILED",
+            "TRANSLATION_RESPONSE_READ_FAILED",
+            "TRANSLATION_TIMEOUT",
+            "TRANSLATION_INTERRUPTED",
+            "TRANSLATION_HTTP_STATUS_408",
+            "TRANSLATION_HTTP_STATUS_429",
+            "TRANSLATION_HTTP_STATUS_500",
+            "TRANSLATION_HTTP_STATUS_503",
+        ] {
+            assert!(translation_error_retryable(code), "{code}");
+        }
+        for code in [
+            "TRANSLATION_HTTP_STATUS_401",
+            "TRANSLATION_HTTP_STATUS_403",
+            "TRANSLATION_HTTP_STATUS_404",
+            "TRANSLATION_BASE_URL_INVALID",
+            "TRANSLATION_API_KEY_INVALID",
+            "TRANSLATION_MODEL_INVALID",
+            "TRANSLATION_RESPONSE_INVALID",
+        ] {
+            assert!(!translation_error_retryable(code), "{code}");
+        }
+        assert_eq!(
+            classify_translation_error_code("TRANSLATION_HTTP_STATUS_429"),
+            TranslationFailureClass {
+                error_code: "TRANSLATION_HTTP_STATUS_429".to_owned(),
+                retryable: true,
+            }
+        );
+    }
+
+    #[test]
     fn same_language_is_marked_skipped_and_never_connects_to_the_provider() {
         let config = enabled("http://127.0.0.1:9/v1").validate_enabled().unwrap();
         assert_eq!(translate_text(&config, "原文", "zh").unwrap(), "原文");
@@ -768,6 +1030,9 @@ mod tests {
             content_sha256: "a".repeat(64),
             committed_at: "1".to_owned(),
             commit_id: "b".repeat(64),
+            meeting_sample_start: 0,
+            meeting_sample_end: 16,
+            timeline_revision: 1,
             translation_status: "disabled".to_owned(),
             translation_target: None,
             translation_text: None,
@@ -834,6 +1099,9 @@ mod tests {
                 text: "local original".to_owned(),
                 started_at_ms: "0".to_owned(),
                 ended_at_ms: "100".to_owned(),
+                meeting_sample_start: 0,
+                meeting_sample_end: 1_600,
+                timeline_revision: 1,
             })
             .unwrap()
             .final_segment;

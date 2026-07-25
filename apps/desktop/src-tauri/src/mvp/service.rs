@@ -4,23 +4,51 @@ use std::sync::{
 };
 
 use super::{
-    audio::{AudioDeviceInventory, AudioDeviceSelection},
-    contract::{AudioSourceSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus},
-    export::{ExportResult, export_meeting, transcript_text},
-    storage::{
-        DurableFinal, FinalCandidate, MvpStorage, MvpStorageWriter, segment_from_durable,
-        visible_window_start_sequence,
+    audio::{AudioDeviceInventory, AudioDeviceSelection, AudioSourceMode},
+    contract::{
+        AudioSourceSnapshot, DiskHealthSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus,
     },
-    translation::{TranslationConfig, TranslationSubmitter, TranslationWorker},
+    export::{
+        ExportOptions, ExportResult, ExportSummary, ExportSummarySection, export_meeting,
+        export_meeting_with_options, transcript_text,
+    },
+    governance::{GovernanceFileTombstone, MeetingFileVault},
+    raw_audio::{
+        RawAudioConfig, RawAudioError, RawAudioManifest, RawAudioRetentionPolicy, RawAudioStore,
+        read_mixed_window_16khz,
+    },
+    secret_store::{ProductionSecretStore, SecretStore, SecretStoreStatus},
+    storage::{
+        DurableFinal, FinalCandidate, MeetingLibraryItem, MeetingLibraryQuery, MvpStorage,
+        MvpStorageWriter, ProviderProfileInput, ProviderProfileRecord, RecoveryActionKind,
+        SegmentSearchQuery, SummaryChunkInput, SummaryJobInput, SummaryJobRecord,
+        SummaryResultInput, SummaryResultRecord, TranslationCandidate, TranslationCompletion,
+        now_ms_string, segment_from_durable, sha256_hex, visible_window_start_sequence,
+    },
+    summary::{
+        MeetingSummary, SummaryConfig, SummaryOutcome, SummaryProgressSnapshot, SummaryRunRequest,
+        SummarySegment, SummaryStage, run_summary,
+    },
+    translation::{
+        TranslationConfig, TranslationProbe, TranslationSubmitter, TranslationWorker,
+        ValidatedTranslationConfig, test_translation, translate_text, translation_error_retryable,
+    },
 };
 
 pub(crate) const MVP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const DISK_REQUIRED_BYTES: u64 = 512 * 1024 * 1024;
+const DISK_WARNING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const GOVERNANCE_RECOVERY_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+#[cfg(windows)]
+const RECOVERY_WINDOW_SAMPLES: u64 = 8 * 16_000;
 
 #[cfg(windows)]
 use std::{
     collections::VecDeque,
-    env,
+    env, fs,
+    io::Write,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         TryLockError,
         atomic::{AtomicU8, AtomicU64, AtomicUsize},
@@ -47,6 +75,7 @@ use super::{
         AudioBlock, AudioSegment, BlockPacketizer, EnergyEndpointSegmenter, Mono16kResampler,
         SegmentEvent, TARGET_SAMPLE_RATE_HZ, mix_blocks,
     },
+    raw_audio::{MeetingSampleRange, RawAudioGap, RawAudioMeetingWriter},
 };
 
 pub struct MvpService {
@@ -54,8 +83,243 @@ pub struct MvpService {
     storage: Option<MvpStorage>,
     storage_writer: Option<Arc<MvpStorageWriter>>,
     translation: Mutex<Option<TranslationWorker>>,
+    secret_store: Arc<dyn SecretStore>,
+    summary_state: Arc<Mutex<SummaryJobSnapshot>>,
+    summary_cancel: Arc<AtomicBool>,
+    summary_active: Arc<AtomicBool>,
+    retry_progress: Arc<Mutex<TranslationRetryProgressSnapshot>>,
+    retry_cancel: Arc<AtomicBool>,
     inner: Mutex<ServiceInner>,
     shutdown_started: AtomicBool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationRetryProgressSnapshot {
+    pub batch_id: Option<String>,
+    pub status: String,
+    pub total: usize,
+    pub progress: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub cost_risk_accepted: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentAudioLocation {
+    pub available: bool,
+    pub path: Option<String>,
+    pub offset_ms: Option<String>,
+    pub duration_ms: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticBundleResult {
+    pub path: String,
+    pub byte_length: usize,
+    pub sha256: String,
+    pub redacted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretStoreSnapshot {
+    pub backend: String,
+    pub available: bool,
+    pub configured: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryCitationSnapshot {
+    pub segment_id: Option<String>,
+    pub sequence: Option<String>,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryResultSnapshot {
+    pub summary_id: String,
+    pub version: u32,
+    pub language: String,
+    pub overview: String,
+    pub actions: Vec<String>,
+    pub decisions: Vec<String>,
+    pub open_questions: Vec<String>,
+    pub citations: Vec<SummaryCitationSnapshot>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryJobSnapshot {
+    pub job_id: String,
+    pub meeting_id: String,
+    pub status: String,
+    pub version: u32,
+    pub total_chunks: usize,
+    pub completed_chunks: usize,
+    pub can_cancel: bool,
+    pub can_retry: bool,
+    pub message: Option<String>,
+    pub result: Option<SummaryResultSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingListItemSnapshot {
+    pub meeting_id: String,
+    pub title: String,
+    pub status: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub duration_ms: String,
+    pub language: String,
+    pub saved_final_count: String,
+    pub translation_failed_count: usize,
+    pub summary_status: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingListPageSnapshot {
+    pub items: Vec<MeetingListItemSnapshot>,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+    pub page_size: usize,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDetailSnapshot {
+    pub meeting: MeetingListItemSnapshot,
+    pub segments: Vec<super::contract::TranscriptSegment>,
+    pub summary: Option<SummaryResultSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentSearchHitSnapshot {
+    pub meeting_id: String,
+    pub meeting_title: String,
+    pub segment_id: Option<String>,
+    pub sequence: Option<String>,
+    pub scope: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentSearchPageSnapshot {
+    pub hits: Vec<SegmentSearchHitSnapshot>,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderProfileSnapshot {
+    pub profile_id: String,
+    pub label: String,
+    #[serde(rename = "class")]
+    pub provider_class: String,
+    pub base_url: String,
+    pub model: String,
+    pub policy_url: Option<String>,
+    pub data_flow: String,
+    pub config_version: u32,
+    pub secret_state: String,
+    pub last_test_status: String,
+    pub last_test_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderProfileUpdate {
+    pub profile_id: String,
+    pub label: String,
+    #[serde(rename = "class")]
+    pub provider_class: String,
+    pub base_url: String,
+    pub model: String,
+    pub policy_url: Option<String>,
+    pub data_flow: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletePreviewEntrySnapshot {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub path: Option<String>,
+    pub byte_length: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletePreviewSnapshot {
+    pub meeting_id: String,
+    pub recovery_window_seconds: u64,
+    pub include_raw: bool,
+    pub include_derived: bool,
+    pub entries: Vec<DeletePreviewEntrySnapshot>,
+    pub will_delete_bytes: String,
+    pub can_restore: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResultSnapshot {
+    pub meeting_id: String,
+    pub deleted: bool,
+    pub restored_until: Option<String>,
+    pub entries_deleted: usize,
+    pub bytes_deleted: String,
+}
+
+impl Default for SummaryJobSnapshot {
+    fn default() -> Self {
+        Self {
+            job_id: "idle".to_owned(),
+            meeting_id: "idle".to_owned(),
+            status: "idle".to_owned(),
+            version: 0,
+            total_chunks: 0,
+            completed_chunks: 0,
+            can_cancel: false,
+            can_retry: false,
+            message: None,
+            result: None,
+        }
+    }
+}
+
+impl Default for TranslationRetryProgressSnapshot {
+    fn default() -> Self {
+        Self {
+            batch_id: None,
+            status: "idle".to_owned(),
+            total: 0,
+            progress: 0,
+            succeeded: 0,
+            failed: 0,
+            cancelled: 0,
+            cost_risk_accepted: false,
+            message: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -96,6 +360,16 @@ impl RecognitionLanguage {
         format!("SenseVoice · {} · CPU · local", self.code())
     }
 
+    fn from_model_label(model_label: &str) -> Self {
+        if model_label.contains("· en ·") {
+            Self::English
+        } else if model_label.contains("· ja ·") {
+            Self::Japanese
+        } else {
+            Self::Chinese
+        }
+    }
+
     #[cfg(windows)]
     const fn sherpa(self) -> LockedSherpaLanguage {
         match self {
@@ -123,6 +397,13 @@ impl Default for MvpService {
 
 impl MvpService {
     fn new_with_storage_result(storage_result: Result<MvpStorage, String>) -> Self {
+        Self::new_with_dependencies(storage_result, Arc::new(ProductionSecretStore::new()))
+    }
+
+    fn new_with_dependencies(
+        storage_result: Result<MvpStorage, String>,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Self {
         let (storage, storage_writer, storage_error) = match storage_result {
             Ok(storage) => match MvpStorageWriter::start(storage.clone()) {
                 Ok(writer) => (Some(storage), Some(Arc::new(writer)), None),
@@ -146,10 +427,722 @@ impl MvpService {
             storage,
             storage_writer,
             translation: Mutex::new(translation),
+            secret_store,
+            summary_state: Arc::new(Mutex::new(SummaryJobSnapshot::default())),
+            summary_cancel: Arc::new(AtomicBool::new(false)),
+            summary_active: Arc::new(AtomicBool::new(false)),
+            retry_progress: Arc::new(Mutex::new(TranslationRetryProgressSnapshot::default())),
+            retry_cancel: Arc::new(AtomicBool::new(false)),
             inner: Mutex::new(ServiceInner::default()),
             shutdown_started: AtomicBool::new(false),
         }
     }
+
+    pub fn secret_store_status(
+        &self,
+        provider_profile_id: Option<&str>,
+    ) -> Result<SecretStoreSnapshot, String> {
+        let available = matches!(
+            self.secret_store
+                .status()
+                .map_err(|_| "SECRET_STORE_UNAVAILABLE".to_owned())?,
+            SecretStoreStatus::Available
+        );
+        let configured = if let Some(profile_id) = provider_profile_id {
+            let secret_id = provider_secret_id(profile_id)?;
+            let mut secret = self
+                .secret_store
+                .get(&secret_id)
+                .map_err(|_| "SECRET_STORE_READ_FAILED".to_owned())?;
+            let configured = secret.is_some();
+            if let Some(bytes) = secret.as_mut() {
+                bytes.fill(0);
+            }
+            configured
+        } else {
+            false
+        };
+        Ok(SecretStoreSnapshot {
+            backend: if cfg!(windows) {
+                "windows-credential-manager".to_owned()
+            } else {
+                "unsupported".to_owned()
+            },
+            available,
+            configured,
+        })
+    }
+
+    pub fn set_provider_secret(
+        &self,
+        provider_profile_id: &str,
+        secret: String,
+    ) -> Result<SecretStoreSnapshot, String> {
+        let secret_id = provider_secret_id(provider_profile_id)?;
+        let mut secret = secret.into_bytes();
+        let result = self
+            .secret_store
+            .set(&secret_id, &secret)
+            .map_err(|_| "SECRET_STORE_WRITE_FAILED".to_owned());
+        secret.fill(0);
+        result?;
+        self.secret_store_status(Some(provider_profile_id))
+    }
+
+    pub fn delete_provider_secret(
+        &self,
+        provider_profile_id: &str,
+    ) -> Result<SecretStoreSnapshot, String> {
+        let secret_id = provider_secret_id(provider_profile_id)?;
+        self.secret_store
+            .delete(&secret_id)
+            .map_err(|_| "SECRET_STORE_DELETE_FAILED".to_owned())?;
+        self.secret_store_status(Some(provider_profile_id))
+    }
+
+    pub fn test_provider(&self, provider_profile_id: &str) -> Result<TranslationProbe, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let profile = storage
+            .provider_profile_latest(provider_profile_id)?
+            .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
+        if profile.provider_class == "local" {
+            let probe = TranslationProbe {
+                endpoint: profile
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "local://meetingrelay".to_owned()),
+                model: profile.model.clone(),
+                target_language: "zh".to_owned(),
+                latency_ms: 0,
+                preview: "Local provider ready".to_owned(),
+            };
+            self.record_provider_test(&profile, "passed", None)?;
+            return Ok(probe);
+        }
+        let config = TranslationConfig {
+            enabled: true,
+            base_url: profile.base_url.clone().unwrap_or_default(),
+            model: profile.model.clone(),
+            api_key: self.provider_api_key(provider_profile_id)?,
+            target_language: "zh".to_owned(),
+            allow_insecure_http: profile.provider_class == "lan",
+        };
+        match test_translation(&config) {
+            Ok(probe) => {
+                self.record_provider_test(&profile, "passed", None)?;
+                Ok(probe)
+            }
+            Err(error) => {
+                let _ = self.record_provider_test(&profile, "failed", Some(&error));
+                Err(error)
+            }
+        }
+    }
+
+    pub fn provider_profiles(&self) -> Result<Vec<ProviderProfileSnapshot>, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let mut profiles = storage.provider_profiles_latest()?;
+        if profiles.is_empty() {
+            self.seed_default_provider_profiles()?;
+            profiles = storage.provider_profiles_latest()?;
+        }
+        profiles
+            .into_iter()
+            .map(|profile| {
+                let secret_state = self.provider_secret_state(&profile)?;
+                Ok(ProviderProfileSnapshot {
+                    profile_id: profile.profile_id,
+                    label: profile.label,
+                    provider_class: profile.provider_class,
+                    base_url: profile.base_url.unwrap_or_default(),
+                    model: profile.model,
+                    policy_url: profile.policy_url,
+                    data_flow: profile.data_flow,
+                    config_version: profile.config_version.max(1),
+                    secret_state,
+                    last_test_status: profile
+                        .last_test_status
+                        .unwrap_or_else(|| "untested".to_owned()),
+                    last_test_at: profile.last_test_at,
+                    last_error: profile.last_error,
+                })
+            })
+            .collect()
+    }
+
+    pub fn save_provider_profile(
+        &self,
+        update: ProviderProfileUpdate,
+    ) -> Result<ProviderProfileSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let existing = storage
+            .provider_profile_latest(&update.profile_id)?
+            .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
+        let endpoint_hash = if update.provider_class == "local" {
+            sha256_hex(update.base_url.as_bytes())
+        } else {
+            TranslationConfig {
+                enabled: true,
+                base_url: update.base_url.clone(),
+                model: update.model.clone(),
+                api_key: None,
+                target_language: "zh".to_owned(),
+                allow_insecure_http: update.provider_class == "lan",
+            }
+            .validate_enabled()?
+            .endpoint_hash
+        };
+        let secret_state = self.provider_secret_state(&existing)?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let saved = writer.save_provider_profile(ProviderProfileInput {
+            profile_id: Some(update.profile_id),
+            label: update.label,
+            provider_class: update.provider_class,
+            base_url: Some(update.base_url),
+            model: update.model,
+            endpoint_hash,
+            data_flow: update.data_flow,
+            policy_url: update.policy_url,
+            config_version: existing.config_version.saturating_add(1),
+            secret_state: secret_state.clone(),
+            last_test_at: None,
+            last_test_status: None,
+            last_error: None,
+        })?;
+        Ok(ProviderProfileSnapshot {
+            profile_id: saved.profile_id,
+            label: saved.label,
+            provider_class: saved.provider_class,
+            base_url: saved.base_url.unwrap_or_default(),
+            model: saved.model,
+            policy_url: saved.policy_url,
+            data_flow: saved.data_flow,
+            config_version: saved.config_version.max(1),
+            secret_state,
+            last_test_status: "untested".to_owned(),
+            last_test_at: None,
+            last_error: None,
+        })
+    }
+
+    fn seed_default_provider_profiles(&self) -> Result<(), String> {
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        for input in default_provider_profiles() {
+            writer.save_provider_profile(input)?;
+        }
+        Ok(())
+    }
+
+    fn provider_secret_state(&self, profile: &ProviderProfileRecord) -> Result<String, String> {
+        if profile.provider_class == "local" {
+            return Ok("not_required".to_owned());
+        }
+        if !matches!(self.secret_store.status(), Ok(SecretStoreStatus::Available)) {
+            return Ok("unsupported".to_owned());
+        }
+        let secret_id = provider_secret_id(&profile.profile_id)?;
+        let mut secret = self
+            .secret_store
+            .get(&secret_id)
+            .map_err(|_| "SECRET_STORE_READ_FAILED".to_owned())?;
+        let state = if secret.is_some() {
+            "present"
+        } else {
+            "missing"
+        };
+        if let Some(bytes) = secret.as_mut() {
+            bytes.fill(0);
+        }
+        Ok(state.to_owned())
+    }
+
+    fn record_provider_test(
+        &self,
+        profile: &ProviderProfileRecord,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        writer.save_provider_profile(ProviderProfileInput {
+            profile_id: Some(profile.profile_id.clone()),
+            label: profile.label.clone(),
+            provider_class: profile.provider_class.clone(),
+            base_url: profile.base_url.clone(),
+            model: profile.model.clone(),
+            endpoint_hash: profile.endpoint_hash.clone(),
+            data_flow: profile.data_flow.clone(),
+            policy_url: profile.policy_url.clone(),
+            config_version: profile.config_version,
+            secret_state: profile.secret_state.clone(),
+            last_test_at: Some(now_ms_string()),
+            last_test_status: Some(status.to_owned()),
+            last_error: error.map(bounded_provider_error),
+        })?;
+        Ok(())
+    }
+
+    pub fn list_meetings(
+        &self,
+        query: String,
+        tags: Vec<String>,
+        cursor: Option<String>,
+        page_size: usize,
+    ) -> Result<MeetingListPageSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let page = storage.list_meetings(MeetingLibraryQuery {
+            query,
+            tags,
+            cursor,
+            page_size,
+        })?;
+        Ok(MeetingListPageSnapshot {
+            items: page
+                .items
+                .into_iter()
+                .map(meeting_list_item_snapshot)
+                .collect(),
+            next_cursor: page.next_cursor,
+            total: page.total,
+            page_size: page.page_size,
+            elapsed_ms: page.elapsed_ms,
+        })
+    }
+
+    pub fn search_segments(
+        &self,
+        text: Option<String>,
+        scopes: Vec<String>,
+        meeting_id: Option<String>,
+        tag_ids: Vec<String>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<SegmentSearchPageSnapshot, String> {
+        let started = std::time::Instant::now();
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let page = storage.search_segments(SegmentSearchQuery {
+            text,
+            scopes,
+            meeting_id,
+            tag_ids,
+            limit,
+            cursor,
+        })?;
+        let total = page.hits.len();
+        let mut hits = Vec::with_capacity(total);
+        for hit in page.hits {
+            let title = storage
+                .meeting_library_item(&hit.meeting_id)?
+                .map(|item| item.title)
+                .unwrap_or_else(|| hit.meeting_id.clone());
+            let (segment_id, sequence) = resolve_search_identity(storage, &hit)?;
+            hits.push(SegmentSearchHitSnapshot {
+                meeting_id: hit.meeting_id,
+                meeting_title: title,
+                segment_id,
+                sequence,
+                score: match hit.scope.as_str() {
+                    "original" => 1.0,
+                    "translation" => 0.9,
+                    "summary" => 0.8,
+                    "speaker" => 0.7,
+                    _ => 0.0,
+                },
+                scope: hit.scope,
+                snippet: hit.text.chars().take(1_024).collect(),
+            });
+        }
+        Ok(SegmentSearchPageSnapshot {
+            hits,
+            next_cursor: page.next_cursor,
+            total,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    pub fn meeting_detail(&self, meeting_id: &str) -> Result<MeetingDetailSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let item = storage
+            .meeting_library_item(meeting_id)?
+            .ok_or_else(|| "MVP_STORAGE_MEETING_NOT_FOUND".to_owned())?;
+        let snapshot = storage.snapshot(meeting_id)?;
+        let summary = match storage.latest_summary_job_for_meeting(meeting_id)? {
+            Some(job) if job.status == "completed" => {
+                let records = storage.summary_results(&job.job_id)?;
+                summary_result_from_records(storage, &job, &records)?
+            }
+            _ => None,
+        };
+        Ok(MeetingDetailSnapshot {
+            meeting: meeting_list_item_snapshot(item),
+            segments: snapshot.finals.iter().map(segment_from_durable).collect(),
+            summary,
+        })
+    }
+
+    pub fn update_meeting_tags(
+        &self,
+        meeting_id: &str,
+        tags: Vec<String>,
+    ) -> Result<MeetingDetailSnapshot, String> {
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        writer.replace_meeting_tags(meeting_id, tags)?;
+        self.meeting_detail(meeting_id)
+    }
+
+    pub fn update_meeting_metadata(
+        &self,
+        meeting_id: &str,
+        title: &str,
+        language: &str,
+    ) -> Result<MeetingDetailSnapshot, String> {
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        writer.update_meeting_metadata(meeting_id, title, language)?;
+        self.meeting_detail(meeting_id)
+    }
+
+    pub fn tags(&self) -> Result<Vec<super::storage::TagRecord>, String> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+            .tags()
+    }
+
+    pub fn create_tag(
+        &self,
+        name: &str,
+        color: Option<&str>,
+    ) -> Result<super::storage::TagRecord, String> {
+        self.storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?
+            .create_tag(name, color)
+    }
+
+    pub fn delete_tag(&self, tag_id: &str) -> Result<(), String> {
+        self.storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?
+            .delete_tag(tag_id)
+    }
+
+    pub fn assign_tag(&self, meeting_id: &str, tag_id: &str) -> Result<(), String> {
+        self.storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?
+            .assign_tag(meeting_id, tag_id)
+    }
+
+    pub fn unassign_tag(&self, meeting_id: &str, tag_id: &str) -> Result<(), String> {
+        self.storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?
+            .unassign_tag(meeting_id, tag_id)
+    }
+
+    pub fn provider_profile_history(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<ProviderProfileRecord>, String> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+            .provider_profile_history(profile_id)
+    }
+
+    pub fn start_summary(
+        &self,
+        meeting_id: &str,
+        provider_profile_id: Option<&str>,
+        language: &str,
+    ) -> Result<SummaryJobSnapshot, String> {
+        if language != "zh" {
+            return Err("SUMMARY_LANGUAGE_UNSUPPORTED".to_owned());
+        }
+        self.start_summary_internal(meeting_id, provider_profile_id, None)
+    }
+
+    pub fn summary_status(&self, job_id: &str) -> Result<SummaryJobSnapshot, String> {
+        let current = lock(&self.summary_state).clone();
+        if current.job_id == job_id
+            && (self.summary_active.load(Ordering::Acquire) || current.status != "queued")
+        {
+            return Ok(current);
+        }
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let progress = storage
+            .summary_progress(job_id)?
+            .ok_or_else(|| "SUMMARY_JOB_NOT_FOUND".to_owned())?;
+        let records = storage.summary_results(job_id)?;
+        let result = if progress.job.status == "completed" {
+            summary_result_from_records(storage, &progress.job, &records)?
+        } else {
+            None
+        };
+        Ok(summary_job_from_storage(
+            progress.job,
+            progress.chunk_count,
+            result,
+        ))
+    }
+
+    pub fn cancel_summary(&self, job_id: &str) -> Result<SummaryJobSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let job = storage
+            .summary_job(job_id)?
+            .ok_or_else(|| "SUMMARY_JOB_NOT_FOUND".to_owned())?;
+        if job.status != "pending" {
+            return self.summary_status(job_id);
+        }
+        self.summary_cancel.store(true, Ordering::Release);
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let cancelled = writer.cancel_summary_job(job_id)?;
+        let mut state = lock(&self.summary_state);
+        if state.job_id == job_id {
+            state.status = "cancelled".to_owned();
+            state.can_cancel = false;
+            state.can_retry = true;
+            state.message = Some("Summary cancelled".to_owned());
+            state.result = None;
+            return Ok(state.clone());
+        }
+        Ok(summary_job_from_storage(cancelled, 0, None))
+    }
+
+    pub fn retry_summary(&self, job_id: &str) -> Result<SummaryJobSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let parent = storage
+            .summary_job(job_id)?
+            .ok_or_else(|| "SUMMARY_JOB_NOT_FOUND".to_owned())?;
+        if parent.status == "pending" {
+            return Err("SUMMARY_JOB_STILL_RUNNING".to_owned());
+        }
+        self.start_summary_internal(
+            &parent.meeting_id,
+            parent.provider_profile_id.as_deref(),
+            Some(job_id),
+        )
+    }
+
+    fn start_summary_internal(
+        &self,
+        meeting_id: &str,
+        provider_profile_id: Option<&str>,
+        parent_job_id: Option<&str>,
+    ) -> Result<SummaryJobSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let meeting = storage.snapshot(meeting_id)?;
+        if meeting.meeting.state == "recording" {
+            return Err("SUMMARY_RECORDING_NOT_ALLOWED".to_owned());
+        }
+        if meeting.finals.is_empty() {
+            return Err("SUMMARY_EMPTY_MEETING".to_owned());
+        }
+        let profile_id = match provider_profile_id {
+            Some(profile_id) => profile_id.to_owned(),
+            None => storage
+                .provider_profiles_latest()?
+                .into_iter()
+                .find(|profile| profile.provider_class != "local")
+                .map(|profile| profile.profile_id)
+                .ok_or_else(|| "SUMMARY_PROVIDER_REQUIRED".to_owned())?,
+        };
+        let profile = storage
+            .provider_profile_latest(&profile_id)?
+            .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
+        if profile.provider_class == "local" {
+            return Err("SUMMARY_LOCAL_PROVIDER_UNSUPPORTED".to_owned());
+        }
+        let config = SummaryConfig {
+            enabled: true,
+            provider: "openai-compatible".to_owned(),
+            base_url: profile.base_url.unwrap_or_default(),
+            model: profile.model,
+            api_key: self.provider_api_key(&profile_id)?,
+            allow_insecure_http: profile.provider_class == "lan",
+            max_chunk_chars: None,
+            max_retries: None,
+        }
+        .validate_enabled()?;
+        let request = SummaryRunRequest {
+            meeting_id: meeting_id.to_owned(),
+            segments: meeting
+                .finals
+                .iter()
+                .map(|segment| SummarySegment {
+                    meeting_id: meeting_id.to_owned(),
+                    segment_id: segment.segment_id.clone(),
+                    sequence: segment.sequence,
+                    sample_start: segment.meeting_sample_start,
+                    sample_end: segment.meeting_sample_end,
+                    text: segment.text.clone(),
+                })
+                .collect(),
+        };
+        request.validate()?;
+        self.summary_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "SUMMARY_JOB_ALREADY_RUNNING".to_owned())?;
+        self.summary_cancel.store(false, Ordering::Release);
+        let job_input = SummaryJobInput {
+            meeting_id: meeting_id.to_owned(),
+            provider_profile_id: Some(profile_id),
+            prompt_version: "meetingrelay.summary.prompt.v1".to_owned(),
+            request_schema_version: "openai.chat.completions.v1".to_owned(),
+        };
+        let job = match parent_job_id {
+            Some(parent) => writer.retry_summary_job(parent, job_input),
+            None => writer.start_summary_job(job_input),
+        }
+        .inspect_err(|_| self.summary_active.store(false, Ordering::Release))?;
+        let queued = summary_job_from_storage(job.clone(), 0, None);
+        *lock(&self.summary_state) = queued.clone();
+
+        let state = Arc::clone(&self.summary_state);
+        let cancellation = Arc::clone(&self.summary_cancel);
+        let active = Arc::clone(&self.summary_active);
+        let thread_job = job.clone();
+        let thread_writer = Arc::clone(&writer);
+        let spawn = std::thread::Builder::new()
+            .name(format!("meetingrelay-summary-{}", job.attempt))
+            .spawn(move || {
+                let progress_state = Arc::clone(&state);
+                let progress_job_id = thread_job.job_id.clone();
+                let source_segment_ids = request
+                    .segments
+                    .iter()
+                    .map(|segment| segment.segment_id.clone())
+                    .collect::<Vec<_>>();
+                let outcome = run_summary(&config, request, &cancellation, move |progress| {
+                    let mut current = lock(&progress_state);
+                    if current.job_id == progress_job_id && current.status != "cancelled" {
+                        apply_summary_progress(&mut current, &progress);
+                    }
+                });
+                finish_summary_run(
+                    &thread_writer,
+                    &thread_job,
+                    outcome,
+                    &cancellation,
+                    &state,
+                    &source_segment_ids,
+                );
+                active.store(false, Ordering::Release);
+            });
+        if spawn.is_err() {
+            self.summary_active.store(false, Ordering::Release);
+            let _ = writer.fail_summary_job(&job.job_id, "SUMMARY_WORKER_START_FAILED", true);
+            let mut state = lock(&self.summary_state);
+            state.status = "failed".to_owned();
+            state.can_cancel = false;
+            state.can_retry = true;
+            state.message = Some("SUMMARY_WORKER_START_FAILED".to_owned());
+            return Err("SUMMARY_WORKER_START_FAILED".to_owned());
+        }
+        Ok(queued)
+    }
+
+    fn provider_api_key(&self, provider_profile_id: &str) -> Result<Option<String>, String> {
+        let secret_id = provider_secret_id(provider_profile_id)?;
+        let mut bytes = match self
+            .secret_store
+            .get(&secret_id)
+            .map_err(|_| "SECRET_STORE_READ_FAILED".to_owned())?
+        {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let secret = String::from_utf8(bytes.clone())
+            .map_err(|_| "SECRET_STORE_VALUE_INVALID".to_owned())?;
+        bytes.fill(0);
+        Ok(Some(secret))
+    }
+
+    fn resolve_translation_config(
+        &self,
+        mut requested: TranslationConfig,
+        provider_profile_id: Option<&str>,
+    ) -> Result<TranslationConfig, String> {
+        requested.api_key = None;
+        if !requested.enabled {
+            return Ok(requested);
+        }
+        let provider_profile_id = provider_profile_id
+            .ok_or_else(|| "TRANSLATION_PROVIDER_PROFILE_REQUIRED".to_owned())?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let profile = storage
+            .provider_profile_latest(provider_profile_id)?
+            .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
+        if profile.provider_class == "local" {
+            return Err("TRANSLATION_LOCAL_PROVIDER_UNSUPPORTED".to_owned());
+        }
+        let config = TranslationConfig {
+            enabled: true,
+            base_url: profile.base_url.unwrap_or_default(),
+            model: profile.model,
+            api_key: self.provider_api_key(provider_profile_id)?,
+            target_language: requested.target_language,
+            allow_insecure_http: profile.provider_class == "lan",
+        };
+        config.validate_enabled()?;
+        Ok(config)
+    }
+
     pub fn snapshot(&self) -> MvpSnapshot {
         let inner = lock(&self.inner);
         #[cfg(windows)]
@@ -200,6 +1193,7 @@ impl MvpService {
         )
     }
 
+    #[cfg(test)]
     pub fn start_with_devices_and_language(
         &self,
         consent_accepted: bool,
@@ -207,22 +1201,56 @@ impl MvpService {
         language: &str,
         translation: Option<TranslationConfig>,
     ) -> Result<MvpSnapshot, String> {
+        self.start_with_devices_language_and_audio_mode(
+            consent_accepted,
+            selection,
+            language,
+            translation,
+            None,
+            AudioSourceMode::default(),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_devices_language_and_audio_mode(
+        &self,
+        consent_accepted: bool,
+        selection: AudioDeviceSelection,
+        language: &str,
+        translation: Option<TranslationConfig>,
+        translation_provider_profile_id: Option<&str>,
+        audio_source_mode: AudioSourceMode,
+        raw_audio_enabled: bool,
+    ) -> Result<MvpSnapshot, String> {
         if !consent_accepted {
             return Err("CONSENT_REQUIRED".to_owned());
         }
         let language = RecognitionLanguage::parse(language)?;
-        let translation = translation.unwrap_or_default();
-        if translation.enabled {
-            translation.validate_enabled()?;
-        }
+        let translation = self.resolve_translation_config(
+            translation.unwrap_or_default(),
+            translation_provider_profile_id,
+        )?;
 
         #[cfg(windows)]
         {
-            self.start_windows(selection, language, translation)
+            self.start_windows(
+                selection,
+                language,
+                translation,
+                audio_source_mode,
+                raw_audio_enabled,
+            )
         }
         #[cfg(not(windows))]
         {
-            let _ = (selection, language, translation);
+            let _ = (
+                selection,
+                language,
+                translation,
+                audio_source_mode,
+                raw_audio_enabled,
+            );
             Err("MVP_WINDOWS_ONLY".to_owned())
         }
     }
@@ -326,6 +1354,58 @@ impl MvpService {
         export_meeting(storage, writer, meeting_id, target_dir)
     }
 
+    pub fn export_meeting_options(
+        &self,
+        meeting_id: &str,
+        target_dir: String,
+        mut options: ExportOptions,
+    ) -> Result<ExportResult, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let requested_summary_version = options.summary_version;
+        options.summary = None;
+        options.summary_version = None;
+        if options.include_summary {
+            let job = match requested_summary_version {
+                Some(version) => Some(
+                    storage
+                        .summary_job_for_meeting_version(meeting_id, version)?
+                        .ok_or_else(|| "SUMMARY_VERSION_NOT_FOUND".to_owned())?,
+                ),
+                None => storage.latest_summary_job_for_meeting(meeting_id)?,
+            };
+            if let Some(job) = job {
+                if job.status != "completed" {
+                    if requested_summary_version.is_some() {
+                        return Err("SUMMARY_VERSION_NOT_COMPLETED".to_owned());
+                    }
+                } else {
+                    let records = storage.summary_results(&job.job_id)?;
+                    options.summary_version = Some(job.attempt.max(1));
+                    options.summary = Some(ExportSummary {
+                        version: options.summary_version,
+                        sections: records
+                            .into_iter()
+                            .map(|record| ExportSummarySection {
+                                kind: Some(record.section_kind),
+                                heading: Some(record.heading),
+                                text: record.text,
+                                citation_segment_ids: record.citation_segment_ids,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+        }
+        export_meeting_with_options(storage, writer, meeting_id, target_dir, options)
+    }
+
     pub fn transcript_text(&self, meeting_id: &str) -> Result<String, String> {
         let storage = self
             .storage
@@ -334,9 +1414,820 @@ impl MvpService {
         transcript_text(storage, meeting_id)
     }
 
+    pub fn retry_translation_segment(
+        &self,
+        meeting_id: &str,
+        segment_id: &str,
+        sequence: &str,
+        source_language: &str,
+        config: TranslationConfig,
+        provider_profile_id: &str,
+    ) -> Result<MvpSnapshot, String> {
+        let config = self
+            .resolve_translation_config(config, Some(provider_profile_id))?
+            .validate_enabled()?;
+        let sequence = sequence
+            .parse::<u64>()
+            .map_err(|_| "TRANSLATION_RETRY_SEGMENT_INVALID".to_owned())?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let meeting = storage.snapshot(meeting_id)?;
+        let final_segment = meeting
+            .finals
+            .iter()
+            .find(|item| item.segment_id == segment_id && item.sequence == sequence)
+            .cloned()
+            .ok_or_else(|| "TRANSLATION_RETRY_SEGMENT_MISSING".to_owned())?;
+        retry_one_translation(writer, &final_segment, source_language, &config)?;
+        self.apply_meeting_snapshot(writer.open_meeting(meeting_id)?)
+    }
+
+    pub fn retry_failed_translations(
+        &self,
+        meeting_id: &str,
+        source_language: &str,
+        config: TranslationConfig,
+        provider_profile_id: &str,
+        cost_risk_accepted: bool,
+    ) -> Result<TranslationRetryProgressSnapshot, String> {
+        if lock(&self.retry_progress).status == "running" {
+            return Err("TRANSLATION_RETRY_ALREADY_RUNNING".to_owned());
+        }
+        let config = self
+            .resolve_translation_config(config, Some(provider_profile_id))?
+            .validate_enabled()?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+            .clone();
+        let writer = Arc::clone(
+            self.storage_writer
+                .as_ref()
+                .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?,
+        );
+        let plan = storage.failed_translation_retry_plan(meeting_id, cost_risk_accepted)?;
+        let meeting = storage.snapshot(meeting_id)?;
+        let mut finals = Vec::new();
+        for item in plan
+            .items
+            .iter()
+            .filter(|item| item.retryable && item.target_language == config.target_language)
+        {
+            if let Some(final_segment) = meeting.finals.iter().find(|final_segment| {
+                final_segment.segment_id == item.segment_id
+                    && final_segment.revision == item.source_revision
+            }) {
+                finals.push(final_segment.clone());
+            }
+        }
+        if finals.is_empty() {
+            return Err("TRANSLATION_RETRY_NOTHING_RETRYABLE".to_owned());
+        }
+
+        let batch_id = format!("retry-{}", super::storage::now_ms_string());
+        let initial = TranslationRetryProgressSnapshot {
+            batch_id: Some(batch_id),
+            status: "running".to_owned(),
+            total: finals.len(),
+            progress: 0,
+            succeeded: 0,
+            failed: 0,
+            cancelled: 0,
+            cost_risk_accepted: true,
+            message: (plan.non_retryable > 0).then(|| {
+                format!(
+                    "{} non-retryable failures were excluded",
+                    plan.non_retryable
+                )
+            }),
+        };
+        *lock(&self.retry_progress) = initial.clone();
+        self.retry_cancel.store(false, Ordering::Release);
+
+        let progress = Arc::clone(&self.retry_progress);
+        let cancelled = Arc::clone(&self.retry_cancel);
+        let source_language = source_language.to_owned();
+        let meeting_id = meeting_id.to_owned();
+        let spawn = std::thread::Builder::new()
+            .name("meetingrelay-translation-retry".to_owned())
+            .spawn(move || {
+                for (index, final_segment) in finals.iter().enumerate() {
+                    if cancelled.load(Ordering::Acquire) {
+                        let mut state = lock(&progress);
+                        state.cancelled = state.total.saturating_sub(state.progress);
+                        state.status = "cancelled".to_owned();
+                        state.message = Some("Translation retry batch cancelled.".to_owned());
+                        return;
+                    }
+                    let succeeded =
+                        retry_one_translation(&writer, final_segment, &source_language, &config)
+                            .is_ok();
+                    let mut state = lock(&progress);
+                    state.progress = index + 1;
+                    if succeeded {
+                        state.succeeded += 1;
+                    } else {
+                        state.failed += 1;
+                    }
+                }
+                let mut state = lock(&progress);
+                state.status = if state.succeeded == 0 && state.failed > 0 {
+                    "failed".to_owned()
+                } else {
+                    "completed".to_owned()
+                };
+                state.message = Some(format!(
+                    "Meeting {meeting_id}: {} succeeded, {} failed.",
+                    state.succeeded, state.failed
+                ));
+            });
+        if spawn.is_err() {
+            let mut progress = lock(&self.retry_progress);
+            progress.status = "failed".to_owned();
+            progress.failed = progress.total;
+            progress.progress = progress.total;
+            progress.message = Some("TRANSLATION_RETRY_WORKER_START_FAILED".to_owned());
+            return Err("TRANSLATION_RETRY_WORKER_START_FAILED".to_owned());
+        }
+        Ok(initial)
+    }
+
+    pub fn translation_retry_progress(&self) -> TranslationRetryProgressSnapshot {
+        lock(&self.retry_progress).clone()
+    }
+
+    pub fn cancel_translation_batch(&self) -> TranslationRetryProgressSnapshot {
+        self.retry_cancel.store(true, Ordering::Release);
+        let mut progress = lock(&self.retry_progress);
+        if progress.status == "running" {
+            progress.message = Some("Translation retry cancellation requested.".to_owned());
+        }
+        progress.clone()
+    }
+
+    pub fn interrupted_meetings(
+        &self,
+    ) -> Result<Vec<super::storage::InterruptedMeetingRecord>, String> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+            .interrupted_meetings()
+    }
+
+    pub fn recover_meeting(&self, meeting_id: &str) -> Result<MvpSnapshot, String> {
+        self.apply_recovery_action(meeting_id, RecoveryActionKind::Recover)
+    }
+
+    pub fn finalize_interrupted(&self, meeting_id: &str) -> Result<MvpSnapshot, String> {
+        self.apply_recovery_action(meeting_id, RecoveryActionKind::Finalize)
+    }
+
+    pub fn keep_interrupted(&self, meeting_id: &str) -> Result<MvpSnapshot, String> {
+        self.apply_recovery_action(meeting_id, RecoveryActionKind::KeepInterrupted)
+    }
+
+    fn apply_recovery_action(
+        &self,
+        meeting_id: &str,
+        action: RecoveryActionKind,
+    ) -> Result<MvpSnapshot, String> {
+        #[cfg(windows)]
+        if history_open_blocked(&lock(&self.inner), &self.snapshot) {
+            return Err("SESSION_ACTIVE".to_owned());
+        }
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let meeting = writer.open_meeting(meeting_id)?;
+        let recovered_manifest = if action != RecoveryActionKind::KeepInterrupted {
+            self.raw_audio_store(RawAudioRetentionPolicy::NeverAutoDelete)?
+                .recover_interrupted_meeting(meeting_id)
+                .map_err(|error| public_raw_audio_policy_error(&error))?
+        } else {
+            None
+        };
+        if action == RecoveryActionKind::Recover {
+            self.apply_meeting_snapshot(meeting.clone())?;
+            #[cfg(windows)]
+            if let Some(manifest) = recovered_manifest.as_ref() {
+                let last_sample = meeting
+                    .finals
+                    .last()
+                    .map_or(0, |final_segment| final_segment.meeting_sample_end);
+                let model_label = self
+                    .storage
+                    .as_ref()
+                    .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+                    .meeting_model_label(meeting_id)?;
+                self.recover_raw_tail(
+                    meeting_id,
+                    manifest,
+                    last_sample,
+                    RecognitionLanguage::from_model_label(&model_label),
+                )?;
+            }
+        }
+        writer.record_recovery_action(meeting_id, action)?;
+        self.apply_meeting_snapshot(writer.open_meeting(meeting_id)?)
+    }
+
+    #[cfg(windows)]
+    fn recover_raw_tail(
+        &self,
+        meeting_id: &str,
+        manifest: &RawAudioManifest,
+        last_saved_sample: u64,
+        language: RecognitionLanguage,
+    ) -> Result<(), String> {
+        let tail_end = manifest
+            .sources
+            .iter()
+            .map(|source| source.meeting_sample_end)
+            .max()
+            .unwrap_or(last_saved_sample);
+        if tail_end <= last_saved_sample {
+            return Ok(());
+        }
+
+        let submitter = {
+            let mut inner = lock(&self.inner);
+            self.ensure_inference_worker(&mut inner, language)?;
+            let inference = inner
+                .inference
+                .as_ref()
+                .ok_or_else(|| "ASR_WORKER_START_FAILED".to_owned())?;
+            inference.submitter.shared.seed_durable_sequence(
+                self.storage
+                    .as_ref()
+                    .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+                    .snapshot(meeting_id)?
+                    .meeting
+                    .last_final_sequence,
+            );
+            inference.submitter()
+        };
+        let errors = Arc::new(RuntimeErrors::default());
+        let mut endpoint = EnergyEndpointSegmenter::new();
+        let mut packetizer = BlockPacketizer::new();
+        let mut blocks = Vec::new();
+        let mut window_start = last_saved_sample;
+
+        while window_start < tail_end {
+            let window_end = window_start
+                .saturating_add(RECOVERY_WINDOW_SAMPLES)
+                .min(tail_end);
+            let samples = read_mixed_window_16khz(manifest, window_start, window_end)
+                .map_err(|error| public_raw_audio_policy_error(&error))?;
+            blocks.clear();
+            packetizer.push(&samples, &mut blocks);
+            for block in blocks.drain(..) {
+                if let Some(event) = endpoint.push_block(&block) {
+                    submit_recovery_event(
+                        event,
+                        last_saved_sample,
+                        meeting_id,
+                        &submitter,
+                        &errors,
+                    )?;
+                }
+            }
+            window_start = window_end;
+        }
+        if let Some(block) = packetizer.flush_padded()
+            && let Some(event) = endpoint.push_block(&block)
+        {
+            submit_recovery_event(event, last_saved_sample, meeting_id, &submitter, &errors)?;
+        }
+        if let Some(event) = endpoint.flush_stop() {
+            submit_recovery_event(event, last_saved_sample, meeting_id, &submitter, &errors)?;
+        }
+        errors.completion_error().map_or(Ok(()), Err)
+    }
+
+    pub fn locate_segment_audio(
+        &self,
+        meeting_id: &str,
+        segment_id: &str,
+        sequence: &str,
+    ) -> Result<SegmentAudioLocation, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let sequence = sequence
+            .parse::<u64>()
+            .map_err(|_| "MVP_AUDIO_LOCATION_SEGMENT_INVALID".to_owned())?;
+        let meeting = storage.snapshot(meeting_id)?;
+        let final_segment = meeting
+            .finals
+            .iter()
+            .find(|item| item.segment_id == segment_id && item.sequence == sequence)
+            .ok_or_else(|| "MVP_AUDIO_LOCATION_SEGMENT_MISSING".to_owned())?;
+        let data_root = storage
+            .default_export_dir()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
+        let manifest_path = data_root
+            .join("derived")
+            .join(meeting_id)
+            .join("raw-audio-manifest.json");
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SegmentAudioLocation {
+                    available: false,
+                    path: None,
+                    offset_ms: None,
+                    duration_ms: None,
+                    reason: Some("RAW_AUDIO_DISABLED_OR_MISSING".to_owned()),
+                });
+            }
+            Err(_) => return Err("RAW_AUDIO_MANIFEST_READ_FAILED".to_owned()),
+        };
+        let manifest: super::raw_audio::RawAudioManifest =
+            serde_json::from_slice(&bytes).map_err(|_| "RAW_AUDIO_MANIFEST_INVALID".to_owned())?;
+        let source = manifest
+            .sources
+            .iter()
+            .find(|source| {
+                final_segment.meeting_sample_start >= source.meeting_sample_start
+                    && final_segment.meeting_sample_end <= source.meeting_sample_end
+                    && source.path.is_file()
+            })
+            .or_else(|| manifest.sources.iter().find(|source| source.path.is_file()));
+        let Some(source) = source else {
+            return Ok(SegmentAudioLocation {
+                available: false,
+                path: None,
+                offset_ms: None,
+                duration_ms: None,
+                reason: Some("RAW_AUDIO_SOURCE_MISSING".to_owned()),
+            });
+        };
+        let offset_ms = final_segment.meeting_sample_start.saturating_mul(1_000) / 16_000;
+        let duration_ms = final_segment
+            .meeting_sample_end
+            .saturating_sub(final_segment.meeting_sample_start)
+            .saturating_mul(1_000)
+            / 16_000;
+        Ok(SegmentAudioLocation {
+            available: true,
+            path: Some(source.path.to_string_lossy().into_owned()),
+            offset_ms: Some(offset_ms.to_string()),
+            duration_ms: Some(duration_ms.max(1).to_string()),
+            reason: None,
+        })
+    }
+
+    pub fn create_diagnostic_bundle(&self) -> Result<DiagnosticBundleResult, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let snapshot = self.snapshot();
+        let summary = lock(&self.summary_state).clone();
+        let provider_versions = [
+            "openai-compatible/meetingrelay.translation.config.v1",
+            "openai-compatible/meetingrelay.summary.prompt.v1",
+            "meetingrelay.document-export.v1",
+        ];
+        let mut recent_errors = snapshot.error.clone().into_iter().collect::<Vec<_>>();
+        if matches!(summary.status.as_str(), "failed" | "cancelled")
+            && let Some(message) = summary.message.as_deref()
+        {
+            recent_errors.push(message.to_owned());
+        }
+        let database_status = match storage.diagnostic_health() {
+            Ok(status) => status,
+            Err(error) => {
+                recent_errors.push(error);
+                "error".to_owned()
+            }
+        };
+        let mut providers = Vec::new();
+        match storage.provider_profiles_latest() {
+            Ok(records) => {
+                for profile in records {
+                    let secret_state = match self.provider_secret_state(&profile) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            recent_errors.push(error);
+                            "unavailable".to_owned()
+                        }
+                    };
+                    if let Some(error) = profile.last_error.as_deref() {
+                        recent_errors.push(error.to_owned());
+                    }
+                    providers.push(serde_json::json!({
+                        "profileId": super::storage::sanitize_diagnostic_value(&profile.profile_id),
+                        "class": super::storage::sanitize_diagnostic_value(&profile.provider_class),
+                        "configVersion": profile.config_version,
+                        "model": super::storage::sanitize_diagnostic_value(&profile.model),
+                        "endpointHash": super::storage::sanitize_diagnostic_value(&profile.endpoint_hash),
+                        "secretState": super::storage::sanitize_diagnostic_value(&secret_state),
+                        "lastTestStatus": profile
+                            .last_test_status
+                            .as_deref()
+                            .map(super::storage::sanitize_diagnostic_value),
+                        "lastTestAt": profile
+                            .last_test_at
+                            .as_deref()
+                            .map(super::storage::sanitize_diagnostic_value),
+                        "lastError": profile
+                            .last_error
+                            .as_deref()
+                            .map(super::storage::sanitize_diagnostic_value),
+                    }));
+                }
+            }
+            Err(error) => recent_errors.push(error),
+        }
+        recent_errors.sort();
+        recent_errors.dedup();
+        recent_errors.truncate(32);
+        let sanitized_errors = recent_errors
+            .iter()
+            .map(|error| super::storage::sanitize_diagnostic_value(error))
+            .collect::<Vec<_>>();
+        let error_refs = sanitized_errors
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let diagnostic = super::storage::sanitized_diagnostic_bundle(
+            Some(&snapshot.model_label),
+            &provider_versions,
+            super::storage::STORAGE_QUEUE_DEPTH,
+            snapshot.translation_queue_depth,
+            snapshot.disk.warning.as_deref(),
+            &error_refs,
+        );
+        let secret_store_status = match self.secret_store.status() {
+            Ok(SecretStoreStatus::Available) => "available",
+            Ok(SecretStoreStatus::Unsupported) => "unsupported",
+            Err(_) => "error",
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "redacted": true,
+            "generatedAt": super::storage::now_ms_string(),
+            "diagnostic": diagnostic,
+            "database": {
+                "status": database_status,
+                "schemaVersion": super::storage::MVP_SCHEMA_VERSION,
+                "schemaChecksum": super::storage::MVP_SCHEMA_CHECKSUM,
+                "readProbe": database_status == "ok",
+            },
+            "disk": {
+                "status": super::storage::sanitize_diagnostic_value(&snapshot.disk.status),
+                "freeBytes": snapshot.disk.free_bytes,
+                "requiredBytes": snapshot.disk.required_bytes,
+                "warning": snapshot
+                    .disk
+                    .warning
+                    .as_deref()
+                    .map(super::storage::sanitize_diagnostic_value),
+            },
+            "queues": {
+                "storageCapacity": super::storage::STORAGE_QUEUE_DEPTH,
+                "inferenceDepth": snapshot.queue_depth,
+                "inferenceCapacity": super::contract::MAX_INFERENCE_QUEUE_DEPTH,
+                "translationDepth": snapshot.translation_queue_depth,
+                "summaryActive": self.summary_active.load(Ordering::Acquire),
+                "summaryStatus": super::storage::sanitize_diagnostic_value(&summary.status),
+            },
+            "runtime": {
+                "os": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "appVersion": env!("CARGO_PKG_VERSION"),
+                "contractVersion": super::contract::MVP_CONTRACT_VERSION,
+                "lifecycle": format!("{:?}", snapshot.lifecycle).to_ascii_lowercase(),
+                "durabilityStatus": super::storage::sanitize_diagnostic_value(
+                    &snapshot.durability_status
+                ),
+                "audioSourceMode": super::storage::sanitize_diagnostic_value(
+                    &snapshot.audio_source_mode
+                ),
+                "localOnly": snapshot.local_only,
+                "memoryOnly": snapshot.memory_only,
+                "secretStore": {
+                    "backend": if cfg!(windows) {
+                        "windows-credential-manager"
+                    } else {
+                        "unsupported"
+                    },
+                    "status": secret_store_status,
+                },
+            },
+            "model": {
+                "ready": snapshot.model_ready,
+                "label": super::storage::sanitize_diagnostic_value(&snapshot.model_label),
+            },
+            "providers": providers,
+            "recentErrors": sanitized_errors,
+        }))
+        .map_err(|_| "MVP_DIAGNOSTIC_SERIALIZE_FAILED".to_owned())?;
+        let lower = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+        if ["authorization", "bearer ", "api_key", "apikey", "token="]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            return Err("MVP_DIAGNOSTIC_REDACTION_FAILED".to_owned());
+        }
+        let directory = storage
+            .default_export_dir()
+            .parent()
+            .map(|parent| parent.join("diagnostics"))
+            .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
+        fs::create_dir_all(&directory).map_err(|_| "MVP_DIAGNOSTIC_DIRECTORY_FAILED".to_owned())?;
+        let path = directory.join(format!(
+            "meetingrelay-diagnostic-{}.json",
+            super::storage::now_ms_string()
+        ));
+        let temporary = path.with_extension("json.tmp");
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| "MVP_DIAGNOSTIC_WRITE_FAILED".to_owned())?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "MVP_DIAGNOSTIC_WRITE_FAILED".to_owned())?;
+        fs::rename(&temporary, &path).map_err(|_| "MVP_DIAGNOSTIC_WRITE_FAILED".to_owned())?;
+        Ok(DiagnosticBundleResult {
+            path: path.to_string_lossy().into_owned(),
+            byte_length: bytes.len(),
+            sha256: super::storage::sha256_hex(&bytes),
+            redacted: true,
+        })
+    }
+
+    pub fn raw_audio_delete_preview(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Option<super::raw_audio::RawAudioDeletePreview>, String> {
+        self.raw_audio_store(RawAudioRetentionPolicy::NeverAutoDelete)?
+            .delete_preview(meeting_id)
+            .map_err(|error| public_raw_audio_policy_error(&error))
+    }
+
+    pub fn delete_raw_audio(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Option<super::raw_audio::RawAudioDeletePreview>, String> {
+        self.raw_audio_store(RawAudioRetentionPolicy::NeverAutoDelete)?
+            .delete_meeting(meeting_id)
+            .map_err(|error| public_raw_audio_policy_error(&error))
+    }
+
+    pub fn raw_audio_retention_preview(
+        &self,
+        older_than_days: u32,
+    ) -> Result<Vec<super::raw_audio::RawAudioDeletePreview>, String> {
+        if !(1..=3_650).contains(&older_than_days) {
+            return Err("RAW_AUDIO_RETENTION_INVALID".to_owned());
+        }
+        self.raw_audio_store(RawAudioRetentionPolicy::PreviewOnly {
+            older_than: std::time::Duration::from_secs(u64::from(older_than_days) * 86_400),
+        })?
+        .retention_delete_preview(std::time::SystemTime::now())
+        .map_err(|error| public_raw_audio_policy_error(&error))
+    }
+
+    pub fn delete_preview(
+        &self,
+        meeting_id: &str,
+        include_raw: bool,
+        include_derived: bool,
+    ) -> Result<DeletePreviewSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let metadata = storage.delete_preview(meeting_id)?;
+        let files = self.file_vault()?.preview(meeting_id)?;
+        let mut entries = Vec::new();
+        let mut bytes = 0_u64;
+        for file in files.entries {
+            if (file.category == "raw" && !include_raw)
+                || (file.category == "derived" && !include_derived)
+            {
+                continue;
+            }
+            bytes = bytes.saturating_add(file.byte_length);
+            entries.push(DeletePreviewEntrySnapshot {
+                entry_type: file.category.clone(),
+                path: Some(file.path),
+                byte_length: file.byte_length.to_string(),
+                description: format!("{} meeting files", file.category),
+            });
+        }
+        if metadata.export_count > 0 {
+            entries.push(DeletePreviewEntrySnapshot {
+                entry_type: "export".to_owned(),
+                path: None,
+                byte_length: "0".to_owned(),
+                description: format!("{} export record(s)", metadata.export_count),
+            });
+        }
+        if metadata.summary_job_count > 0 {
+            entries.push(DeletePreviewEntrySnapshot {
+                entry_type: "summary".to_owned(),
+                path: None,
+                byte_length: "0".to_owned(),
+                description: format!("{} summary version(s)", metadata.summary_job_count),
+            });
+        }
+        entries.push(DeletePreviewEntrySnapshot {
+            entry_type: "metadata".to_owned(),
+            path: None,
+            byte_length: "0".to_owned(),
+            description: format!(
+                "{} final(s), {} translation(s)",
+                metadata.final_count, metadata.translation_count
+            ),
+        });
+        Ok(DeletePreviewSnapshot {
+            meeting_id: meeting_id.to_owned(),
+            recovery_window_seconds: GOVERNANCE_RECOVERY_WINDOW_SECONDS,
+            include_raw,
+            include_derived,
+            entries,
+            will_delete_bytes: bytes.to_string(),
+            can_restore: true,
+        })
+    }
+
+    pub fn delete_execute(
+        &self,
+        meeting_id: &str,
+        recovery_window_seconds: u64,
+        include_raw: bool,
+        include_derived: bool,
+    ) -> Result<DeleteResultSnapshot, String> {
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        self.delete_execute_with(
+            meeting_id,
+            recovery_window_seconds,
+            include_raw,
+            include_derived,
+            |file_manifest_json| {
+                writer
+                    .soft_delete_meeting(meeting_id, file_manifest_json)
+                    .map(|_| ())
+            },
+        )
+    }
+
+    fn delete_execute_with(
+        &self,
+        meeting_id: &str,
+        recovery_window_seconds: u64,
+        include_raw: bool,
+        include_derived: bool,
+        persist_delete: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<DeleteResultSnapshot, String> {
+        if recovery_window_seconds != GOVERNANCE_RECOVERY_WINDOW_SECONDS {
+            return Err("GOVERNANCE_RECOVERY_WINDOW_INVALID".to_owned());
+        }
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let metadata = storage.delete_preview(meeting_id)?;
+        let vault = self.file_vault()?;
+        let file_tombstone = vault.stage_selected(meeting_id, include_raw, include_derived)?;
+        let manifest = file_tombstone.manifest_json()?;
+        if let Err(error) = persist_delete(&manifest) {
+            return Err(vault.restore(&file_tombstone).err().unwrap_or(error));
+        }
+        let bytes = file_tombstone.entries.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.byte_length)
+        });
+        let logical_entries = 1
+            + usize::from(metadata.export_count > 0)
+            + usize::from(metadata.summary_job_count > 0);
+        Ok(DeleteResultSnapshot {
+            meeting_id: meeting_id.to_owned(),
+            deleted: true,
+            restored_until: Some(file_tombstone.expires_at),
+            entries_deleted: file_tombstone.entries.len() + logical_entries,
+            bytes_deleted: bytes.to_string(),
+        })
+    }
+
+    pub fn delete_restore(&self, meeting_id: &str) -> Result<DeleteResultSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let tombstone = storage
+            .tombstone_by_meeting(meeting_id)?
+            .ok_or_else(|| "GOVERNANCE_TOMBSTONE_NOT_FOUND".to_owned())?;
+        let file_tombstone =
+            GovernanceFileTombstone::from_manifest_json(&tombstone.file_manifest_json)?;
+        let entries_deleted = file_tombstone.entries.len();
+        let bytes_deleted = file_tombstone.entries.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.byte_length)
+        });
+        let vault = self.file_vault()?;
+        vault.restore(&file_tombstone)?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        if let Err(error) = writer.restore_meeting(meeting_id) {
+            return Err(vault.restage(&file_tombstone).err().unwrap_or(error));
+        }
+        Ok(DeleteResultSnapshot {
+            meeting_id: meeting_id.to_owned(),
+            deleted: false,
+            restored_until: None,
+            entries_deleted,
+            bytes_deleted: bytes_deleted.to_string(),
+        })
+    }
+
+    pub fn delete_purge(&self, meeting_id: &str) -> Result<DeleteResultSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let tombstone = storage
+            .tombstone_by_meeting(meeting_id)?
+            .ok_or_else(|| "GOVERNANCE_TOMBSTONE_NOT_FOUND".to_owned())?;
+        let file_tombstone =
+            GovernanceFileTombstone::from_manifest_json(&tombstone.file_manifest_json)?;
+        let bytes_deleted = file_tombstone.entries.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.byte_length)
+        });
+        self.file_vault()?.purge(&file_tombstone)?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        writer.purge_meeting_metadata(meeting_id)?;
+        Ok(DeleteResultSnapshot {
+            meeting_id: meeting_id.to_owned(),
+            deleted: true,
+            restored_until: None,
+            entries_deleted: file_tombstone.entries.len().saturating_add(1),
+            bytes_deleted: bytes_deleted.to_string(),
+        })
+    }
+
+    fn file_vault(&self) -> Result<MeetingFileVault, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let root = storage
+            .default_export_dir()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
+        Ok(MeetingFileVault::new(root))
+    }
+
+    fn raw_audio_store(&self, retention: RawAudioRetentionPolicy) -> Result<RawAudioStore, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let root_dir = storage
+            .default_export_dir()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
+        Ok(RawAudioStore::new(RawAudioConfig {
+            enabled: false,
+            root_dir,
+            quota_bytes: Some(20 * 1024 * 1024 * 1024),
+            retention,
+        }))
+    }
+
     pub fn shutdown_before(&self, deadline: std::time::Instant) -> Result<(), String> {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+
+        self.summary_cancel.store(true, Ordering::Release);
+        if self.summary_active.load(Ordering::Acquire) {
+            let job_id = lock(&self.summary_state).job_id.clone();
+            if let Some(writer) = self.storage_writer.as_ref() {
+                let _ = writer.cancel_summary_job(&job_id);
+            }
         }
 
         #[cfg(windows)]
@@ -456,11 +2347,22 @@ impl MvpService {
             self.fail(&error);
             return Err(error);
         }
+        let disk = disk_health_for_storage(self.storage.as_ref().expect("checked above"));
+        let disk_error = (disk.status == "critical").then(|| {
+            disk.warning
+                .clone()
+                .unwrap_or_else(|| "MVP_DISK_CHECK_FAILED".to_owned())
+        });
 
         {
             let mut snapshot = lock(&self.snapshot);
             snapshot.lifecycle = Lifecycle::Booting;
             snapshot.error = None;
+            snapshot.disk = disk;
+        }
+        if let Some(error) = disk_error {
+            self.fail(&error);
+            return Err(error);
         }
         if self.storage.is_some() {
             let writer = self.storage_writer.as_ref().expect("checked above");
@@ -526,6 +2428,8 @@ impl MvpService {
         selection: AudioDeviceSelection,
         language: RecognitionLanguage,
         translation_config: TranslationConfig,
+        audio_source_mode: AudioSourceMode,
+        raw_audio_enabled: bool,
     ) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
@@ -538,12 +2442,53 @@ impl MvpService {
         if lock(&self.snapshot).lifecycle != Lifecycle::Ready {
             return Err("MVP_NOT_READY".to_owned());
         }
+        let disk = disk_health_for_storage(
+            self.storage
+                .as_ref()
+                .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?,
+        );
+        if disk.status == "critical" {
+            let error = disk
+                .warning
+                .clone()
+                .unwrap_or_else(|| "MVP_DISK_CHECK_FAILED".to_owned());
+            lock(&self.snapshot).disk = disk;
+            return Err(error);
+        }
+        lock(&self.snapshot).disk = disk;
         self.ensure_inference_worker(&mut inner, language)?;
         if translation_config.enabled && lock(&self.translation).is_none() {
             return Err("TRANSLATION_WORKER_UNAVAILABLE".to_owned());
         }
         let model_label = language.model_label();
-        let meeting = writer.start_meeting(true, &model_label)?;
+        let meeting = writer.start_meeting_with_metadata(
+            true,
+            &model_label,
+            &format!("Meeting {}", now_ms_string()),
+            language.code(),
+        )?;
+        let raw_audio_writer = if raw_audio_enabled {
+            let data_root = self
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.default_export_dir().parent().map(Path::to_path_buf))
+                .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
+            let store = RawAudioStore::new(RawAudioConfig {
+                enabled: true,
+                root_dir: data_root,
+                quota_bytes: Some(20 * 1024 * 1024 * 1024),
+                retention: RawAudioRetentionPolicy::NeverAutoDelete,
+            });
+            match store.begin_meeting(&meeting.id) {
+                Ok(raw_writer) => raw_writer,
+                Err(error) => {
+                    let _ = writer.interrupt_meeting(&meeting.id);
+                    return Err(public_raw_audio_error(&error));
+                }
+            }
+        } else {
+            None
+        };
         if let Some(translation) = lock(&self.translation).as_ref()
             && let Err(error) = translation.submitter().configure_session(
                 &meeting.id,
@@ -577,17 +2522,23 @@ impl MvpService {
             snapshot.visible_final_window_start_sequence = "1".to_owned();
             snapshot.last_saved_sequence = None;
             snapshot.elapsed_ms = "0".to_owned();
+            snapshot.audio_source_mode = audio_source_mode.as_str().to_owned();
+            snapshot.raw_audio_enabled = raw_audio_enabled;
             snapshot.system.frames = "0".to_owned();
             snapshot.microphone.frames = "0".to_owned();
         }
 
-        let (capture, output) = AudioCapture::start(AudioCaptureOptions::default(), selection)
-            .map_err(|error| {
-                let _ = writer.interrupt_meeting(&meeting.id);
-                let code = public_audio_error(&error.to_string());
-                self.fail(&code);
-                code
-            })?;
+        let (capture, output) = AudioCapture::start_with_mode(
+            AudioCaptureOptions::default(),
+            selection,
+            audio_source_mode,
+        )
+        .map_err(|error| {
+            let _ = writer.interrupt_meeting(&meeting.id);
+            let code = public_audio_error(&error.to_string());
+            self.fail(&code);
+            code
+        })?;
         let session_id = meeting.id.clone();
         let submitter = inner
             .inference
@@ -599,14 +2550,16 @@ impl MvpService {
         let errors = Arc::new(RuntimeErrors::default());
         let metrics = output.metrics.clone();
         let preflight = output.preflight.clone();
-        let coordinator = match spawn_coordinator(
+        let coordinator = match spawn_coordinator(CoordinatorContext {
             output,
             submitter,
-            session_id.clone(),
-            Arc::clone(&stop),
-            Arc::clone(&pause_gate),
-            Arc::clone(&errors),
-        ) {
+            session_id: session_id.clone(),
+            stop: Arc::clone(&stop),
+            pause_gate: Arc::clone(&pause_gate),
+            errors: Arc::clone(&errors),
+            audio_source_mode,
+            raw_audio_writer,
+        }) {
             Ok(coordinator) => coordinator,
             Err(error) => {
                 drop(capture);
@@ -623,6 +2576,8 @@ impl MvpService {
             pause_gate,
             metrics,
             errors,
+            audio_source_mode,
+            last_disk_check_ms: AtomicU64::new(0),
             started: Instant::now(),
             meeting_id: meeting.id.clone(),
         });
@@ -631,8 +2586,13 @@ impl MvpService {
         snapshot.lifecycle = Lifecycle::Recording;
         snapshot.session_id = Some(session_id);
         snapshot.meeting_id = Some(meeting.id);
-        snapshot.system = capturing_source(SourceId::System, &preflight.system_output);
-        snapshot.microphone = capturing_source(SourceId::Microphone, &preflight.microphone);
+        apply_mode_sources(
+            &mut snapshot,
+            audio_source_mode,
+            &preflight.system_output,
+            &preflight.microphone,
+            true,
+        );
         snapshot.error = None;
         Ok(public_snapshot(
             &mut snapshot,
@@ -643,7 +2603,7 @@ impl MvpService {
     #[cfg(windows)]
     fn pause_windows(&self) -> Result<MvpSnapshot, String> {
         let deadline = Instant::now() + MVP_SHUTDOWN_TIMEOUT;
-        let (pause_gate, submitter) = {
+        let (pause_gate, submitter, audio_source_mode) = {
             let inner = lock(&self.inner);
             let Some(session) = inner.session.as_ref() else {
                 return Err("SESSION_NOT_RUNNING".to_owned());
@@ -654,6 +2614,7 @@ impl MvpService {
             (
                 Arc::clone(&session.pause_gate),
                 inner.inference.as_ref().map(InferenceWorker::submitter),
+                session.audio_source_mode,
             )
         };
 
@@ -667,7 +2628,11 @@ impl MvpService {
         {
             let inner = lock(&self.inner);
             if inner.session.is_some() {
-                apply_paused_snapshot(&mut lock(&self.snapshot), Some(&error));
+                apply_paused_snapshot_for_mode(
+                    &mut lock(&self.snapshot),
+                    audio_source_mode,
+                    Some(&error),
+                );
             }
             return Err(error);
         }
@@ -678,7 +2643,7 @@ impl MvpService {
         };
         self.refresh_from_session(session, false);
         let mut snapshot = lock(&self.snapshot);
-        apply_paused_snapshot(&mut snapshot, None);
+        apply_paused_snapshot_for_mode(&mut snapshot, session.audio_source_mode, None);
         Ok(public_snapshot(
             &mut snapshot,
             inner.inference.as_ref().map(|worker| &worker.submitter),
@@ -712,14 +2677,15 @@ impl MvpService {
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Recording;
         snapshot.durability_status = "recording".to_owned();
-        snapshot.system.active = true;
-        snapshot.microphone.active = true;
-        if snapshot.system.error.is_none() {
+        snapshot.system.active = session.audio_source_mode.captures_system();
+        snapshot.microphone.active = session.audio_source_mode.captures_microphone();
+        if session.audio_source_mode.captures_system() && snapshot.system.error.is_none() {
             snapshot.system.status = SourceStatus::Capturing;
         }
-        if snapshot.microphone.error.is_none() {
+        if session.audio_source_mode.captures_microphone() && snapshot.microphone.error.is_none() {
             snapshot.microphone.status = SourceStatus::Capturing;
         }
+        apply_disabled_sources(&mut snapshot, session.audio_source_mode);
         snapshot.error = None;
         Ok(public_snapshot(
             &mut snapshot,
@@ -773,10 +2739,15 @@ impl MvpService {
         snapshot.durability_status = meeting.state;
         snapshot.system.active = false;
         snapshot.system.peak = 0.0;
-        snapshot.system.status = SourceStatus::Ready;
         snapshot.microphone.active = false;
         snapshot.microphone.peak = 0.0;
-        snapshot.microphone.status = SourceStatus::Ready;
+        if snapshot.system.error.is_none() {
+            snapshot.system.status = SourceStatus::Ready;
+        }
+        if snapshot.microphone.error.is_none() {
+            snapshot.microphone.status = SourceStatus::Ready;
+        }
+        apply_disabled_sources(&mut snapshot, session.audio_source_mode);
         snapshot.queue_depth = 0;
         snapshot.error = None;
         if let Some(error) = take_runtime_error(&session.errors) {
@@ -823,16 +2794,62 @@ impl MvpService {
     fn refresh_from_session(&self, session: &RunningSession, stopping: bool) {
         let system = session.metrics.snapshot(AudioSourceId::SystemOutput);
         let microphone = session.metrics.snapshot(AudioSourceId::Microphone);
-        let stream_error = system.stream_errors > 0 || microphone.stream_errors > 0;
+        let system_enabled = session.audio_source_mode.captures_system();
+        let microphone_enabled = session.audio_source_mode.captures_microphone();
+        let stream_error = (system_enabled && system.stream_errors > 0)
+            || (microphone_enabled && microphone.stream_errors > 0);
+        let elapsed_ms = u64::try_from(session.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let last_disk_check_ms = session.last_disk_check_ms.load(Ordering::Acquire);
+        let disk_update = if elapsed_ms.saturating_sub(last_disk_check_ms) >= 30_000
+            && session
+                .last_disk_check_ms
+                .compare_exchange(
+                    last_disk_check_ms,
+                    elapsed_ms,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            self.storage.as_ref().map(disk_health_for_storage)
+        } else {
+            None
+        };
+        if disk_update
+            .as_ref()
+            .is_some_and(|disk| disk.status == "critical")
+        {
+            session
+                .errors
+                .mark_incomplete("MVP_DISK_SPACE_INSUFFICIENT");
+        }
         let mut snapshot = lock(&self.snapshot);
-        snapshot.elapsed_ms = session.started.elapsed().as_millis().to_string();
+        snapshot.elapsed_ms = elapsed_ms.to_string();
+        if let Some(disk) = disk_update {
+            if disk.status == "critical" {
+                set_public_error(
+                    &mut snapshot,
+                    disk.warning
+                        .as_deref()
+                        .unwrap_or("MVP_DISK_SPACE_INSUFFICIENT"),
+                );
+            }
+            snapshot.disk = disk;
+        }
         let active = !stopping && !session.pause_gate.is_paused();
-        apply_source_stats(&mut snapshot.system, system, active);
-        apply_source_stats(&mut snapshot.microphone, microphone, active);
+        apply_source_stats(&mut snapshot.system, system, active && system_enabled);
+        apply_source_stats(
+            &mut snapshot.microphone,
+            microphone,
+            active && microphone_enabled,
+        );
+        apply_disabled_sources(&mut snapshot, session.audio_source_mode);
         if stream_error {
             session.errors.mark_incomplete("AUDIO_STREAM_ERROR");
             set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
-        } else if system.dropped_packets > 0 || microphone.dropped_packets > 0 {
+        } else if (system_enabled && system.dropped_packets > 0)
+            || (microphone_enabled && microphone.dropped_packets > 0)
+        {
             session.errors.mark_incomplete("AUDIO_PACKETS_DROPPED");
         }
         if let Some(error) = take_runtime_error(&session.errors) {
@@ -867,10 +2884,67 @@ fn set_public_error(snapshot: &mut MvpSnapshot, error: &str) {
 #[cfg(windows)]
 fn public_error_priority(code: &str) -> u8 {
     match code {
+        "RAW_AUDIO_WRITE_FAILED" => 4,
         "ASR_FINAL_OVERLOAD" => 3,
         "ASR_WORKER_STOPPED" => 2,
         _ => 1,
     }
+}
+
+fn retry_one_translation(
+    writer: &MvpStorageWriter,
+    final_segment: &DurableFinal,
+    source_language: &str,
+    config: &ValidatedTranslationConfig,
+) -> Result<(), String> {
+    for retry_index in 0..3_u64 {
+        let attempt = writer.begin_translation(TranslationCandidate {
+            meeting_id: final_segment.meeting_id.clone(),
+            segment_id: final_segment.segment_id.clone(),
+            source_revision: final_segment.revision,
+            target_language: config.target_language.clone(),
+            model: config.model.clone(),
+            provider: "openai-compatible".to_owned(),
+            config_version: "meetingrelay.translation.config.v1".to_owned(),
+            endpoint_origin: Some(config.endpoint_origin.clone()),
+            endpoint_hash: config.endpoint_hash.clone(),
+            prompt_version: "meetingrelay.translation.prompt.v1".to_owned(),
+            request_schema_version: "openai.chat.completions.v1".to_owned(),
+        })?;
+        let skipped = source_language == config.target_language;
+        let result = if skipped {
+            Ok(final_segment.text.clone())
+        } else {
+            translate_text(config, &final_segment.text, source_language)
+        };
+        let (translated_text, error_code, retryable) = match result {
+            Ok(text) if !skipped => (Some(text), None, false),
+            Ok(_) => (None, None, false),
+            Err(error) => {
+                let retryable = translation_error_retryable(&error);
+                (None, Some(error), retryable)
+            }
+        };
+        writer.finish_translation(TranslationCompletion {
+            meeting_id: final_segment.meeting_id.clone(),
+            segment_id: final_segment.segment_id.clone(),
+            source_revision: final_segment.revision,
+            target_language: config.target_language.clone(),
+            attempt: attempt.attempt,
+            translated_text,
+            error_code: error_code.clone(),
+            retryable,
+            skipped_same_language: skipped,
+        })?;
+        let Some(error) = error_code else {
+            return Ok(());
+        };
+        if !retryable || retry_index == 2 {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100 * (retry_index + 1)));
+    }
+    Err("TRANSLATION_RETRY_EXHAUSTED".to_owned())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -884,6 +2958,589 @@ fn storage_error_from_snapshot(snapshot: &Mutex<MvpSnapshot>) -> String {
         .error
         .clone()
         .unwrap_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())
+}
+
+fn provider_secret_id(provider_profile_id: &str) -> Result<String, String> {
+    if provider_profile_id.is_empty()
+        || provider_profile_id.len() > 128
+        || !provider_profile_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("PROVIDER_PROFILE_ID_INVALID".to_owned());
+    }
+    Ok(format!("MeetingRelay:provider:{provider_profile_id}"))
+}
+
+fn meeting_list_item_snapshot(item: MeetingLibraryItem) -> MeetingListItemSnapshot {
+    MeetingListItemSnapshot {
+        meeting_id: item.meeting_id,
+        title: item.title,
+        status: match item.state.as_str() {
+            "recording" | "paused" | "completed" | "interrupted" | "error" => item.state,
+            "starting" => "recording".to_owned(),
+            _ => "ready".to_owned(),
+        },
+        started_at: item.started_at.clone(),
+        updated_at: item.ended_at.unwrap_or(item.started_at),
+        duration_ms: item.duration_ms.unwrap_or(0).to_string(),
+        language: item.language,
+        saved_final_count: item.final_count.to_string(),
+        translation_failed_count: item.translation_failed_count,
+        summary_status: match item.summary_status.as_str() {
+            "pending" => "queued".to_owned(),
+            "completed" | "failed" | "cancelled" => item.summary_status,
+            _ => "idle".to_owned(),
+        },
+        tags: item.tags.into_iter().map(|tag| tag.name).collect(),
+    }
+}
+
+fn resolve_search_identity(
+    storage: &MvpStorage,
+    hit: &super::storage::SegmentSearchHit,
+) -> Result<(Option<String>, Option<String>), String> {
+    if hit.scope != "summary" {
+        return Ok((Some(hit.segment_id.clone()), Some(hit.sequence.to_string())));
+    }
+    let Some(identity) = hit.segment_id.strip_prefix("summary:") else {
+        return Ok((None, None));
+    };
+    let Some((job_id, section_kind)) = identity.rsplit_once(':') else {
+        return Ok((None, None));
+    };
+    let citation_segment_id = storage
+        .summary_results(job_id)?
+        .into_iter()
+        .find(|record| {
+            record.section_kind == section_kind && u64::from(record.section_index) == hit.sequence
+        })
+        .and_then(|record| record.citation_segment_ids.into_iter().next());
+    let Some(segment_id) = citation_segment_id else {
+        return Ok((None, None));
+    };
+    let sequence = storage
+        .snapshot(&hit.meeting_id)?
+        .finals
+        .into_iter()
+        .find(|segment| segment.segment_id == segment_id)
+        .map(|segment| segment.sequence.to_string());
+    Ok((Some(segment_id), sequence))
+}
+
+fn default_provider_profiles() -> [ProviderProfileInput; 3] {
+    let local_url = "local://meetingrelay";
+    let lan_url = "http://127.0.0.1:11434/v1";
+    let cloud_url = "https://api.openai.com/v1";
+    [
+        ProviderProfileInput {
+            profile_id: Some("local-default".to_owned()),
+            label: "Local · On-device".to_owned(),
+            provider_class: "local".to_owned(),
+            base_url: Some(local_url.to_owned()),
+            model: "SenseVoice".to_owned(),
+            endpoint_hash: sha256_hex(local_url.as_bytes()),
+            data_flow: "Audio and transcript remain on this device.".to_owned(),
+            policy_url: None,
+            config_version: 1,
+            secret_state: "not_required".to_owned(),
+            last_test_at: None,
+            last_test_status: None,
+            last_error: None,
+        },
+        ProviderProfileInput {
+            profile_id: Some("lan-openai-compatible".to_owned()),
+            label: "LAN · OpenAI-compatible".to_owned(),
+            provider_class: "lan".to_owned(),
+            base_url: Some(lan_url.to_owned()),
+            model: "qwen2.5".to_owned(),
+            endpoint_hash: sha256_hex(lan_url.as_bytes()),
+            data_flow: "Final transcript text is sent to the configured LAN endpoint; raw audio is not sent."
+                .to_owned(),
+            policy_url: None,
+            config_version: 1,
+            secret_state: "missing".to_owned(),
+            last_test_at: None,
+            last_test_status: None,
+            last_error: None,
+        },
+        ProviderProfileInput {
+            profile_id: Some("cloud-openai-compatible".to_owned()),
+            label: "Cloud · OpenAI-compatible".to_owned(),
+            provider_class: "cloud".to_owned(),
+            base_url: Some(cloud_url.to_owned()),
+            model: "gpt-4o-mini".to_owned(),
+            endpoint_hash: sha256_hex(cloud_url.as_bytes()),
+            data_flow:
+                "Final transcript text is sent over HTTPS; raw audio remains on this device."
+                    .to_owned(),
+            policy_url: Some("https://openai.com/policies/privacy-policy/".to_owned()),
+            config_version: 1,
+            secret_state: "missing".to_owned(),
+            last_test_at: None,
+            last_test_status: None,
+            last_error: None,
+        },
+    ]
+}
+
+fn bounded_provider_error(error: &str) -> String {
+    let sanitized = error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "PROVIDER_TEST_FAILED".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn summary_job_from_storage(
+    job: SummaryJobRecord,
+    chunk_count: usize,
+    result: Option<SummaryResultSnapshot>,
+) -> SummaryJobSnapshot {
+    let status = match job.status.as_str() {
+        "pending" => "queued",
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "failed",
+    }
+    .to_owned();
+    let can_retry = matches!(status.as_str(), "failed" | "cancelled");
+    SummaryJobSnapshot {
+        job_id: job.job_id,
+        meeting_id: job.meeting_id,
+        status,
+        version: job.attempt.max(1),
+        total_chunks: chunk_count,
+        completed_chunks: chunk_count,
+        can_cancel: job.status == "pending",
+        can_retry,
+        message: job.error_code,
+        result,
+    }
+}
+
+fn apply_summary_progress(current: &mut SummaryJobSnapshot, progress: &SummaryProgressSnapshot) {
+    current.total_chunks = progress.total_chunks;
+    current.completed_chunks = progress.completed_chunks;
+    current.status = match progress.stage {
+        SummaryStage::Validating | SummaryStage::Chunking | SummaryStage::SummarizingChunks => {
+            "chunking"
+        }
+        SummaryStage::Combining | SummaryStage::ValidatingResult => "combining",
+        SummaryStage::Completed => "completed",
+        SummaryStage::Cancelled => "cancelled",
+        SummaryStage::Failed => "failed",
+    }
+    .to_owned();
+    current.can_cancel = matches!(current.status.as_str(), "queued" | "chunking" | "combining");
+    current.can_retry = matches!(current.status.as_str(), "failed" | "cancelled");
+}
+
+fn finish_summary_run(
+    writer: &MvpStorageWriter,
+    job: &SummaryJobRecord,
+    outcome: SummaryOutcome,
+    cancellation: &AtomicBool,
+    state: &Mutex<SummaryJobSnapshot>,
+    source_segment_ids: &[String],
+) {
+    match outcome {
+        SummaryOutcome::Completed(completion) if !cancellation.load(Ordering::Acquire) => {
+            match persist_summary_chunks(
+                writer,
+                job,
+                completion.progress.total_chunks,
+                source_segment_ids,
+            )
+            .and_then(|()| persist_summary_result(writer, job, &completion.result))
+            .and_then(|result| writer.finish_summary_job(&job.job_id).map(|_| result))
+            {
+                Ok(result) => {
+                    let mut current = lock(state);
+                    current.status = "completed".to_owned();
+                    current.completed_chunks = current.total_chunks;
+                    current.can_cancel = false;
+                    current.can_retry = false;
+                    current.message = None;
+                    current.result = Some(result);
+                }
+                Err(error) => {
+                    let error_code = bounded_summary_error(&error);
+                    let _ = writer.fail_summary_job(&job.job_id, &error_code, true);
+                    set_summary_failed(state, &error_code, true);
+                }
+            }
+        }
+        SummaryOutcome::Completed(_) | SummaryOutcome::Cancelled(_) => {
+            let _ = writer.cancel_summary_job(&job.job_id);
+            let mut current = lock(state);
+            current.status = "cancelled".to_owned();
+            current.can_cancel = false;
+            current.can_retry = true;
+            current.message = Some("Summary cancelled".to_owned());
+            current.result = None;
+        }
+        SummaryOutcome::Failed(failure) => {
+            let error_code = bounded_summary_error(&failure.error_code);
+            let _ = writer.fail_summary_job(&job.job_id, &error_code, failure.retryable);
+            set_summary_failed(state, &error_code, failure.retryable);
+        }
+    }
+}
+
+fn persist_summary_chunks(
+    writer: &MvpStorageWriter,
+    job: &SummaryJobRecord,
+    total_chunks: usize,
+    source_segment_ids: &[String],
+) -> Result<(), String> {
+    if total_chunks == 0 {
+        return Err("SUMMARY_CHUNK_COUNT_INVALID".to_owned());
+    }
+    let segment_count_per_chunk = source_segment_ids.len().div_ceil(total_chunks).max(1);
+    for chunk_index in 0..total_chunks {
+        let start = chunk_index.saturating_mul(segment_count_per_chunk);
+        let end = start
+            .saturating_add(segment_count_per_chunk)
+            .min(source_segment_ids.len());
+        let ids = source_segment_ids
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .take(256)
+            .cloned()
+            .collect();
+        writer.append_summary_chunk(SummaryChunkInput {
+            job_id: job.job_id.clone(),
+            chunk_index: u32::try_from(chunk_index).unwrap_or(u32::MAX),
+            source_segment_ids: ids,
+            text: format!("completed chunk {} of {total_chunks}", chunk_index + 1),
+        })?;
+    }
+    Ok(())
+}
+
+fn persist_summary_result(
+    writer: &MvpStorageWriter,
+    job: &SummaryJobRecord,
+    summary: &MeetingSummary,
+) -> Result<SummaryResultSnapshot, String> {
+    writer.append_summary_result(SummaryResultInput {
+        job_id: job.job_id.clone(),
+        section_kind: "overview".to_owned(),
+        section_index: 0,
+        heading: "概览".to_owned(),
+        text: summary.overview.clone(),
+        citation_segment_ids: Vec::new(),
+    })?;
+    for (index, action) in summary.action_items.iter().enumerate() {
+        writer.append_summary_result(SummaryResultInput {
+            job_id: job.job_id.clone(),
+            section_kind: "action".to_owned(),
+            section_index: u32::try_from(index).unwrap_or(u32::MAX),
+            heading: "行动项".to_owned(),
+            text: format_summary_action(action),
+            citation_segment_ids: summary_citation_ids(&action.citation),
+        })?;
+    }
+    for (index, decision) in summary.decisions.iter().enumerate() {
+        writer.append_summary_result(SummaryResultInput {
+            job_id: job.job_id.clone(),
+            section_kind: "decision".to_owned(),
+            section_index: u32::try_from(index).unwrap_or(u32::MAX),
+            heading: "决定".to_owned(),
+            text: decision.text.clone(),
+            citation_segment_ids: summary_citation_ids(&decision.citation),
+        })?;
+    }
+    for (index, question) in summary.open_questions.iter().enumerate() {
+        writer.append_summary_result(SummaryResultInput {
+            job_id: job.job_id.clone(),
+            section_kind: "open_question".to_owned(),
+            section_index: u32::try_from(index).unwrap_or(u32::MAX),
+            heading: "待确认".to_owned(),
+            text: question.text.clone(),
+            citation_segment_ids: summary_citation_ids(&question.citation),
+        })?;
+    }
+    Ok(summary_result_from_summary(job, summary))
+}
+
+fn summary_result_from_summary(
+    job: &SummaryJobRecord,
+    summary: &MeetingSummary,
+) -> SummaryResultSnapshot {
+    let actions = summary
+        .action_items
+        .iter()
+        .map(format_summary_action)
+        .collect();
+    let decisions = summary
+        .decisions
+        .iter()
+        .map(|decision| decision.text.clone())
+        .collect();
+    let open_questions = summary
+        .open_questions
+        .iter()
+        .map(|question| question.text.clone())
+        .collect();
+    let citations = summary
+        .action_items
+        .iter()
+        .map(|action| (&action.citation, "行动项"))
+        .chain(
+            summary
+                .decisions
+                .iter()
+                .map(|decision| (&decision.citation, "决定")),
+        )
+        .chain(
+            summary
+                .open_questions
+                .iter()
+                .map(|question| (&question.citation, "待确认")),
+        )
+        .enumerate()
+        .map(|(index, (citation, label))| SummaryCitationSnapshot {
+            segment_id: citation.segment_id.clone(),
+            sequence: citation.sequence.map(|sequence| sequence.to_string()),
+            label: if citation.unlinked {
+                format!("{label} {} · 未链接", index + 1)
+            } else {
+                format!("{label} {}", index + 1)
+            },
+        })
+        .collect();
+    SummaryResultSnapshot {
+        summary_id: job.job_id.clone(),
+        version: job.attempt.max(1),
+        language: "zh".to_owned(),
+        overview: summary.overview.clone(),
+        actions,
+        decisions,
+        open_questions,
+        citations,
+        created_at: now_ms_string(),
+    }
+}
+
+fn summary_result_from_records(
+    storage: &MvpStorage,
+    job: &SummaryJobRecord,
+    records: &[SummaryResultRecord],
+) -> Result<Option<SummaryResultSnapshot>, String> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let meeting = storage.snapshot(&job.meeting_id)?;
+    let sequence_for = |segment_id: &str| {
+        meeting
+            .finals
+            .iter()
+            .find(|segment| segment.segment_id == segment_id)
+            .map(|segment| segment.sequence.to_string())
+    };
+    let overview = records
+        .iter()
+        .find(|record| record.section_kind == "overview")
+        .map(|record| record.text.clone())
+        .unwrap_or_default();
+    let actions = records
+        .iter()
+        .filter(|record| record.section_kind == "action")
+        .map(|record| record.text.clone())
+        .collect();
+    let decisions = records
+        .iter()
+        .filter(|record| record.section_kind == "decision")
+        .map(|record| record.text.clone())
+        .collect();
+    let open_questions = records
+        .iter()
+        .filter(|record| record.section_kind == "open_question")
+        .map(|record| record.text.clone())
+        .collect();
+    let citations = records
+        .iter()
+        .filter(|record| record.section_kind != "overview")
+        .enumerate()
+        .flat_map(|(index, record)| {
+            if record.citation_segment_ids.is_empty() {
+                return vec![SummaryCitationSnapshot {
+                    segment_id: None,
+                    sequence: None,
+                    label: format!("{} {} · 未链接", record.heading, index + 1),
+                }];
+            }
+            record
+                .citation_segment_ids
+                .iter()
+                .map(|segment_id| SummaryCitationSnapshot {
+                    segment_id: Some(segment_id.clone()),
+                    sequence: sequence_for(segment_id),
+                    label: format!("{} {}", record.heading, index + 1),
+                })
+                .collect()
+        })
+        .collect();
+    Ok(Some(SummaryResultSnapshot {
+        summary_id: job.job_id.clone(),
+        version: job.attempt.max(1),
+        language: "zh".to_owned(),
+        overview,
+        actions,
+        decisions,
+        open_questions,
+        citations,
+        created_at: records
+            .first()
+            .map(|record| record.created_at.clone())
+            .unwrap_or_else(|| job.requested_at.clone()),
+    }))
+}
+
+fn format_summary_action(action: &super::summary::SummaryActionItem) -> String {
+    let mut text = action.text.clone();
+    let mut details = Vec::new();
+    if let Some(owner) = action.owner.as_deref() {
+        details.push(format!("负责人：{owner}"));
+    }
+    if let Some(due) = action.due.as_deref() {
+        details.push(format!("截止：{due}"));
+    }
+    if !details.is_empty() {
+        text.push('（');
+        text.push_str(&details.join("；"));
+        text.push('）');
+    }
+    text
+}
+
+fn summary_citation_ids(citation: &super::summary::SummaryCitation) -> Vec<String> {
+    if citation.unlinked {
+        Vec::new()
+    } else {
+        citation.segment_id.iter().cloned().collect()
+    }
+}
+
+fn bounded_summary_error(error: &str) -> String {
+    let sanitized = error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(128)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "SUMMARY_PERSIST_FAILED".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn set_summary_failed(state: &Mutex<SummaryJobSnapshot>, error_code: &str, retryable: bool) {
+    let mut current = lock(state);
+    current.status = "failed".to_owned();
+    current.can_cancel = false;
+    current.can_retry = retryable;
+    current.message = Some(error_code.to_owned());
+    current.result = None;
+}
+
+#[cfg(windows)]
+fn disk_health_for_storage(storage: &MvpStorage) -> DiskHealthSnapshot {
+    let data_dir = storage
+        .default_export_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if let Err(error) = writable_disk_probe(&data_dir) {
+        return DiskHealthSnapshot {
+            status: "critical".to_owned(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            free_bytes: "0".to_owned(),
+            required_bytes: DISK_REQUIRED_BYTES.to_string(),
+            warning: Some(super::storage::disk_check_from_io_error(&error).code),
+        };
+    }
+    let free_bytes = available_disk_bytes(&data_dir);
+    match free_bytes {
+        Some(free) if free < DISK_REQUIRED_BYTES => DiskHealthSnapshot {
+            status: "critical".to_owned(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            free_bytes: free.to_string(),
+            required_bytes: DISK_REQUIRED_BYTES.to_string(),
+            warning: Some("MVP_DISK_SPACE_INSUFFICIENT".to_owned()),
+        },
+        Some(free) if free < DISK_WARNING_BYTES => DiskHealthSnapshot {
+            status: "warning".to_owned(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            free_bytes: free.to_string(),
+            required_bytes: DISK_REQUIRED_BYTES.to_string(),
+            warning: Some("MVP_DISK_SPACE_LOW".to_owned()),
+        },
+        Some(free) => DiskHealthSnapshot {
+            status: "ok".to_owned(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            free_bytes: free.to_string(),
+            required_bytes: DISK_REQUIRED_BYTES.to_string(),
+            warning: None,
+        },
+        None => DiskHealthSnapshot {
+            status: "warning".to_owned(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            // The write-through probe succeeded, but the platform free-space
+            // query was unavailable. Expose a conservative lower bound.
+            free_bytes: DISK_REQUIRED_BYTES.to_string(),
+            required_bytes: DISK_REQUIRED_BYTES.to_string(),
+            warning: Some("MVP_DISK_SPACE_UNKNOWN".to_owned()),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn writable_disk_probe(data_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    let probe_path = data_dir.join(format!(
+        ".meetingrelay-disk-probe-{}",
+        super::storage::now_ms_string()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&probe_path)?;
+        file.write_all(&[0_u8; 4096])?;
+        file.sync_all()
+    })();
+    let _ = fs::remove_file(&probe_path);
+    result
+}
+
+#[cfg(windows)]
+fn available_disk_bytes(data_dir: &Path) -> Option<u64> {
+    let script = "& { param([string]$dataDir) $root=[IO.Path]::GetPathRoot($dataDir); if ([string]::IsNullOrWhiteSpace($root)) { exit 2 }; ([IO.DriveInfo]::new($root)).AvailableFreeSpace }";
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .arg(data_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
 #[cfg(windows)]
@@ -947,6 +3604,7 @@ fn take_runtime_error(errors: &RuntimeErrors) -> Option<&'static str> {
         1 => Some("AUDIO_DSP_CONFIGURATION"),
         2 => Some("ASR_WORKER_STOPPED"),
         3 => Some("ASR_FINAL_OVERLOAD"),
+        4 => Some("RAW_AUDIO_WRITE_FAILED"),
         _ => None,
     }
 }
@@ -959,6 +3617,8 @@ struct RunningSession {
     pause_gate: Arc<PauseGate>,
     metrics: AudioCaptureMetrics,
     errors: Arc<RuntimeErrors>,
+    audio_source_mode: AudioSourceMode,
+    last_disk_check_ms: AtomicU64,
     started: Instant,
     meeting_id: String,
 }
@@ -1052,6 +3712,58 @@ fn capturing_source(id: SourceId, device: &AudioDevicePreflight) -> AudioSourceS
 }
 
 #[cfg(windows)]
+fn disabled_source(id: SourceId) -> AudioSourceSnapshot {
+    AudioSourceSnapshot {
+        id,
+        label: String::new(),
+        ready: false,
+        active: false,
+        frames: "0".to_owned(),
+        peak: 0.0,
+        status: SourceStatus::Disabled,
+        error: None,
+    }
+}
+
+#[cfg(windows)]
+fn apply_mode_sources(
+    snapshot: &mut MvpSnapshot,
+    mode: AudioSourceMode,
+    system_output: &AudioDevicePreflight,
+    microphone: &AudioDevicePreflight,
+    active: bool,
+) {
+    snapshot.system = if mode.captures_system() {
+        if active {
+            capturing_source(SourceId::System, system_output)
+        } else {
+            ready_source(SourceId::System, system_output)
+        }
+    } else {
+        disabled_source(SourceId::System)
+    };
+    snapshot.microphone = if mode.captures_microphone() {
+        if active {
+            capturing_source(SourceId::Microphone, microphone)
+        } else {
+            ready_source(SourceId::Microphone, microphone)
+        }
+    } else {
+        disabled_source(SourceId::Microphone)
+    };
+}
+
+#[cfg(windows)]
+fn apply_disabled_sources(snapshot: &mut MvpSnapshot, mode: AudioSourceMode) {
+    if !mode.captures_system() {
+        snapshot.system = disabled_source(SourceId::System);
+    }
+    if !mode.captures_microphone() {
+        snapshot.microphone = disabled_source(SourceId::Microphone);
+    }
+}
+
+#[cfg(windows)]
 fn apply_source_stats(source: &mut AudioSourceSnapshot, stats: AudioSourceStats, active: bool) {
     source.active = active;
     source.frames = stats.captured_frames.to_string();
@@ -1085,12 +3797,22 @@ fn apply_paused_source(source: &mut AudioSourceSnapshot) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn apply_paused_snapshot(snapshot: &mut MvpSnapshot, error: Option<&str>) {
+    apply_paused_snapshot_for_mode(snapshot, AudioSourceMode::Both, error);
+}
+
+#[cfg(windows)]
+fn apply_paused_snapshot_for_mode(
+    snapshot: &mut MvpSnapshot,
+    mode: AudioSourceMode,
+    error: Option<&str>,
+) {
     snapshot.lifecycle = Lifecycle::Paused;
     snapshot.durability_status = "paused".to_owned();
     apply_paused_source(&mut snapshot.system);
     apply_paused_source(&mut snapshot.microphone);
+    apply_disabled_sources(snapshot, mode);
     if let Some(error) = error {
         set_public_error(snapshot, error);
     } else if snapshot.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
@@ -1106,6 +3828,35 @@ fn public_audio_error(detail: &str) -> String {
         .take(180)
         .collect::<String>();
     format!("AUDIO_UNAVAILABLE:{normalized}")
+}
+
+#[cfg(windows)]
+fn public_raw_audio_error(error: &RawAudioError) -> String {
+    match error {
+        RawAudioError::QuotaExceeded { .. } => "RAW_AUDIO_QUOTA_EXCEEDED".to_owned(),
+        RawAudioError::Io(io_error) if io_error.kind() == std::io::ErrorKind::StorageFull => {
+            "RAW_AUDIO_DISK_FULL".to_owned()
+        }
+        RawAudioError::Io(_) => "RAW_AUDIO_WRITE_FAILED".to_owned(),
+        RawAudioError::InvalidMeetingId
+        | RawAudioError::InvalidPacket(_)
+        | RawAudioError::SourceFormatChanged { .. }
+        | RawAudioError::Json(_) => "RAW_AUDIO_CONFIG_INVALID".to_owned(),
+    }
+}
+
+fn public_raw_audio_policy_error(error: &RawAudioError) -> String {
+    match error {
+        RawAudioError::InvalidMeetingId => "RAW_AUDIO_MEETING_ID_INVALID".to_owned(),
+        RawAudioError::QuotaExceeded { .. } => "RAW_AUDIO_QUOTA_EXCEEDED".to_owned(),
+        RawAudioError::Io(io_error) if io_error.kind() == std::io::ErrorKind::StorageFull => {
+            "RAW_AUDIO_DISK_FULL".to_owned()
+        }
+        RawAudioError::Io(_) => "RAW_AUDIO_STORAGE_FAILED".to_owned(),
+        RawAudioError::InvalidPacket(_)
+        | RawAudioError::SourceFormatChanged { .. }
+        | RawAudioError::Json(_) => "RAW_AUDIO_CONFIG_INVALID".to_owned(),
+    }
 }
 
 #[cfg(windows)]
@@ -1402,6 +4153,8 @@ struct InferenceTask {
     is_final: bool,
     started_at_ms: String,
     ended_at_ms: String,
+    meeting_sample_start: u64,
+    meeting_sample_end: u64,
     samples: Arc<[i16]>,
     session_errors: Arc<RuntimeErrors>,
 }
@@ -1553,6 +4306,9 @@ fn process_inference_task(
                     text,
                     started_at_ms: task.started_at_ms.clone(),
                     ended_at_ms: task.ended_at_ms.clone(),
+                    meeting_sample_start: task.meeting_sample_start,
+                    meeting_sample_end: task.meeting_sample_end,
+                    timeline_revision: 1,
                 }) {
                     Ok(ack) => {
                         shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);
@@ -1581,6 +4337,9 @@ fn process_inference_task(
                     ended_at_ms: None,
                     committed_at: None,
                     commit_id: None,
+                    meeting_sample_start: task.meeting_sample_start.to_string(),
+                    meeting_sample_end: task.meeting_sample_end.to_string(),
+                    timeline_revision: 1,
                     translation_status: "disabled".to_owned(),
                     translation_target: None,
                     translation_text: None,
@@ -1692,17 +4451,22 @@ fn publish_if_current(
 }
 
 #[cfg(windows)]
-fn spawn_coordinator(
+struct CoordinatorContext {
     output: AudioCaptureOutput,
     submitter: InferenceSubmitter,
     session_id: String,
     stop: Arc<AtomicBool>,
     pause_gate: Arc<PauseGate>,
     errors: Arc<RuntimeErrors>,
-) -> Result<JoinHandle<()>, String> {
+    audio_source_mode: AudioSourceMode,
+    raw_audio_writer: Option<RawAudioMeetingWriter>,
+}
+
+#[cfg(windows)]
+fn spawn_coordinator(context: CoordinatorContext) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("meetingrelay-audio".to_owned())
-        .spawn(move || coordinator_loop(output, submitter, session_id, stop, pause_gate, errors))
+        .spawn(move || coordinator_loop(context))
         .map_err(|_| "AUDIO_COORDINATOR_START_FAILED".to_owned())
 }
 
@@ -1718,14 +4482,17 @@ fn join_before(handle: JoinHandle<()>, deadline: Instant) -> Result<(), String> 
 }
 
 #[cfg(windows)]
-fn coordinator_loop(
-    output: AudioCaptureOutput,
-    submitter: InferenceSubmitter,
-    session_id: String,
-    stop: Arc<AtomicBool>,
-    pause_gate: Arc<PauseGate>,
-    errors: Arc<RuntimeErrors>,
-) {
+fn coordinator_loop(context: CoordinatorContext) {
+    let CoordinatorContext {
+        output,
+        submitter,
+        session_id,
+        stop,
+        pause_gate,
+        errors,
+        audio_source_mode,
+        mut raw_audio_writer,
+    } = context;
     let AudioCaptureOutput {
         packets,
         statuses: _statuses,
@@ -1741,6 +4508,7 @@ fn coordinator_loop(
     };
     let mut endpoint = EnergyEndpointSegmenter::new();
     let mut identity = SegmentIdentity::default();
+    let mut raw_timeline = RawAudioTimeline::default();
 
     while !stop.load(Ordering::Acquire) {
         if let Some(epoch) = pause_gate.pending_pause_epoch() {
@@ -1769,7 +4537,8 @@ fn coordinator_loop(
         }
         let timed_out = match packets.recv_timeout(Duration::from_millis(20)) {
             Ok(packet) => {
-                route_packet(packet, &mut system, &mut microphone);
+                persist_raw_packet(&mut raw_audio_writer, &mut raw_timeline, &packet, &errors);
+                route_packet(packet, audio_source_mode, &mut system, &mut microphone);
                 false
             }
             Err(RecvTimeoutError::Timeout) => true,
@@ -1789,7 +4558,8 @@ fn coordinator_loop(
 
     if !pause_gate.is_paused() {
         while let Ok(packet) = packets.try_recv() {
-            route_packet(packet, &mut system, &mut microphone);
+            persist_raw_packet(&mut raw_audio_writer, &mut raw_timeline, &packet, &errors);
+            route_packet(packet, audio_source_mode, &mut system, &mut microphone);
         }
         if let Some(block) = system.packetizer.flush_padded() {
             system.blocks.push_back(block);
@@ -1810,6 +4580,87 @@ fn coordinator_loop(
             submit_segment(event, &mut identity, &submitter, &errors, &session_id);
         }
     }
+    if let Some(writer) = raw_audio_writer
+        && writer.finalize().is_err()
+    {
+        record_runtime_error(&errors, 4);
+        errors.mark_incomplete("RAW_AUDIO_WRITE_FAILED");
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct RawAudioTimeline {
+    system_end: Option<u64>,
+    microphone_end: Option<u64>,
+}
+
+#[cfg(windows)]
+impl RawAudioTimeline {
+    fn previous_end(&self, source: AudioSourceId) -> Option<u64> {
+        match source {
+            AudioSourceId::SystemOutput => self.system_end,
+            AudioSourceId::Microphone => self.microphone_end,
+        }
+    }
+
+    fn set_end(&mut self, source: AudioSourceId, end: u64) {
+        match source {
+            AudioSourceId::SystemOutput => self.system_end = Some(end),
+            AudioSourceId::Microphone => self.microphone_end = Some(end),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn persist_raw_packet(
+    writer: &mut Option<RawAudioMeetingWriter>,
+    timeline: &mut RawAudioTimeline,
+    packet: &RawAudioPacket,
+    errors: &RuntimeErrors,
+) {
+    let Some(active_writer) = writer.as_mut() else {
+        return;
+    };
+    let source_end = packet
+        .captured_frame_start
+        .saturating_add(u64::try_from(packet.frame_count()).unwrap_or(u64::MAX));
+    let start = source_frame_to_meeting_sample(packet.captured_frame_start, packet.sample_rate);
+    let mut end = source_frame_to_meeting_sample_ceil(source_end, packet.sample_rate);
+    if end <= start {
+        end = start.saturating_add(1);
+    }
+    let gap = timeline
+        .previous_end(packet.source)
+        .filter(|previous| start > *previous)
+        .map(|previous| RawAudioGap {
+            start: previous,
+            end: start,
+            reason: "CAPTURE_GAP".to_owned(),
+        });
+    if active_writer
+        .append_packet(packet, MeetingSampleRange::new(start, end), gap)
+        .is_err()
+    {
+        record_runtime_error(errors, 4);
+        errors.mark_incomplete("RAW_AUDIO_WRITE_FAILED");
+        *writer = None;
+        return;
+    }
+    timeline.set_end(packet.source, end);
+}
+
+#[cfg(windows)]
+fn source_frame_to_meeting_sample(frame: u64, sample_rate: u32) -> u64 {
+    frame.saturating_mul(u64::from(TARGET_SAMPLE_RATE_HZ)) / u64::from(sample_rate.max(1))
+}
+
+#[cfg(windows)]
+fn source_frame_to_meeting_sample_ceil(frame: u64, sample_rate: u32) -> u64 {
+    frame
+        .saturating_mul(u64::from(TARGET_SAMPLE_RATE_HZ))
+        .saturating_add(u64::from(sample_rate.max(1)).saturating_sub(1))
+        / u64::from(sample_rate.max(1))
 }
 
 #[cfg(windows)]
@@ -1939,12 +4790,14 @@ impl SourcePipeline {
 #[cfg(windows)]
 fn route_packet(
     packet: RawAudioPacket,
+    mode: AudioSourceMode,
     system: &mut SourcePipeline,
     microphone: &mut SourcePipeline,
 ) {
     match packet.source {
-        AudioSourceId::SystemOutput => system.push(packet),
-        AudioSourceId::Microphone => microphone.push(packet),
+        AudioSourceId::SystemOutput if mode.captures_system() => system.push(packet),
+        AudioSourceId::Microphone if mode.captures_microphone() => microphone.push(packet),
+        _ => {}
     }
 }
 
@@ -2122,6 +4975,34 @@ fn submit_segment(
 }
 
 #[cfg(windows)]
+fn submit_recovery_event(
+    event: SegmentEvent,
+    timeline_offset: u64,
+    meeting_id: &str,
+    submitter: &InferenceSubmitter,
+    errors: &Arc<RuntimeErrors>,
+) -> Result<(), String> {
+    let SegmentEvent::Final { mut segment, .. } = event else {
+        return Ok(());
+    };
+    segment.started_at_sample = segment.started_at_sample.saturating_add(timeline_offset);
+    segment.ended_at_sample = segment.ended_at_sample.saturating_add(timeline_offset);
+    let segment_id = format!(
+        "recovered-{}-{}",
+        segment.started_at_sample, segment.ended_at_sample
+    );
+    submitter.submit(inference_task(
+        meeting_id,
+        segment_id,
+        1,
+        true,
+        segment,
+        Arc::clone(errors),
+    ))?;
+    submitter.barrier_before(Instant::now() + MVP_SHUTDOWN_TIMEOUT)
+}
+
+#[cfg(windows)]
 fn inference_task(
     session_id: &str,
     segment_id: String,
@@ -2130,6 +5011,8 @@ fn inference_task(
     segment: AudioSegment,
     session_errors: Arc<RuntimeErrors>,
 ) -> InferenceTask {
+    let meeting_sample_start = segment.started_at_sample;
+    let meeting_sample_end = segment.ended_at_sample;
     let started_at_ms = samples_to_ms(segment.started_at_sample).to_string();
     let ended_at_ms = samples_to_ms(segment.ended_at_sample).to_string();
     let samples = segment
@@ -2145,6 +5028,8 @@ fn inference_task(
         is_final,
         started_at_ms,
         ended_at_ms,
+        meeting_sample_start,
+        meeting_sample_end,
         samples,
         session_errors,
     }
@@ -2168,12 +5053,649 @@ fn is_meaningful_transcript(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mvp::secret_store::MemorySecretStore;
 
     #[cfg(windows)]
     use crate::mvp::{
         audio::AudioSampleFormat,
         dsp::{BLOCK_SAMPLES, SPEECH_START_BLOCKS},
     };
+
+    #[test]
+    fn provider_secret_status_never_exposes_secret_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-secret-service-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let service =
+            MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+
+        assert!(
+            !service
+                .secret_store_status(Some("cloud-primary"))
+                .unwrap()
+                .configured
+        );
+        let status = service
+            .set_provider_secret("cloud-primary", "integration-secret".to_owned())
+            .unwrap();
+        assert!(status.available);
+        assert!(status.configured);
+        assert!(
+            !serde_json::to_string(&status)
+                .unwrap()
+                .contains("integration-secret")
+        );
+        assert_eq!(
+            service
+                .provider_api_key("cloud-primary")
+                .unwrap()
+                .as_deref(),
+            Some("integration-secret")
+        );
+        assert!(
+            !service
+                .delete_provider_secret("cloud-primary")
+                .unwrap()
+                .configured
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_provider_reports_that_a_vault_secret_is_not_required() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-local-provider-secret-state-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let service =
+            MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+
+        let profiles = service.provider_profiles().unwrap();
+        let local = profiles
+            .iter()
+            .find(|profile| profile.profile_id == "provider-local-default")
+            .expect("seeded local provider");
+        assert_eq!(local.provider_class, "local");
+        assert_eq!(local.secret_state, "not_required");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_translation_resolves_profile_and_secret_store_as_source_of_truth() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-translation-provider-service-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+            let service =
+                MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+            service
+                .save_provider_profile(ProviderProfileUpdate {
+                    profile_id: "provider-cloud-default".to_owned(),
+                    label: "Cloud".to_owned(),
+                    provider_class: "cloud".to_owned(),
+                    base_url: "https://api.example.test/v1".to_owned(),
+                    model: "translation-model".to_owned(),
+                    policy_url: None,
+                    data_flow: "Final transcript text is sent to the provider.".to_owned(),
+                })
+                .unwrap();
+            service
+                .set_provider_secret(
+                    "provider-cloud-default",
+                    "credential-manager-secret".to_owned(),
+                )
+                .unwrap();
+
+            let resolved = service
+                .resolve_translation_config(
+                    TranslationConfig {
+                        enabled: true,
+                        base_url: "https://caller-must-not-win.invalid".to_owned(),
+                        model: "caller-must-not-win".to_owned(),
+                        api_key: Some("caller-secret-must-not-win".to_owned()),
+                        target_language: "ja".to_owned(),
+                        allow_insecure_http: false,
+                    },
+                    Some("provider-cloud-default"),
+                )
+                .unwrap();
+            assert_eq!(resolved.base_url, "https://api.example.test/v1");
+            assert_eq!(resolved.model, "translation-model");
+            assert_eq!(resolved.target_language, "ja");
+            assert_eq!(
+                resolved.api_key.as_deref(),
+                Some("credential-manager-secret")
+            );
+            assert!(!resolved.allow_insecure_http);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied live provider credentials and sends one external translation request"]
+    fn live_provider_service_path_uses_profile_secret_store_and_persists_provenance() {
+        if !cfg!(windows) {
+            eprintln!("skipped: production SecretStore live service path requires Windows");
+            return;
+        }
+
+        let base_url = required_live_env("MEETINGRELAY_LIVE_TRANSLATION_BASE_URL");
+        let model = required_live_env("MEETINGRELAY_LIVE_TRANSLATION_MODEL");
+        let api_key = required_live_env("MEETINGRELAY_LIVE_TRANSLATION_API_KEY");
+        let allow_insecure_http =
+            std::env::var("MEETINGRELAY_LIVE_TRANSLATION_ALLOW_INSECURE_HTTP")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
+        let provider_class = if allow_insecure_http { "lan" } else { "cloud" };
+        let now = crate::mvp::storage::now_ms_string();
+        let profile_id = format!("live-service-{now}-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-live-provider-service-{now}-{}",
+            std::process::id()
+        ));
+        let cleanup = LiveProviderCleanup::new(root.clone(), profile_id.clone());
+        std::fs::create_dir_all(&root).expect("create live provider temp dir");
+
+        {
+            let storage_path = root.join("mvp.sqlite3");
+            let storage = MvpStorage::open_at(&storage_path).expect("open live provider storage");
+            let service = MvpService::new_with_dependencies(
+                Ok(storage.clone()),
+                Arc::new(ProductionSecretStore::new()),
+            );
+            let writer = service
+                .storage_writer
+                .as_ref()
+                .expect("live provider storage writer");
+
+            let initial_model = "caller-must-not-win";
+            let initial_endpoint_hash = TranslationConfig {
+                enabled: true,
+                base_url: base_url.clone(),
+                model: initial_model.to_owned(),
+                api_key: None,
+                target_language: "zh".to_owned(),
+                allow_insecure_http,
+            }
+            .validate_enabled()
+            .expect("validate initial live provider profile")
+            .endpoint_hash;
+            let first = writer
+                .save_provider_profile(ProviderProfileInput {
+                    profile_id: Some(profile_id.clone()),
+                    label: "Live service test initial".to_owned(),
+                    provider_class: provider_class.to_owned(),
+                    base_url: Some(base_url.clone()),
+                    model: initial_model.to_owned(),
+                    endpoint_hash: initial_endpoint_hash,
+                    data_flow:
+                        "Live ignored test sends one final transcript to the configured provider."
+                            .to_owned(),
+                    policy_url: None,
+                    config_version: 1,
+                    secret_state: "missing".to_owned(),
+                    last_test_at: None,
+                    last_test_status: None,
+                    last_error: None,
+                })
+                .expect("save first live provider profile version");
+            assert_eq!(first.config_version, 1);
+
+            let saved = service
+                .save_provider_profile(ProviderProfileUpdate {
+                    profile_id: profile_id.clone(),
+                    label: "Live service test".to_owned(),
+                    provider_class: provider_class.to_owned(),
+                    base_url: base_url.clone(),
+                    model: model.clone(),
+                    policy_url: None,
+                    data_flow:
+                        "Live ignored test sends one final transcript to the configured provider."
+                            .to_owned(),
+                })
+                .expect("save second live provider profile version");
+            assert_eq!(saved.config_version, 2);
+            assert_eq!(
+                service
+                    .provider_profile_history(&profile_id)
+                    .expect("read live provider profile history")
+                    .len(),
+                2
+            );
+
+            let status = service
+                .set_provider_secret(&profile_id, api_key)
+                .expect("store live provider secret in production SecretStore");
+            assert!(status.available);
+            assert!(status.configured);
+            let stored_key_matches = service
+                .provider_api_key(&profile_id)
+                .expect("read live provider secret from production SecretStore")
+                .as_deref()
+                .is_some_and(|stored| {
+                    stored == required_live_env("MEETINGRELAY_LIVE_TRANSLATION_API_KEY")
+                });
+            assert!(
+                stored_key_matches,
+                "live provider secret did not round-trip through production SecretStore"
+            );
+
+            let meeting = writer
+                .start_meeting_with_metadata(
+                    true,
+                    "live service test model",
+                    "Live provider service test",
+                    "en",
+                )
+                .expect("start live provider test meeting");
+            let source_text =
+                "Please translate this short MeetingRelay provider integration test sentence.";
+            writer
+                .commit_final(FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: "live-segment-1".to_owned(),
+                    sequence: 1,
+                    revision: 1,
+                    text: source_text.to_owned(),
+                    started_at_ms: "0".to_owned(),
+                    ended_at_ms: "1000".to_owned(),
+                    meeting_sample_start: 0,
+                    meeting_sample_end: 16_000,
+                    timeline_revision: 1,
+                })
+                .expect("commit live provider source final");
+            writer
+                .complete_meeting(&meeting.id)
+                .expect("complete live provider test meeting");
+
+            service
+                .retry_translation_segment(
+                    &meeting.id,
+                    "live-segment-1",
+                    "1",
+                    "en",
+                    TranslationConfig {
+                        enabled: true,
+                        base_url: "https://caller-must-not-win.invalid/v1".to_owned(),
+                        model: "caller-must-not-win".to_owned(),
+                        api_key: Some("caller-secret-must-not-win".to_owned()),
+                        target_language: "zh".to_owned(),
+                        allow_insecure_http: false,
+                    },
+                    &profile_id,
+                )
+                .expect("live provider translation through service profile path");
+
+            let snapshot = storage
+                .snapshot(&meeting.id)
+                .expect("read live provider meeting snapshot");
+            assert_eq!(snapshot.finals.len(), 1);
+            let final_segment = &snapshot.finals[0];
+            assert_eq!(final_segment.text, source_text);
+            assert_eq!(final_segment.translation_status, "completed");
+            assert_eq!(final_segment.translation_target.as_deref(), Some("zh"));
+            let translated = final_segment
+                .translation_text
+                .as_deref()
+                .expect("live provider translated text persisted");
+            assert!(!translated.trim().is_empty());
+
+            let attempt = read_live_translation_attempt(&storage_path, &meeting.id);
+            assert_eq!(attempt.target_language, "zh");
+            assert_eq!(attempt.provider, "openai-compatible");
+            assert_eq!(attempt.config_version, "meetingrelay.translation.config.v1");
+            assert_eq!(attempt.model, model);
+            assert_eq!(attempt.prompt_version, "meetingrelay.translation.prompt.v1");
+            assert_eq!(attempt.request_schema_version, "openai.chat.completions.v1");
+            assert_eq!(attempt.status, "completed");
+            assert!(attempt.error_code.is_none());
+            assert!(attempt.completed_at.is_some());
+            assert!(attempt.endpoint_origin.is_some());
+            assert_eq!(attempt.endpoint_hash.len(), 64);
+
+            println!(
+                "live provider service path passed: model={}, target={}, profile_versions=2, attempt={}, endpoint_hash={}",
+                attempt.model, attempt.target_language, attempt.attempt, attempt.endpoint_hash
+            );
+        }
+
+        drop(cleanup);
+    }
+
+    #[derive(Debug)]
+    struct LiveProviderAttempt {
+        target_language: String,
+        attempt: u32,
+        provider: String,
+        config_version: String,
+        endpoint_origin: Option<String>,
+        endpoint_hash: String,
+        model: String,
+        prompt_version: String,
+        request_schema_version: String,
+        status: String,
+        error_code: Option<String>,
+        completed_at: Option<String>,
+    }
+
+    struct LiveProviderCleanup {
+        root: std::path::PathBuf,
+        profile_id: String,
+    }
+
+    impl LiveProviderCleanup {
+        fn new(root: std::path::PathBuf, profile_id: String) -> Self {
+            Self { root, profile_id }
+        }
+    }
+
+    impl Drop for LiveProviderCleanup {
+        fn drop(&mut self) {
+            if let Ok(secret_id) = provider_secret_id(&self.profile_id) {
+                let _ = ProductionSecretStore::new().delete(&secret_id);
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn required_live_env(name: &str) -> String {
+        let value = std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+        let trimmed = value.trim();
+        assert!(!trimmed.is_empty(), "{name} must not be empty");
+        trimmed.to_owned()
+    }
+
+    fn read_live_translation_attempt(
+        storage_path: &std::path::Path,
+        meeting_id: &str,
+    ) -> LiveProviderAttempt {
+        let connection =
+            rusqlite::Connection::open(storage_path).expect("open live provider sqlite");
+        connection
+            .query_row(
+                "SELECT target_language, attempt, provider, config_version, endpoint_origin,
+                        endpoint_hash, model, prompt_version, request_schema_version, status,
+                        error_code, completed_at
+                 FROM mvp_translation_attempts
+                 WHERE meeting_id=?1
+                 ORDER BY attempt DESC
+                 LIMIT 1",
+                rusqlite::params![meeting_id],
+                |row| {
+                    Ok(LiveProviderAttempt {
+                        target_language: row.get(0)?,
+                        attempt: row.get(1)?,
+                        provider: row.get(2)?,
+                        config_version: row.get(3)?,
+                        endpoint_origin: row.get(4)?,
+                        endpoint_hash: row.get(5)?,
+                        model: row.get(6)?,
+                        prompt_version: row.get(7)?,
+                        request_schema_version: row.get(8)?,
+                        status: row.get(9)?,
+                        error_code: row.get(10)?,
+                        completed_at: row.get(11)?,
+                    })
+                },
+            )
+            .expect("read live provider translation attempt")
+    }
+
+    #[test]
+    fn export_uses_the_requested_completed_summary_version() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-summary-export-service-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+            let service =
+                MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+            let writer = service.storage_writer.as_ref().unwrap();
+            let meeting = writer.start_meeting(true, "test model").unwrap();
+            writer
+                .commit_final(FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: "segment-1".to_owned(),
+                    sequence: 1,
+                    revision: 1,
+                    text: "source transcript".to_owned(),
+                    started_at_ms: "0".to_owned(),
+                    ended_at_ms: "1000".to_owned(),
+                    meeting_sample_start: 0,
+                    meeting_sample_end: 16_000,
+                    timeline_revision: 1,
+                })
+                .unwrap();
+            writer.complete_meeting(&meeting.id).unwrap();
+            let first = writer
+                .start_summary_job(SummaryJobInput {
+                    meeting_id: meeting.id.clone(),
+                    provider_profile_id: None,
+                    prompt_version: "summary.prompt.v1".to_owned(),
+                    request_schema_version: "summary.request.v1".to_owned(),
+                })
+                .unwrap();
+            writer
+                .append_summary_result(SummaryResultInput {
+                    job_id: first.job_id.clone(),
+                    section_kind: "overview".to_owned(),
+                    section_index: 0,
+                    heading: "概览".to_owned(),
+                    text: "VERSION_ONE_MARKER".to_owned(),
+                    citation_segment_ids: vec!["segment-1".to_owned()],
+                })
+                .unwrap();
+            writer.finish_summary_job(&first.job_id).unwrap();
+            let second = writer
+                .retry_summary_job(
+                    &first.job_id,
+                    SummaryJobInput {
+                        meeting_id: meeting.id.clone(),
+                        provider_profile_id: None,
+                        prompt_version: "summary.prompt.v1".to_owned(),
+                        request_schema_version: "summary.request.v1".to_owned(),
+                    },
+                )
+                .unwrap();
+            writer
+                .append_summary_result(SummaryResultInput {
+                    job_id: second.job_id.clone(),
+                    section_kind: "overview".to_owned(),
+                    section_index: 0,
+                    heading: "概览".to_owned(),
+                    text: "VERSION_TWO_MARKER".to_owned(),
+                    citation_segment_ids: vec!["segment-1".to_owned()],
+                })
+                .unwrap();
+            writer.finish_summary_job(&second.job_id).unwrap();
+
+            let result = service
+                .export_meeting_options(
+                    &meeting.id,
+                    "summary-version-one".to_owned(),
+                    ExportOptions {
+                        formats: vec!["json".to_owned()],
+                        include_original: false,
+                        include_translation: false,
+                        bilingual: false,
+                        include_speaker: false,
+                        include_summary: true,
+                        include_timestamp: true,
+                        summary_version: Some(1),
+                        summary: None,
+                    },
+                )
+                .unwrap();
+            let content = std::fs::read_to_string(&result.artifacts[0].path).unwrap();
+            assert!(content.contains("VERSION_ONE_MARKER"));
+            assert!(!content.contains("VERSION_TWO_MARKER"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diagnostic_bundle_contains_required_sections_without_sensitive_values() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-diagnostic-service-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = {
+            let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+            let service =
+                MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+            service
+                .set_provider_secret(
+                    "provider-cloud-default",
+                    "diagnostic-super-secret".to_owned(),
+                )
+                .unwrap();
+            lock(&service.snapshot).error =
+                Some("Authorization: Bearer diagnostic-super-secret".to_owned());
+
+            let result = service.create_diagnostic_bundle().unwrap();
+            assert!(result.redacted);
+            let text = std::fs::read_to_string(&result.path).unwrap();
+            assert!(!text.contains("diagnostic-super-secret"));
+            assert!(!text.to_ascii_lowercase().contains("authorization"));
+            assert!(!text.to_ascii_lowercase().contains("bearer "));
+            let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+            for section in [
+                "database",
+                "disk",
+                "queues",
+                "runtime",
+                "model",
+                "providers",
+                "recentErrors",
+            ] {
+                assert!(
+                    value.get(section).is_some(),
+                    "missing diagnostic section {section}"
+                );
+            }
+            assert_eq!(value["database"]["status"], "ok");
+            assert_eq!(value["database"]["readProbe"], true);
+            assert_eq!(
+                value["runtime"]["secretStore"]["backend"],
+                if cfg!(windows) {
+                    "windows-credential-manager"
+                } else {
+                    "unsupported"
+                }
+            );
+            let providers = value["providers"].as_array().unwrap();
+            assert_eq!(providers.len(), 3);
+            assert!(
+                providers
+                    .iter()
+                    .all(|provider| provider.get("baseUrl").is_none())
+            );
+            result.path
+        };
+        assert!(std::path::Path::new(&path).is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn available_disk_bytes_handles_data_dir_with_spaces() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay disk probe {}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let free_bytes = available_disk_bytes(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            free_bytes.is_some_and(|bytes| bytes > 0),
+            "disk free-space probe should work for data directories containing spaces"
+        );
+    }
+
+    #[test]
+    fn delete_preview_execute_restore_and_fault_rollback_match() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-governance-service-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+            let reader = storage.clone();
+            let service =
+                MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+            let writer = service.storage_writer.as_ref().unwrap();
+
+            let meeting = writer.start_meeting(true, "test model").unwrap();
+            writer.complete_meeting(&meeting.id).unwrap();
+            let raw = root.join("raw").join(&meeting.id);
+            let derived = root.join("derived").join(&meeting.id);
+            std::fs::create_dir_all(&raw).unwrap();
+            std::fs::create_dir_all(&derived).unwrap();
+            std::fs::write(raw.join("system.wav"), b"raw-bytes").unwrap();
+            std::fs::write(derived.join("summary.json"), b"derived-bytes").unwrap();
+
+            let preview = service.delete_preview(&meeting.id, false, true).unwrap();
+            let deleted = service
+                .delete_execute(
+                    &meeting.id,
+                    preview.recovery_window_seconds,
+                    preview.include_raw,
+                    preview.include_derived,
+                )
+                .unwrap();
+            assert!(deleted.deleted);
+            assert_eq!(deleted.entries_deleted, preview.entries.len());
+            assert_eq!(deleted.bytes_deleted, preview.will_delete_bytes);
+            assert!(raw.exists());
+            assert!(!derived.exists());
+            assert!(reader.meeting_library_item(&meeting.id).unwrap().is_none());
+
+            let restored = service.delete_restore(&meeting.id).unwrap();
+            assert!(!restored.deleted);
+            assert_eq!(std::fs::read(raw.join("system.wav")).unwrap(), b"raw-bytes");
+            assert_eq!(
+                std::fs::read(derived.join("summary.json")).unwrap(),
+                b"derived-bytes"
+            );
+            assert!(reader.meeting_library_item(&meeting.id).unwrap().is_some());
+
+            let faulted = writer.start_meeting(true, "test model").unwrap();
+            writer.complete_meeting(&faulted.id).unwrap();
+            let faulted_raw = root.join("raw").join(&faulted.id);
+            std::fs::create_dir_all(&faulted_raw).unwrap();
+            std::fs::write(faulted_raw.join("system.wav"), b"must-survive").unwrap();
+            assert_eq!(
+                service
+                    .delete_execute_with(
+                        &faulted.id,
+                        GOVERNANCE_RECOVERY_WINDOW_SECONDS,
+                        true,
+                        true,
+                        |_| Err("MVP_STORAGE_FAULT_INJECTED".to_owned()),
+                    )
+                    .unwrap_err(),
+                "MVP_STORAGE_FAULT_INJECTED"
+            );
+            assert_eq!(
+                std::fs::read(faulted_raw.join("system.wav")).unwrap(),
+                b"must-survive"
+            );
+            assert!(reader.snapshot(&faulted.id).is_ok());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[cfg(windows)]
     fn temp_storage_writer(test_name: &str) -> (MvpStorage, MvpStorageWriter) {
@@ -2196,6 +5718,8 @@ mod tests {
             is_final,
             started_at_ms: "0".to_owned(),
             ended_at_ms: "20".to_owned(),
+            meeting_sample_start: 0,
+            meeting_sample_end: 320,
             samples: vec![0_i16].into(),
             session_errors: Arc::new(RuntimeErrors::default()),
         }
@@ -2225,6 +5749,8 @@ mod tests {
             pause_gate: Arc::new(PauseGate::default()),
             metrics,
             errors: Arc::new(RuntimeErrors::default()),
+            audio_source_mode: AudioSourceMode::Both,
+            last_disk_check_ms: AtomicU64::new(0),
             started: Instant::now(),
             meeting_id: meeting_id.to_owned(),
         }
@@ -2404,6 +5930,97 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn mode_source_snapshots_disable_unselected_sources() {
+        let system = AudioDevicePreflight {
+            source: AudioSourceId::SystemOutput,
+            device_id: "system-device".to_owned(),
+            name: "System Device".to_owned(),
+            sample_rate: TARGET_SAMPLE_RATE_HZ,
+            channels: 1,
+            sample_format: AudioSampleFormat::F32,
+        };
+        let microphone = AudioDevicePreflight {
+            source: AudioSourceId::Microphone,
+            device_id: "microphone-device".to_owned(),
+            name: "Microphone Device".to_owned(),
+            sample_rate: TARGET_SAMPLE_RATE_HZ,
+            channels: 1,
+            sample_format: AudioSampleFormat::F32,
+        };
+        let mut snapshot = MvpSnapshot::booting();
+
+        apply_mode_sources(
+            &mut snapshot,
+            AudioSourceMode::SystemOnly,
+            &system,
+            &microphone,
+            true,
+        );
+
+        assert!(snapshot.system.ready);
+        assert!(snapshot.system.active);
+        assert_eq!(snapshot.system.status, SourceStatus::Capturing);
+        assert!(!snapshot.microphone.ready);
+        assert!(!snapshot.microphone.active);
+        assert_eq!(snapshot.microphone.frames, "0");
+        assert_eq!(snapshot.microphone.peak, 0.0);
+        assert_eq!(snapshot.microphone.status, SourceStatus::Disabled);
+        assert_eq!(snapshot.microphone.error, None);
+
+        apply_mode_sources(
+            &mut snapshot,
+            AudioSourceMode::MicrophoneOnly,
+            &system,
+            &microphone,
+            true,
+        );
+
+        assert!(!snapshot.system.ready);
+        assert!(!snapshot.system.active);
+        assert_eq!(snapshot.system.frames, "0");
+        assert_eq!(snapshot.system.status, SourceStatus::Disabled);
+        assert!(snapshot.microphone.ready);
+        assert!(snapshot.microphone.active);
+        assert_eq!(snapshot.microphone.status, SourceStatus::Capturing);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paused_and_resume_helpers_preserve_disabled_source_state() {
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.lifecycle = Lifecycle::Recording;
+        snapshot.durability_status = "recording".to_owned();
+        snapshot.system = AudioSourceSnapshot {
+            id: SourceId::System,
+            label: "System Device".to_owned(),
+            ready: true,
+            active: true,
+            frames: "128".to_owned(),
+            peak: 0.5,
+            status: SourceStatus::Capturing,
+            error: None,
+        };
+        snapshot.microphone = disabled_source(SourceId::Microphone);
+
+        apply_paused_snapshot_for_mode(&mut snapshot, AudioSourceMode::SystemOnly, None);
+
+        assert_eq!(snapshot.lifecycle, Lifecycle::Paused);
+        assert!(!snapshot.system.active);
+        assert_eq!(snapshot.system.status, SourceStatus::Ready);
+        assert!(!snapshot.microphone.ready);
+        assert!(!snapshot.microphone.active);
+        assert_eq!(snapshot.microphone.frames, "0");
+        assert_eq!(snapshot.microphone.status, SourceStatus::Disabled);
+
+        apply_disabled_sources(&mut snapshot, AudioSourceMode::SystemOnly);
+
+        assert_eq!(snapshot.microphone.frames, "0");
+        assert_eq!(snapshot.microphone.peak, 0.0);
+        assert_eq!(snapshot.microphone.status, SourceStatus::Disabled);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn resume_transition_discards_paused_backlog_and_resets_processing_boundary() {
         let (sender, receiver) = sync_channel(8);
         sender
@@ -2411,6 +6028,7 @@ mod tests {
                 source: AudioSourceId::SystemOutput,
                 sample_rate: TARGET_SAMPLE_RATE_HZ,
                 channels: 1,
+                captured_frame_start: 0,
                 samples: vec![0.5; 16],
             })
             .unwrap();
@@ -2419,6 +6037,7 @@ mod tests {
                 source: AudioSourceId::Microphone,
                 sample_rate: TARGET_SAMPLE_RATE_HZ,
                 channels: 1,
+                captured_frame_start: 0,
                 samples: vec![0.5; 16],
             })
             .unwrap();
@@ -2443,12 +6062,14 @@ mod tests {
             source: AudioSourceId::SystemOutput,
             sample_rate: TARGET_SAMPLE_RATE_HZ,
             channels: 1,
+            captured_frame_start: 0,
             samples: vec![0.5; 16],
         });
         microphone.push(RawAudioPacket {
             source: AudioSourceId::Microphone,
             sample_rate: TARGET_SAMPLE_RATE_HZ,
             channels: 1,
+            captured_frame_start: 0,
             samples: vec![0.5; 16],
         });
 
@@ -2552,6 +6173,9 @@ mod tests {
             ended_at_ms: None,
             committed_at: None,
             commit_id: None,
+            meeting_sample_start: "0".to_owned(),
+            meeting_sample_end: "320".to_owned(),
+            timeline_revision: 1,
             translation_status: "disabled".to_owned(),
             translation_target: None,
             translation_text: None,
@@ -2726,6 +6350,9 @@ mod tests {
                     text: "gap".to_owned(),
                     started_at_ms: "0".to_owned(),
                     ended_at_ms: "1".to_owned(),
+                    meeting_sample_start: 0,
+                    meeting_sample_end: 16,
+                    timeline_revision: 1,
                 })
                 .unwrap_err(),
             "MVP_STORAGE_FINAL_SEQUENCE_GAP_OR_REORDER"
@@ -2740,6 +6367,9 @@ mod tests {
                 text: "ok".to_owned(),
                 started_at_ms: "0".to_owned(),
                 ended_at_ms: "1".to_owned(),
+                meeting_sample_start: 0,
+                meeting_sample_end: 16,
+                timeline_revision: 1,
             })
             .unwrap();
         shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);

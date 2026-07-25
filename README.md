@@ -152,9 +152,10 @@ Choose **Other compatible service** to enter a custom Base URL, model ID, and AP
 1. Enable OpenAI-compatible translation.
 2. Select a provider preset or enter a custom Base URL.
 3. Enter a model ID exposed by the selected service.
-4. Select the translation language for the meeting: Chinese, Japanese, or English.
-5. Run **Test connection**. The probe sends only a fixed synthetic sentence, never meeting content.
-6. Confirm the recording and third-party data disclosure before starting the meeting.
+4. Enter the API token when the provider requires one. **Test connection** or starting a meeting stores it in Windows Credential Manager, not in ordinary preferences or SQLite.
+5. Select the translation language for the meeting: Chinese, Japanese, or English.
+6. Run **Test connection**. The probe sends only a fixed synthetic sentence, never meeting content.
+7. Confirm the recording and third-party data disclosure before starting the meeting.
 
 If the translation language is the same as the recognition language, MeetingRelay does not contact the provider and persists the segment as `skipped`.
 
@@ -165,7 +166,7 @@ HTTP is allowed directly for `localhost`, `127.0.0.1`, and `[::1]`. Non-loopback
 > [!WARNING]
 > Remote HTTP sends the API token and durable final transcript in plaintext. Traffic can be read or modified in transit. Acknowledging the risk records a user choice; it does not provide confidentiality or integrity. Prefer HTTPS.
 
-API tokens remain in process memory and are never written to localStorage, SQLite, logs, or exports. The non-secret remote HTTP acknowledgement may be stored locally as a preference.
+API tokens are loaded into process memory only while needed and are persisted exclusively in Windows Credential Manager. They are never written to localStorage, SQLite, logs, or exports. Use **Remove from OS vault** in Provider management to delete a stored token. The non-secret remote HTTP acknowledgement may be stored locally as a preference.
 
 ## Downloads and releases
 
@@ -201,7 +202,7 @@ This is a package-local personal Windows build, not an MSI or NSIS installer.
 - Audio capture, local ASR, the original SQLite transcript, and exports stay on the machine by default.
 - Durable final text is sent to the selected provider only when translation is enabled.
 - Original text is committed before any network translation request; a provider failure cannot invalidate the local record.
-- API tokens are not persisted and never appear in copied or exported transcript data.
+- API tokens are persisted only in Windows Credential Manager, can be removed from Provider management, and never appear in ordinary settings, SQLite, logs, copied transcripts, or exports.
 - Base URLs reject embedded credentials, query strings, and fragments. Remote HTTP requires explicit acknowledgement.
 - Data retention, training, billing, and regional policies for third-party services are controlled by the selected provider.
 - Use the application only after meeting participants have consented to recording, transcription, and any required third-party data transfer.
@@ -253,19 +254,19 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 
 - Sherpa / SenseVoice is the only product ASR backend; Whisper, FunASR, and automatic fallback are not included.
 - Mixed-language recognition is not supported. Each meeting uses one selected recognition language.
-- OpenAI-compatible translation currently uses non-streaming requests per final segment. Token streaming, manual retry, context windows, proxies, custom headers/bodies, and complete provider provenance are not implemented.
-- The 60-minute microphone path has passed a real-device endurance test. Audible system-loopback capture and device hot-plug behavior still require validation.
-- A 10–20 minute real translated meeting, a second clean Windows machine, and a signed installer have not been validated.
+- OpenAI-compatible translation uses non-streaming requests per final segment. Manual segment/meeting retry and sanitized attempt provenance are included; token streaming, context windows, proxies, and custom headers/bodies are not.
+- The 60-minute microphone path and an audible system-loopback short meeting have passed real-device validation. Device hot-plug behavior still requires validation.
+- A short real Windows system-audio meeting has passed the full local-ASR → remote-translation → SQLite path with `gpt-5.4-mini`. A 10–20 minute translated meeting over HTTPS, a second clean Windows machine, and a signed installer have not been validated.
 - `MeetingRelay.exe` is unsigned, and public assets do not include the model or Sherpa runtime.
-- Speaker diarization, meeting summaries, search, tags, and raw-audio playback are not implemented.
+- Speaker diarization is not implemented. Versioned meeting summaries, full-text search, tags, optional raw-audio capture, and segment-level playback location are available; raw audio remains disabled by default.
 
 ## Roadmap
 
 - Validate ASR and translation quality with representative Chinese, Japanese, and English meetings.
-- Add retry for individual failed segments and complete meetings.
 - Validate audible system-output loopback and device hot-plug behavior.
-- Evaluate streaming translation, single-source mode, and raw-audio storage based on real usage.
-- Evaluate Windows Credential Manager, a signed installer, and a second clean-machine test.
+- Evaluate streaming translation only if complete-result latency proves disruptive in real meetings.
+- Validate system-only, microphone-only, both-source, raw-audio recovery, and disk-pressure behavior on representative Windows hardware.
+- Validate a signed installer and a second clean-machine test; Windows Credential Manager integration and a real credential round trip are complete.
 
 ## Contributing
 

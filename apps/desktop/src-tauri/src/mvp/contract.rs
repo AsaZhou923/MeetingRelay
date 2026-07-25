@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-pub const MVP_CONTRACT_VERSION: &str = "meetingrelay.mvp.durable.v2";
+pub const MVP_CONTRACT_VERSION: &str = "meetingrelay.mvp.durable.v3";
 pub const MAX_FINAL_SEGMENTS: usize = 64;
 pub const MAX_INFERENCE_QUEUE_DEPTH: usize = 8;
 
@@ -26,6 +26,7 @@ pub enum SourceId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceStatus {
+    Disabled,
     Ready,
     Capturing,
     Degraded,
@@ -73,10 +74,35 @@ pub struct TranscriptSegment {
     pub ended_at_ms: Option<String>,
     pub committed_at: Option<String>,
     pub commit_id: Option<String>,
+    pub meeting_sample_start: String,
+    pub meeting_sample_end: String,
+    pub timeline_revision: u32,
     pub translation_status: String,
     pub translation_target: Option<String>,
     pub translation_text: Option<String>,
     pub translation_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskHealthSnapshot {
+    pub status: String,
+    pub data_dir: String,
+    pub free_bytes: String,
+    pub required_bytes: String,
+    pub warning: Option<String>,
+}
+
+impl Default for DiskHealthSnapshot {
+    fn default() -> Self {
+        Self {
+            status: "error".to_owned(),
+            data_dir: String::new(),
+            free_bytes: "0".to_owned(),
+            required_bytes: "536870912".to_owned(),
+            warning: Some("DISK_NOT_CHECKED".to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -104,6 +130,9 @@ pub struct MvpSnapshot {
     pub finals: Vec<TranscriptSegment>,
     pub queue_depth: usize,
     pub translation_queue_depth: usize,
+    pub audio_source_mode: String,
+    pub raw_audio_enabled: bool,
+    pub disk: DiskHealthSnapshot,
     pub error: Option<String>,
 }
 
@@ -132,6 +161,9 @@ impl MvpSnapshot {
             finals: Vec::new(),
             queue_depth: 0,
             translation_queue_depth: 0,
+            audio_source_mode: "both".to_owned(),
+            raw_audio_enabled: false,
+            disk: DiskHealthSnapshot::default(),
             error: None,
         }
     }
@@ -170,13 +202,16 @@ mod tests {
         else {
             panic!("snapshot must use a JSON response body");
         };
-        assert!(json.contains(r#""contractVersion":"meetingrelay.mvp.durable.v2""#));
+        assert!(json.contains(r#""contractVersion":"meetingrelay.mvp.durable.v3""#));
         assert!(json.contains(r#""lifecycle":"booting""#));
         assert!(json.contains(r#""localOnly":true,"memoryOnly":false"#));
         assert!(json.contains(r#""durabilityStatus":"initializing""#));
         assert!(json.contains(r#""id":"system""#));
         assert!(json.contains(r#""id":"microphone""#));
         assert!(json.contains(r#""elapsedMs":"0""#));
+        assert!(json.contains(r#""audioSourceMode":"both""#));
+        assert!(json.contains(r#""rawAudioEnabled":false"#));
+        assert!(json.contains(r#""requiredBytes":"536870912""#));
     }
 
     #[test]
@@ -194,6 +229,9 @@ mod tests {
                 ended_at_ms: Some("1".to_owned()),
                 committed_at: Some("2".to_owned()),
                 commit_id: Some(format!("commit-{index}")),
+                meeting_sample_start: "0".to_owned(),
+                meeting_sample_end: "16".to_owned(),
+                timeline_revision: 1,
                 translation_status: "disabled".to_owned(),
                 translation_target: None,
                 translation_text: None,

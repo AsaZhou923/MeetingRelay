@@ -54,6 +54,13 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
             mvp::mvp_audio_devices,
             mvp::mvp_prepare_language,
             mvp::mvp_test_translation,
+            mvp::mvp_secret_store_status,
+            mvp::mvp_provider_profiles,
+            mvp::mvp_provider_profile_history,
+            mvp::mvp_save_provider_profile,
+            mvp::mvp_set_provider_secret,
+            mvp::mvp_delete_provider_secret,
+            mvp::mvp_test_provider,
             mvp::mvp_start,
             mvp::mvp_stop,
             mvp::mvp_pause,
@@ -61,8 +68,40 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
             mvp::mvp_snapshot,
             mvp::mvp_open_recent,
             mvp::mvp_open_meeting,
+            mvp::mvp_list_meetings,
+            mvp::mvp_search_segments,
+            mvp::mvp_meeting_detail,
+            mvp::mvp_update_meeting_tags,
+            mvp::mvp_update_meeting_metadata,
+            mvp::mvp_tags,
+            mvp::mvp_create_tag,
+            mvp::mvp_delete_tag,
+            mvp::mvp_assign_tag,
+            mvp::mvp_unassign_tag,
             mvp::mvp_export_meeting,
-            mvp::mvp_transcript_text
+            mvp::mvp_export_meeting_options,
+            mvp::mvp_transcript_text,
+            mvp::mvp_retry_translation_segment,
+            mvp::mvp_retry_failed_translations,
+            mvp::mvp_translation_retry_progress,
+            mvp::mvp_cancel_translation_batch,
+            mvp::mvp_summary_start,
+            mvp::mvp_summary_status,
+            mvp::mvp_summary_cancel,
+            mvp::mvp_summary_retry,
+            mvp::mvp_interrupted_meetings,
+            mvp::mvp_recover_meeting,
+            mvp::mvp_finalize_interrupted,
+            mvp::mvp_keep_interrupted,
+            mvp::mvp_locate_segment_audio,
+            mvp::mvp_create_diagnostic_bundle,
+            mvp::mvp_raw_audio_delete_preview,
+            mvp::mvp_delete_raw_audio,
+            mvp::mvp_delete_preview,
+            mvp::mvp_delete_execute,
+            mvp::mvp_delete_restore,
+            mvp::mvp_delete_purge,
+            mvp::mvp_raw_audio_retention_preview
         ])
 }
 
@@ -104,7 +143,7 @@ mod tests {
         let tauri::ipc::InvokeResponseBody::Json(body) = response else {
             panic!("MVP snapshot returned a raw IPC body");
         };
-        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.durable.v2""#));
+        assert!(body.contains(r#""contractVersion":"meetingrelay.mvp.durable.v3""#));
         assert!(body.contains(r#""lifecycle":"booting""#));
         assert!(body.contains(r#""localOnly":true,"memoryOnly":false"#));
     }

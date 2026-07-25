@@ -1,4 +1,4 @@
-export const MVP_CONTRACT_VERSION = "meetingrelay.mvp.durable.v2";
+export const MVP_CONTRACT_VERSION = "meetingrelay.mvp.durable.v3";
 
 export const MVP_LIFECYCLES = [
   "booting",
@@ -10,8 +10,22 @@ export const MVP_LIFECYCLES = [
   "error",
 ] as const;
 
-export const MVP_EXPORT_FORMATS = ["json", "markdown", "txt"] as const;
+export const MVP_EXPORT_FORMATS = ["json", "markdown", "txt", "docx", "pdf"] as const;
 export const MVP_RECOGNITION_LANGUAGES = ["zh", "ja", "en"] as const;
+export const MVP_MEETING_LANGUAGES = [...MVP_RECOGNITION_LANGUAGES, "unknown"] as const;
+export const MVP_AUDIO_SOURCE_MODES = ["system_only", "microphone_only", "both"] as const;
+export const MVP_PROVIDER_CLASSES = ["local", "lan", "cloud"] as const;
+export const MVP_SUMMARY_JOB_STATUSES = [
+  "idle",
+  "queued",
+  "chunking",
+  "combining",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export const MVP_DELETE_ENTRY_TYPES = ["raw", "derived", "export", "summary", "metadata"] as const;
+export const MVP_SEARCH_SCOPES = ["original", "translation", "summary", "speaker"] as const;
 export const MVP_TRANSLATION_STATUSES = [
   "disabled",
   "pending",
@@ -19,15 +33,33 @@ export const MVP_TRANSLATION_STATUSES = [
   "failed",
   "skipped",
 ] as const;
+export const MVP_DISK_STATUSES = ["ok", "warning", "critical", "error"] as const;
+export const MVP_TRANSLATION_RETRY_STATUSES = [
+  "idle",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export const MVP_INTERRUPTED_ACTIONS = ["recover", "finalize", "keep"] as const;
 export const AUDIO_DEVICE_PREFERENCE_KEY = "meetingrelay.audio-devices.v1";
 export const TRANSLATION_PREFERENCE_KEY = "meetingrelay.translation.v1";
 
 export type MvpLifecycle = (typeof MVP_LIFECYCLES)[number];
 export type MvpExportFormat = (typeof MVP_EXPORT_FORMATS)[number];
 export type MvpRecognitionLanguage = (typeof MVP_RECOGNITION_LANGUAGES)[number];
+export type MvpMeetingLanguage = (typeof MVP_MEETING_LANGUAGES)[number];
+export type MvpAudioSourceMode = (typeof MVP_AUDIO_SOURCE_MODES)[number];
+export type MvpProviderClass = (typeof MVP_PROVIDER_CLASSES)[number];
+export type MvpSummaryJobStatus = (typeof MVP_SUMMARY_JOB_STATUSES)[number];
+export type MvpDeleteEntryType = (typeof MVP_DELETE_ENTRY_TYPES)[number];
+export type MvpSearchScope = (typeof MVP_SEARCH_SCOPES)[number];
 export type MvpTranslationStatus = (typeof MVP_TRANSLATION_STATUSES)[number];
+export type MvpDiskStatus = (typeof MVP_DISK_STATUSES)[number];
+export type MvpTranslationRetryStatus = (typeof MVP_TRANSLATION_RETRY_STATUSES)[number];
+export type MvpInterruptedAction = (typeof MVP_INTERRUPTED_ACTIONS)[number];
 export type AudioSourceId = "system" | "microphone";
-export type AudioSourceStatus = "ready" | "capturing" | "degraded" | "error";
+export type AudioSourceStatus = "disabled" | "ready" | "capturing" | "degraded" | "error";
 export type DurabilityStatus =
   | "initializing"
   | "ready"
@@ -100,6 +132,8 @@ export type TranslationConfig = {
 
 export type TranslationPreference = Omit<TranslationConfig, "apiKey"> & {
   version: 1;
+  provider: string;
+  baseUrl: "";
 };
 
 export type TranslationProbe = {
@@ -122,6 +156,184 @@ export type MvpExportResult = {
   snapshotId: string;
   finalCount: number;
   artifacts: ExportArtifact[];
+};
+
+export type MeetingListItem = {
+  meetingId: string;
+  title: string;
+  status: DurabilityStatus;
+  startedAt: string;
+  updatedAt: string;
+  durationMs: string;
+  language: MvpMeetingLanguage;
+  savedFinalCount: string;
+  translationFailedCount: number;
+  summaryStatus: MvpSummaryJobStatus;
+  tags: string[];
+};
+
+export type MeetingListPage = {
+  items: MeetingListItem[];
+  nextCursor: string | null;
+  total: number;
+  pageSize: number;
+  elapsedMs: number;
+};
+
+export type MeetingDetail = {
+  meeting: MeetingListItem;
+  segments: TranscriptSegment[];
+  summary: SummaryResult | null;
+};
+
+export type SegmentSearchHit = {
+  meetingId: string;
+  meetingTitle: string;
+  segmentId: string | null;
+  sequence: string | null;
+  scope: MvpSearchScope;
+  snippet: string;
+  score: number;
+};
+
+export type SegmentSearchPage = {
+  hits: SegmentSearchHit[];
+  nextCursor: string | null;
+  total: number;
+  elapsedMs: number;
+};
+
+export type ProviderProfile = {
+  profileId: string;
+  label: string;
+  class: MvpProviderClass;
+  baseUrl: string;
+  model: string;
+  policyUrl: string | null;
+  dataFlow: string;
+  configVersion: number;
+  secretState: "missing" | "present" | "not_required" | "unsupported";
+  lastTestStatus: "untested" | "passed" | "failed";
+  lastTestAt: string | null;
+  lastError: string | null;
+};
+
+export type ProviderProfileDraft = Pick<
+  ProviderProfile,
+  "profileId" | "label" | "class" | "baseUrl" | "model" | "policyUrl" | "dataFlow" | "configVersion"
+>;
+
+export type DeletePreviewEntry = {
+  type: MvpDeleteEntryType;
+  path: string | null;
+  byteLength: string;
+  description: string;
+};
+
+export type DeletePreview = {
+  meetingId: string;
+  recoveryWindowSeconds: number;
+  includeRaw: boolean;
+  includeDerived: boolean;
+  entries: DeletePreviewEntry[];
+  willDeleteBytes: string;
+  canRestore: boolean;
+};
+
+export type DeleteResult = {
+  meetingId: string;
+  deleted: boolean;
+  restoredUntil: string | null;
+  entriesDeleted: number;
+  bytesDeleted: string;
+};
+
+export type SummaryCitation = {
+  segmentId: string | null;
+  sequence: string | null;
+  label: string;
+};
+
+export type SummaryResult = {
+  summaryId: string;
+  version: number;
+  language: MvpRecognitionLanguage;
+  overview: string;
+  actions: string[];
+  decisions: string[];
+  openQuestions: string[];
+  citations: SummaryCitation[];
+  createdAt: string;
+};
+
+export type SummaryJob = {
+  jobId: string;
+  meetingId: string;
+  status: MvpSummaryJobStatus;
+  version: number;
+  totalChunks: number;
+  completedChunks: number;
+  canCancel: boolean;
+  canRetry: boolean;
+  message: string | null;
+  result: SummaryResult | null;
+};
+
+export type ExportOptions = {
+  formats: MvpExportFormat[];
+  includeOriginal: boolean;
+  includeTranslation: boolean;
+  bilingual: boolean;
+  includeSpeaker: boolean;
+  includeSummary: boolean;
+  includeTimestamp: boolean;
+  summaryVersion: number | null;
+};
+
+export type DiskHealthSnapshot = {
+  status: MvpDiskStatus;
+  dataDir: string;
+  freeBytes: string;
+  requiredBytes: string;
+  warning: string | null;
+};
+
+export type TranslationRetryProgress = {
+  batchId: string | null;
+  status: MvpTranslationRetryStatus;
+  total: number;
+  progress: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  costRiskAccepted: boolean;
+  message: string | null;
+};
+
+export type DiagnosticBundleResult = {
+  path: string;
+  byteLength: number;
+  sha256: string;
+  redacted: true;
+};
+
+export type InterruptedMeeting = {
+  meetingId: string;
+  startedAt: string;
+  updatedAt: string;
+  savedFinalCount: string;
+  pendingFinalCount: string;
+  translationFailedCount: number;
+  reason: string | null;
+  recommendedAction: MvpInterruptedAction;
+};
+
+export type SegmentAudioLocation = {
+  available: boolean;
+  path: string | null;
+  offsetMs: string | null;
+  durationMs: string | null;
+  reason: string | null;
 };
 
 export type MvpSnapshot = {
@@ -147,6 +359,7 @@ export type MvpSnapshot = {
   finals: TranscriptSegment[];
   queueDepth: number;
   translationQueueDepth: number;
+  disk: DiskHealthSnapshot;
   error: string | null;
 };
 
@@ -157,6 +370,10 @@ export function hasAllMvpExportFormats(formats: readonly MvpExportFormat[]): boo
 
 export function parseMvpRecognitionLanguage(value: unknown): MvpRecognitionLanguage {
   return enumValue(value, "recognition language", MVP_RECOGNITION_LANGUAGES);
+}
+
+export function parseMvpAudioSourceMode(value: unknown): MvpAudioSourceMode {
+  return enumValue(value, "audio source mode", MVP_AUDIO_SOURCE_MODES);
 }
 
 export function isMvpActiveLifecycle(lifecycle: MvpLifecycle): boolean {
@@ -244,7 +461,10 @@ export function formatMvpErrorMessage(value: unknown): string {
 export function formatMvpSnapshotError(
   snapshot: Pick<MvpSnapshot, "error" | "system" | "microphone">,
 ): string {
-  const error = snapshot.error ?? snapshot.system.error ?? snapshot.microphone.error;
+  const systemError = snapshot.system.status === "disabled" ? null : snapshot.system.error;
+  const microphoneError =
+    snapshot.microphone.status === "disabled" ? null : snapshot.microphone.error;
+  const error = snapshot.error ?? systemError ?? microphoneError;
   return error === null ? "" : formatMvpErrorMessage(error);
 }
 
@@ -252,7 +472,7 @@ const UINT64_MAX = 18_446_744_073_709_551_615n;
 const CANONICAL_UNSIGNED_DECIMAL = /^(?:0|[1-9][0-9]*)$/;
 const IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-fA-F0-9]{64}$/;
-const SOURCE_STATUSES = ["ready", "capturing", "degraded", "error"] as const;
+const SOURCE_STATUSES = ["disabled", "ready", "capturing", "degraded", "error"] as const;
 const DURABILITY_STATUSES = [
   "initializing",
   "ready",
@@ -265,6 +485,8 @@ const DURABILITY_STATUSES = [
 const TRANSLATION_STATUSES = MVP_TRANSLATION_STATUSES;
 const MAX_AUDIO_DEVICES_PER_ROLE = 256;
 const MAX_AUDIO_DEVICE_ID_LENGTH = 1024;
+const MAX_TAGS_PER_MEETING = 32;
+const TAG_TEXT = /^[^\u0000-\u001f\u007f]{1,64}$/;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -558,6 +780,14 @@ export function parseTranslationProbe(value: unknown): TranslationProbe {
   };
 }
 
+function providerKey(value: unknown): string {
+  const key = boundedString(value, "translation provider", 64).trim();
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(key)) {
+    throw new Error("translation provider is invalid.");
+  }
+  return key;
+}
+
 export function parseTranslationPreference(
   serialized: string | null,
 ): TranslationPreference | null {
@@ -565,13 +795,15 @@ export function parseTranslationPreference(
   try {
     const preference = object(JSON.parse(serialized), "translation preference");
     if (preference.version !== 1) return null;
-    const baseUrl = boundedString(preference.baseUrl, "translation base URL", 512).trim();
     const model = boundedString(preference.model, "translation model", 256).trim();
-    if (baseUrl.length === 0 || model.length === 0) return null;
+    if (model.length === 0) return null;
+    if ("apiKey" in preference || "Authorization" in preference) return null;
+    if (preference.baseUrl !== undefined && preference.baseUrl !== "") return null;
     return {
       version: 1,
       enabled: boolean(preference.enabled, "translation enabled"),
-      baseUrl,
+      provider: providerKey(preference.provider ?? "custom"),
+      baseUrl: "",
       model,
       targetLanguage: parseMvpRecognitionLanguage(preference.targetLanguage),
       allowInsecureHttp:
@@ -582,6 +814,98 @@ export function parseTranslationPreference(
   } catch {
     return null;
   }
+}
+
+function diskHealth(value: unknown): DiskHealthSnapshot {
+  const disk = object(value, "disk health");
+  return {
+    status: enumValue(disk.status, "disk.status", MVP_DISK_STATUSES),
+    dataDir: boundedString(disk.dataDir, "disk.dataDir", 1024),
+    freeBytes: uint64(disk.freeBytes, "disk.freeBytes"),
+    requiredBytes: uint64(disk.requiredBytes, "disk.requiredBytes"),
+    warning: nullableString(disk.warning, "disk.warning", 512),
+  };
+}
+
+export function parseTranslationRetryProgress(value: unknown): TranslationRetryProgress {
+  const progress = object(value, "translation retry progress");
+  const total = safeCount(progress.total, "retry.total");
+  const completed = safeCount(progress.progress, "retry.progress");
+  const succeeded = safeCount(progress.succeeded, "retry.succeeded");
+  const failed = safeCount(progress.failed, "retry.failed");
+  const cancelled = safeCount(progress.cancelled, "retry.cancelled");
+  if (completed > total || succeeded + failed + cancelled > total) {
+    throw new Error("translation retry progress counters are inconsistent.");
+  }
+  return {
+    batchId: nullableIdentifier(progress.batchId, "retry.batchId"),
+    status: enumValue(progress.status, "retry.status", MVP_TRANSLATION_RETRY_STATUSES),
+    total,
+    progress: completed,
+    succeeded,
+    failed,
+    cancelled,
+    costRiskAccepted: boolean(progress.costRiskAccepted, "retry.costRiskAccepted"),
+    message: nullableString(progress.message, "retry.message", 512),
+  };
+}
+
+export function parseDiagnosticBundleResult(value: unknown): DiagnosticBundleResult {
+  const result = object(value, "diagnostic bundle");
+  const sha256 = boundedString(result.sha256, "diagnostic.sha256", 64);
+  if (!SHA256.test(sha256)) throw new Error("diagnostic.sha256 must be a SHA-256 hex digest.");
+  if (result.redacted !== true) throw new Error("diagnostic bundle must be redacted.");
+  return {
+    path: boundedString(result.path, "diagnostic.path", 1024),
+    byteLength: safeCount(result.byteLength, "diagnostic.byteLength"),
+    sha256,
+    redacted: true,
+  };
+}
+
+function interruptedMeeting(value: unknown): InterruptedMeeting {
+  const meeting = object(value, "interrupted meeting");
+  return {
+    meetingId: identifier(meeting.meetingId, "interrupted.meetingId"),
+    startedAt: boundedString(meeting.startedAt, "interrupted.startedAt", 64),
+    updatedAt: boundedString(meeting.updatedAt, "interrupted.updatedAt", 64),
+    savedFinalCount: uint64(meeting.savedFinalCount, "interrupted.savedFinalCount"),
+    pendingFinalCount: uint64(meeting.pendingFinalCount, "interrupted.pendingFinalCount"),
+    translationFailedCount: safeCount(
+      meeting.translationFailedCount,
+      "interrupted.translationFailedCount",
+    ),
+    reason: nullableString(meeting.reason, "interrupted.reason", 512),
+    recommendedAction: enumValue(
+      meeting.recommendedAction,
+      "interrupted.recommendedAction",
+      MVP_INTERRUPTED_ACTIONS,
+    ),
+  };
+}
+
+export function parseInterruptedMeetings(value: unknown): InterruptedMeeting[] {
+  if (!Array.isArray(value) || value.length > 128) {
+    throw new Error("interrupted meetings must be a bounded array.");
+  }
+  return value.map(interruptedMeeting);
+}
+
+export function parseSegmentAudioLocation(value: unknown): SegmentAudioLocation {
+  const location = object(value, "segment audio location");
+  const available = boolean(location.available, "audio.available");
+  const path = nullableString(location.path, "audio.path", 1024);
+  const offsetMs = location.offsetMs === null ? null : uint64(location.offsetMs, "audio.offsetMs");
+  const durationMs =
+    location.durationMs === null ? null : uint64(location.durationMs, "audio.durationMs");
+  const reason = nullableString(location.reason, "audio.reason", 512);
+  if (available && (path === null || offsetMs === null || durationMs === null)) {
+    throw new Error("available segment audio must include path and time range.");
+  }
+  if (!available && reason === null) {
+    throw new Error("unavailable segment audio must include a reason.");
+  }
+  return { available, path, offsetMs, durationMs, reason };
 }
 
 export function requiresInsecureRemoteHttpAcknowledgement(baseUrl: string): boolean {
@@ -597,6 +921,25 @@ export function requiresInsecureRemoteHttpAcknowledgement(baseUrl: string): bool
 
 function exportFormat(value: unknown): MvpExportFormat {
   return enumValue(value, "export format", MVP_EXPORT_FORMATS);
+}
+
+function tag(value: unknown, label: string): string {
+  const text = boundedString(value, label, 64).trim();
+  if (!TAG_TEXT.test(text)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return text;
+}
+
+function tags(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > MAX_TAGS_PER_MEETING) {
+    throw new Error(`${label} must be a bounded array.`);
+  }
+  const parsed = value.map((entry, index) => tag(entry, `${label}[${index}]`));
+  if (new Set(parsed).size !== parsed.length) {
+    throw new Error(`${label} contains duplicates.`);
+  }
+  return parsed;
 }
 
 function exportArtifact(value: unknown): ExportArtifact {
@@ -623,6 +966,283 @@ export function parseMvpExportResult(value: unknown): MvpExportResult {
     snapshotId: identifier(result.snapshotId, "snapshotId"),
     finalCount: safeCount(result.finalCount, "export.finalCount"),
     artifacts: result.artifacts.map(exportArtifact),
+  };
+}
+
+function summaryStatus(value: unknown, label: string): MvpSummaryJobStatus {
+  return enumValue(value, label, MVP_SUMMARY_JOB_STATUSES);
+}
+
+function providerClass(value: unknown, label: string): MvpProviderClass {
+  return enumValue(value, label, MVP_PROVIDER_CLASSES);
+}
+
+function searchScope(value: unknown, label: string): MvpSearchScope {
+  return enumValue(value, label, MVP_SEARCH_SCOPES);
+}
+
+function meetingListItem(value: unknown, label: string): MeetingListItem {
+  const meeting = object(value, label);
+  return {
+    meetingId: identifier(meeting.meetingId, `${label}.meetingId`),
+    title: boundedString(meeting.title, `${label}.title`, 256),
+    status: enumValue(meeting.status, `${label}.status`, DURABILITY_STATUSES),
+    startedAt: boundedString(meeting.startedAt, `${label}.startedAt`, 64),
+    updatedAt: boundedString(meeting.updatedAt, `${label}.updatedAt`, 64),
+    durationMs: uint64(meeting.durationMs, `${label}.durationMs`),
+    language: enumValue(meeting.language, `${label}.language`, MVP_MEETING_LANGUAGES),
+    savedFinalCount: uint64(meeting.savedFinalCount, `${label}.savedFinalCount`),
+    translationFailedCount: safeCount(
+      meeting.translationFailedCount,
+      `${label}.translationFailedCount`,
+    ),
+    summaryStatus: summaryStatus(meeting.summaryStatus, `${label}.summaryStatus`),
+    tags: tags(meeting.tags, `${label}.tags`),
+  };
+}
+
+export function parseMeetingListPage(value: unknown): MeetingListPage {
+  const page = object(value, "meeting list page");
+  if (!Array.isArray(page.items) || page.items.length > 200) {
+    throw new Error("meeting list page items are invalid.");
+  }
+  const pageSize = safeCount(page.pageSize, "meeting pageSize");
+  if (pageSize === 0 || pageSize > 200 || page.items.length > pageSize) {
+    throw new Error("meeting pageSize is outside the UI bound.");
+  }
+  return {
+    items: page.items.map((item, index) => meetingListItem(item, `items[${index}]`)),
+    nextCursor: nullableString(page.nextCursor, "meeting nextCursor", 256),
+    total: safeCount(page.total, "meeting total"),
+    pageSize,
+    elapsedMs: safeCount(page.elapsedMs, "meeting elapsedMs"),
+  };
+}
+
+export function parseMeetingDetail(value: unknown): MeetingDetail {
+  const detail = object(value, "meeting detail");
+  if (!Array.isArray(detail.segments) || detail.segments.length > 10_000) {
+    throw new Error("meeting detail segments are invalid.");
+  }
+  return {
+    meeting: meetingListItem(detail.meeting, "detail.meeting"),
+    segments: detail.segments.map((item) => transcript(item, true)),
+    summary: detail.summary === null ? null : summaryResult(detail.summary),
+  };
+}
+
+function segmentSearchHit(value: unknown, label: string): SegmentSearchHit {
+  const hit = object(value, label);
+  const score = hit.score;
+  if (typeof score !== "number" || !Number.isFinite(score) || score < 0) {
+    throw new Error(`${label}.score must be a non-negative finite number.`);
+  }
+  return {
+    meetingId: identifier(hit.meetingId, `${label}.meetingId`),
+    meetingTitle: boundedString(hit.meetingTitle, `${label}.meetingTitle`, 256),
+    segmentId: nullableIdentifier(hit.segmentId, `${label}.segmentId`),
+    sequence: hit.sequence === null ? null : uint64(hit.sequence, `${label}.sequence`),
+    scope: searchScope(hit.scope, `${label}.scope`),
+    snippet: boundedString(hit.snippet, `${label}.snippet`, 1024),
+    score,
+  };
+}
+
+export function parseSegmentSearchPage(value: unknown): SegmentSearchPage {
+  const page = object(value, "segment search page");
+  if (!Array.isArray(page.hits) || page.hits.length > 200) {
+    throw new Error("segment search hits are invalid.");
+  }
+  return {
+    hits: page.hits.map((hit, index) => segmentSearchHit(hit, `hits[${index}]`)),
+    nextCursor: nullableString(page.nextCursor, "segment search nextCursor", 256),
+    total: safeCount(page.total, "segment search total"),
+    elapsedMs: safeCount(page.elapsedMs, "segment search elapsedMs"),
+  };
+}
+
+export function parseProviderProfiles(value: unknown): ProviderProfile[] {
+  if (!Array.isArray(value) || value.length > 64) {
+    throw new Error("provider profiles must be a bounded array.");
+  }
+  return value.map((entry, index) => {
+    const profile = object(entry, `provider[${index}]`);
+    const configVersion = safeCount(profile.configVersion, `provider[${index}].configVersion`);
+    if (configVersion === 0) {
+      throw new Error("provider configVersion must be positive.");
+    }
+    return {
+      profileId: identifier(profile.profileId, `provider[${index}].profileId`),
+      label: boundedString(profile.label, `provider[${index}].label`, 128),
+      class: providerClass(profile.class, `provider[${index}].class`),
+      baseUrl: boundedString(profile.baseUrl, `provider[${index}].baseUrl`, 640),
+      model: boundedString(profile.model, `provider[${index}].model`, 256),
+      policyUrl: nullableString(profile.policyUrl, `provider[${index}].policyUrl`, 640),
+      dataFlow: boundedString(profile.dataFlow, `provider[${index}].dataFlow`, 1024),
+      configVersion,
+      secretState: enumValue(profile.secretState, `provider[${index}].secretState`, [
+        "missing",
+        "present",
+        "not_required",
+        "unsupported",
+      ] as const),
+      lastTestStatus: enumValue(profile.lastTestStatus, `provider[${index}].lastTestStatus`, [
+        "untested",
+        "passed",
+        "failed",
+      ] as const),
+      lastTestAt: nullableString(profile.lastTestAt, `provider[${index}].lastTestAt`, 64),
+      lastError: nullableString(profile.lastError, `provider[${index}].lastError`, 512),
+    };
+  });
+}
+
+export function parseProviderProfileDraft(value: unknown): ProviderProfileDraft {
+  const profile = object(value, "provider profile draft");
+  const configVersion = safeCount(profile.configVersion, "provider draft.configVersion");
+  if (configVersion === 0) {
+    throw new Error("provider draft configVersion must be positive.");
+  }
+  return {
+    profileId: identifier(profile.profileId, "provider draft.profileId"),
+    label: boundedString(profile.label, "provider draft.label", 128),
+    class: providerClass(profile.class, "provider draft.class"),
+    baseUrl: boundedString(profile.baseUrl, "provider draft.baseUrl", 640),
+    model: boundedString(profile.model, "provider draft.model", 256),
+    policyUrl: nullableString(profile.policyUrl, "provider draft.policyUrl", 640),
+    dataFlow: boundedString(profile.dataFlow, "provider draft.dataFlow", 1024),
+    configVersion,
+  };
+}
+
+function deletePreviewEntry(value: unknown, label: string): DeletePreviewEntry {
+  const entry = object(value, label);
+  return {
+    type: enumValue(entry.type, `${label}.type`, MVP_DELETE_ENTRY_TYPES),
+    path: nullableString(entry.path, `${label}.path`, 1024),
+    byteLength: uint64(entry.byteLength, `${label}.byteLength`),
+    description: boundedString(entry.description, `${label}.description`, 512),
+  };
+}
+
+export function parseDeletePreview(value: unknown): DeletePreview {
+  const preview = object(value, "delete preview");
+  if (!Array.isArray(preview.entries) || preview.entries.length > 1024) {
+    throw new Error("delete preview entries are invalid.");
+  }
+  const recoveryWindowSeconds = safeCount(
+    preview.recoveryWindowSeconds,
+    "delete recoveryWindowSeconds",
+  );
+  if (recoveryWindowSeconds > 86_400) {
+    throw new Error("delete recovery window is outside the UI bound.");
+  }
+  return {
+    meetingId: identifier(preview.meetingId, "delete.meetingId"),
+    recoveryWindowSeconds,
+    includeRaw: boolean(preview.includeRaw, "delete.includeRaw"),
+    includeDerived: boolean(preview.includeDerived, "delete.includeDerived"),
+    entries: preview.entries.map((entry, index) => deletePreviewEntry(entry, `entries[${index}]`)),
+    willDeleteBytes: uint64(preview.willDeleteBytes, "delete.willDeleteBytes"),
+    canRestore: boolean(preview.canRestore, "delete.canRestore"),
+  };
+}
+
+export function parseDeleteResult(value: unknown): DeleteResult {
+  const result = object(value, "delete result");
+  return {
+    meetingId: identifier(result.meetingId, "deleteResult.meetingId"),
+    deleted: boolean(result.deleted, "deleteResult.deleted"),
+    restoredUntil: nullableString(result.restoredUntil, "deleteResult.restoredUntil", 64),
+    entriesDeleted: safeCount(result.entriesDeleted, "deleteResult.entriesDeleted"),
+    bytesDeleted: uint64(result.bytesDeleted, "deleteResult.bytesDeleted"),
+  };
+}
+
+function summaryCitation(value: unknown, label: string): SummaryCitation {
+  const citation = object(value, label);
+  const segmentId = nullableIdentifier(citation.segmentId, `${label}.segmentId`);
+  const sequence = citation.sequence === null ? null : uint64(citation.sequence, `${label}.sequence`);
+  return {
+    segmentId,
+    sequence,
+    label: boundedString(citation.label, `${label}.label`, 128),
+  };
+}
+
+function boundedStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > 256) {
+    throw new Error(`${label} must be a bounded array.`);
+  }
+  return value.map((entry, index) => boundedString(entry, `${label}[${index}]`, 2048));
+}
+
+function summaryResult(value: unknown): SummaryResult {
+  const result = object(value, "summary result");
+  if (!Array.isArray(result.citations) || result.citations.length > 1024) {
+    throw new Error("summary citations are invalid.");
+  }
+  const version = safeCount(result.version, "summary.version");
+  if (version === 0) throw new Error("summary version must be positive.");
+  return {
+    summaryId: identifier(result.summaryId, "summary.summaryId"),
+    version,
+    language: parseMvpRecognitionLanguage(result.language),
+    overview: boundedString(result.overview, "summary.overview", 32_768),
+    actions: boundedStringArray(result.actions, "summary.actions"),
+    decisions: boundedStringArray(result.decisions, "summary.decisions"),
+    openQuestions: boundedStringArray(result.openQuestions, "summary.openQuestions"),
+    citations: result.citations.map((entry, index) => summaryCitation(entry, `citations[${index}]`)),
+    createdAt: boundedString(result.createdAt, "summary.createdAt", 64),
+  };
+}
+
+export function parseSummaryJob(value: unknown): SummaryJob {
+  const job = object(value, "summary job");
+  const totalChunks = safeCount(job.totalChunks, "summary.totalChunks");
+  const completedChunks = safeCount(job.completedChunks, "summary.completedChunks");
+  if (completedChunks > totalChunks) {
+    throw new Error("summary chunk counters are inconsistent.");
+  }
+  return {
+    jobId: identifier(job.jobId, "summary.jobId"),
+    meetingId: identifier(job.meetingId, "summary.meetingId"),
+    status: summaryStatus(job.status, "summary.status"),
+    version: safeCount(job.version, "summary.version"),
+    totalChunks,
+    completedChunks,
+    canCancel: boolean(job.canCancel, "summary.canCancel"),
+    canRetry: boolean(job.canRetry, "summary.canRetry"),
+    message: nullableString(job.message, "summary.message", 512),
+    result: job.result === null ? null : summaryResult(job.result),
+  };
+}
+
+export function parseExportOptions(value: unknown): ExportOptions {
+  const options = object(value, "export options");
+  if (!Array.isArray(options.formats) || options.formats.length === 0) {
+    throw new Error("export options must include at least one format.");
+  }
+  const formats = options.formats.map(exportFormat);
+  if (new Set(formats).size !== formats.length) {
+    throw new Error("export options contain duplicate formats.");
+  }
+  const summaryVersion =
+    options.summaryVersion === null || options.summaryVersion === undefined
+      ? null
+      : safeCount(options.summaryVersion, "export.summaryVersion");
+  if (summaryVersion === 0) {
+    throw new Error("export summaryVersion must be positive.");
+  }
+  return {
+    formats,
+    includeOriginal: boolean(options.includeOriginal, "export.includeOriginal"),
+    includeTranslation: boolean(options.includeTranslation, "export.includeTranslation"),
+    bilingual: boolean(options.bilingual, "export.bilingual"),
+    includeSpeaker: boolean(options.includeSpeaker, "export.includeSpeaker"),
+    includeSummary: boolean(options.includeSummary, "export.includeSummary"),
+    includeTimestamp: boolean(options.includeTimestamp, "export.includeTimestamp"),
+    summaryVersion,
   };
 }
 
@@ -690,6 +1310,7 @@ export function parseMvpSnapshot(value: unknown): MvpSnapshot {
     finals: snapshot.finals.map((item) => transcript(item, true)),
     queueDepth: snapshot.queueDepth,
     translationQueueDepth: snapshot.translationQueueDepth,
+    disk: diskHealth(snapshot.disk),
     error: nullableString(snapshot.error, "snapshot.error", 256),
   };
 }
