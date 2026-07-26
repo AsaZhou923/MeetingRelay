@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { Window } from "@tauri-apps/api/window";
 
 import {
   AUDIO_DEVICE_PREFERENCE_KEY,
@@ -27,6 +28,8 @@ import {
   parseMvpSnapshot,
   parseSegmentAudioLocation,
   parseSegmentSearchPage,
+  parseSpeakerDiarizationResult,
+  parseSpeakerVersion,
   parseSummaryJob,
   parseTranslationPreference,
   parseTranslationProbe,
@@ -49,6 +52,9 @@ import {
   type ProviderProfileDraft,
   type SegmentAudioLocation,
   type SegmentSearchPage,
+  type SpeakerAssignment,
+  type SpeakerIdentity,
+  type SpeakerVersion,
   type SummaryJob,
   type TranscriptSegment,
   type TranslationConfig,
@@ -62,7 +68,8 @@ const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("MeetingRelay app root is missing.");
 
 app.innerHTML = `
-  <main class="relay-shell">
+  <a class="skip-link" href="#transcript-title">Skip to live transcript</a>
+  <main id="main-content" class="relay-shell">
     <header class="masthead">
       <div class="brand-lockup">
         <p class="kicker">PRIVATE MEETING CAPTURE / WINDOWS</p>
@@ -75,7 +82,7 @@ app.innerHTML = `
     </header>
 
     <section class="workspace">
-      <aside class="control-rail" aria-label="Session controls">
+      <aside class="control-rail" aria-label="Session controls and input settings">
         <div class="rail-index">01 / INPUT</div>
         <h2>声音源</h2>
         <div class="device-pickers" aria-label="音频设备选择">
@@ -260,6 +267,7 @@ app.innerHTML = `
           <div class="session-clock">
             <span id="lifecycle">BOOTING</span>
             <strong id="elapsed">00:00:00</strong>
+            <button id="overlay-toggle" class="secondary-button overlay-toggle" type="button" aria-pressed="false" disabled>Show overlay</button>
           </div>
         </div>
         <div class="transcript-viewport">
@@ -326,6 +334,60 @@ element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
             <input id="detail-tags" type="text" placeholder="Edit tags, comma separated" spellcheck="false" />
             <button id="detail-save-tags" class="secondary-button" type="button" disabled>Save tags</button>
           </div>
+          <section class="speaker-workspace" aria-labelledby="speaker-title">
+            <div class="speaker-heading">
+              <div>
+                <span>R5 / SPEAKERS</span>
+                <h4 id="speaker-title">Speaker workspace</h4>
+              </div>
+              <div class="speaker-actions">
+                <button id="speaker-run" class="secondary-button" type="button" disabled>Run diarization</button>
+                <button id="speaker-refresh" class="secondary-button" type="button" disabled>Refresh</button>
+              </div>
+            </div>
+            <dl class="speaker-version">
+              <div><dt>Selected version</dt><dd id="speaker-version">none</dd></div>
+              <div><dt>Latest version</dt><dd id="speaker-latest-version">none</dd></div>
+              <div><dt>Algorithm</dt><dd id="speaker-algorithm">not run</dd></div>
+              <div><dt>Status</dt><dd id="speaker-status">Select a meeting.</dd></div>
+            </dl>
+            <div class="speaker-version-picker">
+              <label>
+                <span>Load speaker version</span>
+                <input id="speaker-version-input" type="number" min="1" step="1" inputmode="numeric" disabled />
+              </label>
+              <button id="speaker-load-version" class="secondary-button" type="button" disabled>Load version</button>
+              <p id="speaker-edit-note">Edits use the latest version only.</p>
+            </div>
+            <ol id="speaker-identities" class="speaker-identities" aria-live="polite"></ol>
+            <form id="speaker-rename-form" class="speaker-form" aria-label="Rename speaker">
+              <label>
+                <span>Speaker</span>
+                <select id="speaker-rename-id" disabled></select>
+              </label>
+              <label>
+                <span>New name</span>
+                <input id="speaker-rename-name" type="text" maxlength="80" spellcheck="false" disabled />
+              </label>
+              <button id="speaker-rename" class="secondary-button" type="submit" disabled>Rename</button>
+            </form>
+            <form id="speaker-merge-form" class="speaker-form" aria-label="Merge speakers">
+              <label>
+                <span>From</span>
+                <select id="speaker-merge-from" disabled></select>
+              </label>
+              <label>
+                <span>Into</span>
+                <select id="speaker-merge-into" disabled></select>
+              </label>
+              <label>
+                <span>Merged name</span>
+                <input id="speaker-merge-name" type="text" maxlength="80" spellcheck="false" disabled />
+              </label>
+              <button id="speaker-merge" class="secondary-button" type="submit" disabled>Merge</button>
+            </form>
+            <button id="speaker-undo" class="secondary-button" type="button" disabled>Undo last speaker edit</button>
+          </section>
           <ol id="detail-segments" class="detail-segments"></ol>
         </section>
 
@@ -385,6 +447,7 @@ element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
             <button id="export-selected" class="secondary-button" type="button" disabled>Export selected</button>
           </div>
           <fieldset class="format-grid">
+            <legend>Export formats</legend>
             <label><input type="checkbox" name="export-format" value="json" checked /> JSON</label>
             <label><input type="checkbox" name="export-format" value="markdown" checked /> Markdown</label>
             <label><input type="checkbox" name="export-format" value="txt" checked /> TXT</label>
@@ -392,10 +455,11 @@ element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
             <label><input type="checkbox" name="export-format" value="pdf" /> PDF</label>
           </fieldset>
           <fieldset class="format-grid">
+            <legend>Export content options</legend>
             <label><input id="export-original" type="checkbox" checked /> original</label>
             <label><input id="export-translation" type="checkbox" checked /> translation</label>
             <label><input id="export-bilingual" type="checkbox" checked /> bilingual</label>
-            <label><input id="export-speaker" type="checkbox" checked /> speaker</label>
+            <label><input id="export-speaker" type="checkbox" checked aria-describedby="export-speaker-note" /> speaker <small id="export-speaker-note">Run speaker diarization before exporting speaker labels.</small></label>
             <label><input id="export-summary" type="checkbox" checked /> summary</label>
             <label><input id="export-timestamp" type="checkbox" checked /> timestamp</label>
           </fieldset>
@@ -438,6 +502,7 @@ const controls = {
   error: element<HTMLParagraphElement>("#error"),
   lifecycle: element<HTMLSpanElement>("#lifecycle"),
   elapsed: element<HTMLElement>("#elapsed"),
+  overlayToggle: element<HTMLButtonElement>("#overlay-toggle"),
   model: element<HTMLElement>("#model-status"),
   empty: element<HTMLElement>("#empty-state"),
   transcript: element<HTMLOListElement>("#transcript"),
@@ -481,6 +546,26 @@ const controls = {
   detailSummary: element<HTMLElement>("#detail-summary"),
   detailTags: element<HTMLInputElement>("#detail-tags"),
   detailSaveTags: element<HTMLButtonElement>("#detail-save-tags"),
+  speakerRun: element<HTMLButtonElement>("#speaker-run"),
+  speakerRefresh: element<HTMLButtonElement>("#speaker-refresh"),
+  speakerVersion: element<HTMLElement>("#speaker-version"),
+  speakerLatestVersion: element<HTMLElement>("#speaker-latest-version"),
+  speakerAlgorithm: element<HTMLElement>("#speaker-algorithm"),
+  speakerStatus: element<HTMLElement>("#speaker-status"),
+  speakerVersionInput: element<HTMLInputElement>("#speaker-version-input"),
+  speakerLoadVersion: element<HTMLButtonElement>("#speaker-load-version"),
+  speakerEditNote: element<HTMLParagraphElement>("#speaker-edit-note"),
+  speakerIdentities: element<HTMLOListElement>("#speaker-identities"),
+  speakerRenameForm: element<HTMLFormElement>("#speaker-rename-form"),
+  speakerRenameId: element<HTMLSelectElement>("#speaker-rename-id"),
+  speakerRenameName: element<HTMLInputElement>("#speaker-rename-name"),
+  speakerRename: element<HTMLButtonElement>("#speaker-rename"),
+  speakerMergeForm: element<HTMLFormElement>("#speaker-merge-form"),
+  speakerMergeFrom: element<HTMLSelectElement>("#speaker-merge-from"),
+  speakerMergeInto: element<HTMLSelectElement>("#speaker-merge-into"),
+  speakerMergeName: element<HTMLInputElement>("#speaker-merge-name"),
+  speakerMerge: element<HTMLButtonElement>("#speaker-merge"),
+  speakerUndo: element<HTMLButtonElement>("#speaker-undo"),
   detailSegments: element<HTMLOListElement>("#detail-segments"),
   providerRefresh: element<HTMLButtonElement>("#provider-refresh"),
   providerList: element<HTMLElement>("#provider-list"),
@@ -513,8 +598,29 @@ const controls = {
   exportStudioStatus: element<HTMLParagraphElement>("#export-studio-status"),
 };
 
+for (const [control, label] of [
+  [controls.systemDevice, "Windows system output device"],
+  [controls.microphoneDevice, "Windows microphone device"],
+  [controls.recognitionLanguage, "Meeting recognition language"],
+  [controls.sourceMode, "Meeting audio source mode"],
+  [controls.translationProvider, "Translation provider preset"],
+  [controls.translationLanguage, "Translation target language"],
+  [controls.librarySearch, "Search meeting library"],
+  [controls.libraryTags, "Filter meeting library by tags"],
+  [controls.detailSequence, "Jump to detail segment number"],
+  [controls.speakerVersionInput, "Speaker version number to load"],
+  [controls.speakerRenameId, "Speaker to rename"],
+  [controls.speakerRenameName, "New speaker display name"],
+  [controls.speakerMergeFrom, "Speaker to merge from"],
+  [controls.speakerMergeInto, "Speaker to merge into"],
+  [controls.speakerMergeName, "Optional merged speaker display name"],
+] as const) {
+  control.setAttribute("aria-label", label);
+}
+
 let latest: MvpSnapshot | null = null;
 let lastExport: MvpExportResult | null = null;
+let overlayVisible = false;
 let pollTimer: number | null = null;
 let audioDevices: AudioDeviceInventory | null = null;
 let audioDeviceLoadError: string | null = null;
@@ -531,6 +637,8 @@ let audioPreview: HTMLAudioElement | null = null;
 let meetingPage: MeetingListPage | null = null;
 let searchPage: SegmentSearchPage | null = null;
 let meetingDetail: MeetingDetail | null = null;
+let latestSpeakerVersion: SpeakerVersion | null = null;
+let speakerVersion: SpeakerVersion | null = null;
 let providerProfiles: ProviderProfile[] = [];
 let selectedProviderId: string | null = null;
 let deletePreviewState: DeletePreview | null = null;
@@ -538,6 +646,7 @@ let summaryJob: SummaryJob | null = null;
 let summaryPollTimer: number | null = null;
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 const R3_PAGE_SIZE = 50;
+const CAPTION_OVERLAY_WINDOW_LABEL = "caption-overlay";
 
 function message(error: unknown): string {
   return formatMvpErrorMessage(error);
@@ -934,6 +1043,10 @@ function renderSource(source: AudioSourceSnapshot, paused: boolean): void {
             : "异常";
   element<HTMLElement>(`#${source.id}-frames`).textContent = `${source.frames} frames`;
   element<HTMLElement>(`#${source.id}-level`).style.transform = `scaleX(${source.peak})`;
+  card.setAttribute(
+    "aria-label",
+    `${source.label || source.id}: ${element<HTMLElement>(`#${source.id}-status`).textContent ?? ""}`,
+  );
 }
 
 function renderRecent(snapshot: MvpSnapshot): void {
@@ -971,6 +1084,12 @@ function renderExports(snapshot: MvpSnapshot): void {
   controls.exportSelected.disabled = !canExport(snapshot);
 }
 
+function renderOverlayToggle(snapshot: MvpSnapshot): void {
+  controls.overlayToggle.disabled = snapshot.meetingId === null && snapshot.interim === null && snapshot.finals.length === 0;
+  controls.overlayToggle.textContent = overlayVisible ? "Hide overlay" : "Show overlay";
+  controls.overlayToggle.setAttribute("aria-pressed", String(overlayVisible));
+}
+
 function tagFilters(): string[] {
   return controls.libraryTags.value
     .split(",")
@@ -980,6 +1099,126 @@ function tagFilters(): string[] {
 
 function selectedMeetingId(): string | null {
   return meetingDetail?.meeting.meetingId ?? latest?.meetingId ?? null;
+}
+
+function idempotencyKey(operation: string): string {
+  const random =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${operation}-${random}`;
+}
+
+function assignmentKey(segmentId: string, sequence: string): string {
+  return `${segmentId}\u0000${sequence}`;
+}
+
+function speakerNameMap(version: SpeakerVersion | null): Map<string, string> {
+  return new Map(version?.identities.map((identity) => [identity.speakerId, identity.displayName]) ?? []);
+}
+
+function speakerAssignmentMap(version: SpeakerVersion | null): Map<string, SpeakerAssignment> {
+  return new Map(
+    version?.assignments.map((assignment) => [
+      assignmentKey(assignment.segmentId, assignment.sequence),
+      assignment,
+    ]) ?? [],
+  );
+}
+
+function speakerAssignmentCounts(version: SpeakerVersion | null): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const assignment of version?.assignments ?? []) {
+    counts.set(assignment.speakerId, (counts.get(assignment.speakerId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function speakerOptions(identities: readonly SpeakerIdentity[]): HTMLOptionElement[] {
+  return identities.map((identity) => {
+    const option = document.createElement("option");
+    option.value = identity.speakerId;
+    option.textContent = identity.displayName;
+    return option;
+  });
+}
+
+function renderSpeakerWorkspace(): void {
+  const meetingId = selectedMeetingId();
+  const hasMeeting = meetingId !== null;
+  const version = speakerVersion?.meetingId === meetingId ? speakerVersion : null;
+  const latestVersion =
+    latestSpeakerVersion?.meetingId === meetingId ? latestSpeakerVersion : null;
+  const viewingLatest =
+    version !== null && latestVersion !== null && version.version === latestVersion.version;
+  const counts = speakerAssignmentCounts(version);
+  const canEdit = version !== null && viewingLatest && version.identities.length > 0;
+  const canMerge = version !== null && viewingLatest && version.identities.length > 1;
+  controls.speakerRun.disabled = !hasMeeting;
+  controls.speakerRefresh.disabled = !hasMeeting;
+  controls.speakerVersion.textContent = version === null ? "none" : String(version.version);
+  controls.speakerLatestVersion.textContent =
+    latestVersion === null ? "none" : String(latestVersion.version);
+  controls.speakerAlgorithm.textContent = version?.algorithm ?? "not run";
+  controls.speakerVersionInput.disabled = latestVersion === null;
+  controls.speakerVersionInput.min = "1";
+  controls.speakerVersionInput.max = latestVersion === null ? "1" : String(latestVersion.version);
+  controls.speakerVersionInput.value = version === null ? "" : String(version.version);
+  controls.speakerLoadVersion.disabled = latestVersion === null;
+  controls.speakerEditNote.dataset.status = viewingLatest ? "editable" : "readonly";
+  controls.speakerEditNote.textContent =
+    version === null
+      ? "Run speaker diarization before editing or exporting speaker labels."
+      : viewingLatest
+        ? "Editing is enabled for the latest speaker version."
+        : `Viewing historical speaker version ${version.version}; rename, merge, and undo are disabled until you return to latest ${latestVersion?.version ?? "version"}.`;
+  const preservedStatus = controls.speakerStatus.dataset.status ?? "";
+  if (!["loading", "failed", "unavailable", "skipped"].includes(preservedStatus)) {
+    controls.speakerStatus.textContent =
+      version === null
+        ? hasMeeting
+          ? "No completed speaker version yet."
+          : "Select a meeting."
+        : `${version.operation} completed · ${version.identities.length} speakers · ${version.assignments.length} assignments`;
+    controls.speakerStatus.dataset.status = version === null ? "empty" : "completed";
+  }
+  controls.speakerIdentities.replaceChildren(
+    ...(version?.identities.map((identity) => {
+      const item = document.createElement("li");
+      const name = document.createElement("strong");
+      const detail = document.createElement("span");
+      name.textContent = identity.displayName;
+      detail.textContent = `${identity.speakerId} · ${counts.get(identity.speakerId) ?? 0} assigned segment(s)`;
+      item.append(name, detail);
+      return item;
+    }) ?? []),
+  );
+  controls.speakerRenameId.replaceChildren(...speakerOptions(version?.identities ?? []));
+  controls.speakerMergeFrom.replaceChildren(...speakerOptions(version?.identities ?? []));
+  controls.speakerMergeInto.replaceChildren(...speakerOptions(version?.identities ?? []));
+  controls.speakerRenameId.disabled = !canEdit;
+  controls.speakerRenameName.disabled = !canEdit;
+  controls.speakerRename.disabled = !canEdit;
+  controls.speakerMergeFrom.disabled = !canMerge;
+  controls.speakerMergeInto.disabled = !canMerge;
+  controls.speakerMergeName.disabled = !canMerge;
+  controls.speakerMerge.disabled = !canMerge;
+  controls.speakerUndo.disabled = version === null || !viewingLatest || version.parentVersion === null;
+  controls.exportSpeaker.disabled = version === null;
+  controls.exportSpeaker.checked = version !== null && controls.exportSpeaker.checked;
+  controls.exportSpeaker.closest("label")?.setAttribute(
+    "title",
+    version === null
+      ? "Run speaker diarization before including speaker labels in export."
+      : `Speaker version ${version.version} will be included.`,
+  );
+  const speakerExportNote = document.querySelector<HTMLElement>("#export-speaker-note");
+  if (speakerExportNote !== null) {
+    speakerExportNote.textContent =
+      version === null
+        ? "Run speaker diarization before exporting speaker labels."
+        : `Speaker version ${version.version} ready.`;
+  }
 }
 
 function renderMeetingLibrary(): void {
@@ -1040,27 +1279,39 @@ function renderMeetingDetail(): void {
     controls.detailTags.value = "";
     controls.detailSaveTags.disabled = true;
     controls.detailSegments.replaceChildren();
+    renderSpeakerWorkspace();
     return;
   }
+  const assignments = speakerAssignmentMap(speakerVersion);
+  const names = speakerNameMap(speakerVersion);
   controls.detailSummary.textContent = `${detail.meeting.title} · ${detail.meeting.status} · ${formatElapsed(detail.meeting.durationMs)} · ${detail.meeting.savedFinalCount} finals`;
   controls.detailTags.value = detail.meeting.tags.join(", ");
   controls.detailSaveTags.disabled = false;
+  renderSpeakerWorkspace();
   controls.detailSegments.replaceChildren(
     ...detail.segments.slice(0, 200).map((segment) => {
       const item = document.createElement("li");
       item.id = `detail-segment-${segment.sequence}`;
       item.dataset.sequence = segment.sequence;
       item.dataset.segmentId = segment.segmentId;
+      item.tabIndex = -1;
       const header = document.createElement("strong");
       const text = document.createElement("p");
+      const speaker = document.createElement("p");
       const translation = document.createElement("p");
+      const assignment = assignments.get(assignmentKey(segment.segmentId, segment.sequence));
       header.textContent = `#${segment.sequence} · ${segment.startedAtMs}ms`;
+      speaker.className = "speaker-label";
+      speaker.textContent =
+        assignment === undefined
+          ? "Speaker: unassigned"
+          : `Speaker: ${names.get(assignment.speakerId) ?? assignment.speakerId} · confidence ${Math.round(assignment.confidence * 100)}%`;
       text.textContent = segment.text;
       translation.textContent =
         segment.translationStatus === "completed"
           ? segment.translationText ?? ""
           : `translation ${segment.translationStatus}`;
-      item.append(header, text, translation);
+      item.append(header, speaker, text, translation);
       return item;
     }),
   );
@@ -1073,6 +1324,7 @@ function renderProviderProfiles(): void {
       button.type = "button";
       button.className = "provider-profile";
       button.dataset.selected = String(profile.profileId === selectedProviderId);
+      button.setAttribute("aria-pressed", String(profile.profileId === selectedProviderId));
       button.textContent = `${profile.label} · ${profile.class} · v${profile.configVersion} · secret ${profile.secretState} · test ${profile.lastTestStatus}`;
       button.title = `${profile.baseUrl}\n${profile.model}\n${profile.dataFlow}${profile.policyUrl ? `\nPolicy: ${profile.policyUrl}` : ""}${profile.lastError ? `\nError: ${profile.lastError}` : ""}`;
       button.addEventListener("click", () => {
@@ -1399,6 +1651,7 @@ function render(snapshot: MvpSnapshot): void {
   controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
   renderAudioDeviceControls(active);
   renderTranslationControls(active);
+  renderOverlayToggle(snapshot);
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
   controls.translationQueue.textContent = controls.translationEnabled.checked
     ? `${snapshot.translationQueueDepth} / 32`
@@ -1463,6 +1716,34 @@ async function call(command: string, args?: Record<string, unknown>): Promise<Mv
   return parseMvpSnapshot(await invoke<unknown>(command, args));
 }
 
+async function captionOverlayWindow(): Promise<Window> {
+  const overlayWindow = await Window.getByLabel(CAPTION_OVERLAY_WINDOW_LABEL);
+  if (overlayWindow === null) {
+    throw new Error("CAPTION_OVERLAY_WINDOW_MISSING");
+  }
+  return overlayWindow;
+}
+
+async function syncOverlayState(): Promise<void> {
+  overlayVisible = await (await captionOverlayWindow()).isVisible();
+  if (latest !== null) renderOverlayToggle(latest);
+}
+
+async function setOverlayVisible(visible: boolean): Promise<void> {
+  controls.overlayToggle.disabled = true;
+  try {
+    const overlayWindow = await captionOverlayWindow();
+    if (visible) {
+      await overlayWindow.show();
+    } else {
+      await overlayWindow.hide();
+    }
+    overlayVisible = await overlayWindow.isVisible();
+  } finally {
+    if (latest !== null) renderOverlayToggle(latest);
+  }
+}
+
 async function openRecentMeeting(): Promise<void> {
   render(await call("mvp_open_recent"));
 }
@@ -1491,10 +1772,12 @@ async function exportMeetingWithOptions(): Promise<void> {
     includeOriginal: controls.exportOriginal.checked,
     includeTranslation: controls.exportTranslation.checked,
     bilingual: controls.exportBilingual.checked,
-    includeSpeaker: controls.exportSpeaker.checked,
+    includeSpeaker: controls.exportSpeaker.checked && speakerVersion !== null,
     includeSummary: controls.exportSummary.checked,
     includeTimestamp: controls.exportTimestamp.checked,
     summaryVersion: meetingDetail?.summary?.version ?? summaryJob?.result?.version ?? null,
+    speakerVersion:
+      controls.exportSpeaker.checked && speakerVersion !== null ? speakerVersion.version : null,
   });
   lastExport = parseMvpExportResult(
     await invoke<unknown>("mvp_export_meeting_options", {
@@ -1561,11 +1844,130 @@ async function loadMeetingDetail(
   sequence: string | null = null,
 ): Promise<void> {
   meetingDetail = parseMeetingDetail(await invoke<unknown>("mvp_meeting_detail", { meetingId }));
+  latestSpeakerVersion = parseSpeakerVersion(
+    await invoke<unknown>("mvp_speaker_latest", { meetingId }),
+  );
+  speakerVersion = latestSpeakerVersion;
+  controls.speakerStatus.dataset.status = "";
   deletePreviewState = null;
   renderMeetingDetail();
   renderDeletePreview();
   if (segmentId !== null || sequence !== null) focusDetailSegment(segmentId, sequence);
   if (latest) render(latest);
+}
+
+async function refreshSpeakerVersion(): Promise<void> {
+  const meetingId = selectedMeetingId();
+  if (meetingId === null) return;
+  latestSpeakerVersion = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
+  speakerVersion = latestSpeakerVersion;
+  renderMeetingDetail();
+}
+
+async function loadSpeakerVersion(): Promise<void> {
+  const meetingId = selectedMeetingId();
+  const latestVersion = latestSpeakerVersion;
+  if (meetingId === null || latestVersion === null) return;
+  const requested = Number(controls.speakerVersionInput.value);
+  if (!Number.isSafeInteger(requested) || requested < 1 || requested > latestVersion.version) {
+    throw new Error(`SPEAKER_VERSION_RANGE_1_TO_${latestVersion.version}`);
+  }
+  speakerVersion = parseSpeakerVersion(
+    await invoke<unknown>("mvp_speaker_version", { meetingId, version: requested }),
+  );
+  if (speakerVersion === null) throw new Error("SPEAKER_VERSION_NOT_FOUND");
+  controls.speakerStatus.dataset.status = "";
+  renderMeetingDetail();
+}
+
+async function runSpeakerDiarization(): Promise<void> {
+  const meetingId = selectedMeetingId();
+  if (meetingId === null) return;
+  controls.speakerStatus.dataset.status = "loading";
+  controls.speakerStatus.textContent = "Running speaker diarization...";
+  renderSpeakerWorkspace();
+  const result = parseSpeakerDiarizationResult(
+    await invoke<unknown>("mvp_speaker_diarize", { meetingId }),
+  );
+  if (result.status === "completed") {
+    latestSpeakerVersion = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
+    speakerVersion = latestSpeakerVersion;
+    controls.speakerStatus.dataset.status = "completed";
+    controls.speakerStatus.textContent = `Speaker diarization completed at version ${result.version}.`;
+  } else {
+    controls.speakerStatus.dataset.status = result.status;
+    controls.speakerStatus.textContent =
+      result.status === "unavailable"
+        ? `Speaker diarization unavailable: ${result.reason ?? "raw audio is required"}`
+        : result.status === "failed"
+          ? `Speaker diarization failed: ${result.reason ?? "unknown failure"}`
+          : `Speaker diarization skipped: ${result.reason ?? "no eligible transcript finals"}`;
+  }
+  renderMeetingDetail();
+}
+
+async function renameSpeaker(): Promise<void> {
+  const meetingId = selectedMeetingId();
+  if (meetingId === null || speakerVersion === null) return;
+  if (latestSpeakerVersion === null || speakerVersion.version !== latestSpeakerVersion.version) {
+    throw new Error("SPEAKER_EDIT_REQUIRES_LATEST_VERSION");
+  }
+  latestSpeakerVersion = parseSpeakerVersion(
+    await invoke<unknown>("mvp_speaker_rename", {
+      request: {
+        meetingId,
+        speakerId: controls.speakerRenameId.value,
+        displayName: controls.speakerRenameName.value.trim(),
+        baseVersion: speakerVersion.version,
+        idempotencyKey: idempotencyKey("speaker-rename"),
+      },
+    }),
+  );
+  speakerVersion = latestSpeakerVersion;
+  controls.speakerRenameName.value = "";
+  renderMeetingDetail();
+}
+
+async function mergeSpeakers(): Promise<void> {
+  const meetingId = selectedMeetingId();
+  if (meetingId === null || speakerVersion === null) return;
+  if (latestSpeakerVersion === null || speakerVersion.version !== latestSpeakerVersion.version) {
+    throw new Error("SPEAKER_EDIT_REQUIRES_LATEST_VERSION");
+  }
+  latestSpeakerVersion = parseSpeakerVersion(
+    await invoke<unknown>("mvp_speaker_merge", {
+      request: {
+        meetingId,
+        fromSpeakerId: controls.speakerMergeFrom.value,
+        intoSpeakerId: controls.speakerMergeInto.value,
+        displayName: controls.speakerMergeName.value.trim() || null,
+        baseVersion: speakerVersion.version,
+        idempotencyKey: idempotencyKey("speaker-merge"),
+      },
+    }),
+  );
+  speakerVersion = latestSpeakerVersion;
+  controls.speakerMergeName.value = "";
+  renderMeetingDetail();
+}
+
+async function undoSpeakerEdit(): Promise<void> {
+  const meetingId = selectedMeetingId();
+  if (meetingId === null || speakerVersion === null) return;
+  if (latestSpeakerVersion === null || speakerVersion.version !== latestSpeakerVersion.version) {
+    throw new Error("SPEAKER_EDIT_REQUIRES_LATEST_VERSION");
+  }
+  latestSpeakerVersion = parseSpeakerVersion(
+    await invoke<unknown>("mvp_speaker_undo", {
+      request: {
+        meetingId,
+        baseVersion: speakerVersion.version,
+        idempotencyKey: idempotencyKey("speaker-undo"),
+      },
+    }),
+  );
+  speakerVersion = latestSpeakerVersion;
+  renderMeetingDetail();
 }
 
 function focusDetailSegment(segmentId: string | null, sequence: string | null): void {
@@ -1578,7 +1980,13 @@ function focusDetailSegment(segmentId: string | null, sequence: string | null): 
   const target =
     selector.length === 0 ? null : controls.detailSegments.querySelector<HTMLElement>(selector);
   target?.scrollIntoView({ block: "center" });
-  if (target !== null) target.dataset.focused = "true";
+  if (target !== null) {
+    for (const row of controls.detailSegments.querySelectorAll<HTMLElement>("[data-focused]")) {
+      delete row.dataset.focused;
+    }
+    target.dataset.focused = "true";
+    target.focus({ preventScroll: true });
+  }
 }
 
 async function saveMeetingTags(): Promise<void> {
@@ -2102,6 +2510,17 @@ controls.pauseResume.addEventListener("click", async () => {
   }
 });
 
+controls.overlayToggle.addEventListener("click", async () => {
+  try {
+    await setOverlayVisible(!overlayVisible);
+  } catch (error) {
+    controls.error.textContent = `Overlay control failed: ${message(error)}`;
+    await syncOverlayState().catch((syncError) => {
+      controls.error.textContent = `Overlay control failed: ${message(error)}; state refresh failed: ${message(syncError)}`;
+    });
+  }
+});
+
 controls.openRecent.addEventListener("click", async () => {
   controls.openRecent.disabled = true;
   lastExport = null;
@@ -2175,6 +2594,80 @@ controls.detailSequence.addEventListener("change", () => {
   const sequence = controls.detailSequence.value.trim();
   if (sequence.length === 0) return;
   focusDetailSegment(null, sequence);
+});
+
+controls.speakerRun.addEventListener("click", async () => {
+  controls.speakerRun.disabled = true;
+  try {
+    await runSpeakerDiarization();
+  } catch (error) {
+    controls.speakerStatus.dataset.status = "failed";
+    controls.speakerStatus.textContent = `Speaker diarization failed: ${message(error)}`;
+  } finally {
+    renderSpeakerWorkspace();
+  }
+});
+
+controls.speakerRefresh.addEventListener("click", async () => {
+  controls.speakerRefresh.disabled = true;
+  try {
+    await refreshSpeakerVersion();
+  } catch (error) {
+    controls.speakerStatus.dataset.status = "failed";
+    controls.speakerStatus.textContent = `Speaker refresh failed: ${message(error)}`;
+  } finally {
+    renderSpeakerWorkspace();
+  }
+});
+
+controls.speakerLoadVersion.addEventListener("click", async () => {
+  controls.speakerLoadVersion.disabled = true;
+  try {
+    await loadSpeakerVersion();
+  } catch (error) {
+    controls.speakerStatus.dataset.status = "failed";
+    controls.speakerStatus.textContent = `Speaker version load failed: ${message(error)}`;
+  } finally {
+    renderSpeakerWorkspace();
+  }
+});
+
+controls.speakerRenameForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  controls.speakerRename.disabled = true;
+  try {
+    await renameSpeaker();
+  } catch (error) {
+    controls.speakerStatus.dataset.status = "failed";
+    controls.speakerStatus.textContent = `Speaker rename failed: ${message(error)}`;
+  } finally {
+    renderSpeakerWorkspace();
+  }
+});
+
+controls.speakerMergeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  controls.speakerMerge.disabled = true;
+  try {
+    await mergeSpeakers();
+  } catch (error) {
+    controls.speakerStatus.dataset.status = "failed";
+    controls.speakerStatus.textContent = `Speaker merge failed: ${message(error)}`;
+  } finally {
+    renderSpeakerWorkspace();
+  }
+});
+
+controls.speakerUndo.addEventListener("click", async () => {
+  controls.speakerUndo.disabled = true;
+  try {
+    await undoSpeakerEdit();
+  } catch (error) {
+    controls.speakerStatus.dataset.status = "failed";
+    controls.speakerStatus.textContent = `Speaker undo failed: ${message(error)}`;
+  } finally {
+    renderSpeakerWorkspace();
+  }
 });
 
 controls.providerRefresh.addEventListener("click", async () => {
@@ -2431,6 +2924,9 @@ renderRetryProgress(null);
 renderRecoveryCenter();
 
 void (async () => {
+  await syncOverlayState().catch((error) => {
+    controls.error.textContent = `Overlay window unavailable: ${message(error)}`;
+  });
   try {
     await loadAudioDevices();
   } catch (error) {

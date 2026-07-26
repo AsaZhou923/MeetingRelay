@@ -231,6 +231,7 @@ cargo test --workspace --all-targets --all-features
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/mvp/start.test.ps1
 pnpm mvp:release:personal:test
+pnpm mvp:acceptance:test
 ```
 
 CI 配置位于 [`.github/workflows/mvp.yml`](.github/workflows/mvp.yml)，在 Windows Server 2022 上执行依赖安装、前端验证、Rust 格式/Clippy/测试、锁定资产物化和 package-local Release 构建。
@@ -244,6 +245,7 @@ MeetingRelay/
 ├── crates/model-worker-contract/        # ASR 内部接口类型
 ├── tools/sherpa-native/                 # 锁定资产、校验与 runtime staging
 ├── tools/mvp/                           # Windows 启动和发布脚本
+├── tools/distribution/                  # NSIS staging、SBOM、签名与发布门禁
 └── .github/workflows/mvp.yml            # Windows 产品 CI
 ```
 
@@ -253,19 +255,18 @@ MeetingRelay/
 
 - 当前产品 ASR 固定为 Sherpa / SenseVoice，不提供 Whisper、FunASR 或自动 fallback。
 - 当前不做中日英混合识别；每场会议只选择一种识别语言。
-- OpenAI-compatible 翻译目前是 final 级非流式请求，尚无 token streaming、手动重试、上下文窗口、代理、自定义 Header/请求体或完整 provider provenance。
-- 60 分钟麦克风链路已经通过真实设备验收；系统输出有声回环和设备热插拔仍需继续验证。
-- 尚未完成 10–20 分钟真实翻译会议、第二台干净 Windows 电脑和签名安装包验收。
-- `MeetingRelay.exe` 未签名，公开附件不包含模型或 Sherpa runtime。
-- 尚未加入说话人区分、会议摘要、搜索、标签和原始音频回放。
+- OpenAI-compatible 翻译目前是 final 级非流式请求；已支持单段/整场手动重试和脱敏 attempt provenance，但仍不支持 token streaming、上下文窗口、代理和自定义 Header/请求体。
+- 60 分钟麦克风链路和有声系统输出短会已经通过真实设备验收；设备热插拔仍需继续验证。
+- 短会已通过本地 ASR → 远程翻译 → SQLite 全链路。仓库也加入了可重复执行的 Windows 验收门禁，覆盖 10–20 分钟 HTTPS 会议、费用/延迟/质量、2 小时双音源 loss/gap 和 timeline p95/max；这些长时真实证据仍需代表性硬件完成。
+- 已发布的 `MeetingRelay.exe` 未签名，公开附件不包含模型或 Sherpa runtime。仓库可构建带明确标记的未签名 NSIS 测试安装包；正式安装包仍等待资产再分发审批和 Authenticode 证书。
+- 已加入基于显式原始音频捕获的会后说话人区分。若原始音频缺失或不可读，系统会返回 unavailable/failed，不会用文本长度生成伪说话人版本。
 
 ## Roadmap
 
-- 完成代表性中、日、英会议的 ASR 与翻译质量验收。
-- 增加失败译文的单条与整场重试。
-- 验证有声系统输出 loopback 和设备热插拔。
-- 根据真实使用结果评估流式翻译、单一音源模式和原始音频保存。
-- 评估 Windows Credential Manager、签名安装包和第二台干净电脑验收。
+- 完成代表性中、日、英长会的 ASR、翻译质量、费用和时间轴验收。
+- 验证设备热插拔以及 2 小时 system/microphone/both 双源采集。
+- 根据真实使用结果评估流式翻译是否必要。
+- 审批锁定模型/runtime 的再分发记录，签名 NSIS 安装包与 bundled binary，并在第二台干净 Windows 电脑完成安装、升级、回滚拒绝和卸载验收。
 
 ## 贡献
 
@@ -287,7 +288,7 @@ cargo test --workspace --all-targets --all-features
 
 本仓库当前尚未包含独立的 `LICENSE` 文件。在明确代码许可证之前，请不要假定拥有复制、修改或再分发本仓库代码的授权。
 
-SenseVoice 模型、Sherpa 原生运行库及其他第三方组件分别受其上游许可证约束。正式 GitHub Release 只提供未签名 EXE，不捆绑模型和原生 runtime。
+SenseVoice 模型、Sherpa 原生运行库及其他第三方组件分别受其上游许可证约束。仓库已经提供 `NOTICE.md`、`THIRD_PARTY_NOTICES.md`、SBOM 生成和严格的再分发审批门禁，但锁文件中的 distribution status 仍为 pending。因此当前正式 GitHub Release 仍只提供未签名 EXE，不捆绑模型和原生 runtime。
 
 ## 致谢
 

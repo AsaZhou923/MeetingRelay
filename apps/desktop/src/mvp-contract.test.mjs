@@ -29,6 +29,8 @@ import {
   parseProviderProfileDraft,
   parseSegmentAudioLocation,
   parseSegmentSearchPage,
+  parseSpeakerDiarizationResult,
+  parseSpeakerVersion,
   parseSummaryJob,
   parseTranslationPreference,
   parseTranslationProbe,
@@ -74,6 +76,9 @@ const finalSegment = (sequence, text = `saved ${sequence}`) => ({
   endedAtMs: String(sequence * 1000 + 900),
   committedAt: String(sequence * 1000 + 950),
   commitId: `commit-${sequence}`,
+  meetingSampleStart: String(sequence * 16_000),
+  meetingSampleEnd: String(sequence * 16_000 + 14_400),
+  timelineRevision: 1,
   translationStatus: "disabled",
   translationTarget: null,
   translationText: null,
@@ -129,6 +134,53 @@ test("parses completed translation state and rejects inconsistent shapes", () =>
         finals: [{ ...translated, translationText: null }],
       }),
     /translation state/,
+  );
+});
+
+test("parses timeline sample fields for overlay-safe transcript rendering", () => {
+  const parsed = parseMvpSnapshot({
+    ...snapshot,
+    lifecycle: "recording",
+    durabilityStatus: "recording",
+    interim: {
+      ...finalSegment(1, "draft words"),
+      segmentId: "interim-active",
+      sequence: "0",
+      revision: 3,
+      isFinal: false,
+      saved: false,
+      committedAt: null,
+      commitId: null,
+      meetingSampleStart: "48000",
+      meetingSampleEnd: "64000",
+      timelineRevision: 7,
+    },
+    finals: [{ ...finalSegment(2), timelineRevision: 9 }],
+    savedFinalCount: "1",
+    totalFinalCount: "1",
+    lastSavedSequence: "2",
+  });
+
+  assert.equal(parsed.interim?.meetingSampleStart, "48000");
+  assert.equal(parsed.interim?.meetingSampleEnd, "64000");
+  assert.equal(parsed.interim?.timelineRevision, 7);
+  assert.equal(parsed.finals[0].meetingSampleStart, "32000");
+  assert.equal(parsed.finals[0].timelineRevision, 9);
+  assert.throws(
+    () =>
+      parseMvpSnapshot({
+        ...snapshot,
+        finals: [{ ...finalSegment(3), timelineRevision: 0 }],
+      }),
+    /timelineRevision/,
+  );
+  assert.throws(
+    () =>
+      parseMvpSnapshot({
+        ...snapshot,
+        finals: [{ ...finalSegment(4), meetingSampleStart: 0 }],
+      }),
+    /meetingSampleStart/,
   );
 });
 
@@ -698,8 +750,7 @@ test("parses R4 summary jobs, citation links, and selectable export options", ()
       }),
     /chunk counters/,
   );
-  assert.deepEqual(
-    parseExportOptions({
+  const parsedExportOptions = parseExportOptions({
       formats: ["json", "docx", "pdf"],
       includeOriginal: true,
       includeTranslation: true,
@@ -707,9 +758,12 @@ test("parses R4 summary jobs, citation links, and selectable export options", ()
       includeSpeaker: true,
       includeSummary: true,
       includeTimestamp: true,
-    }).formats,
-    ["json", "docx", "pdf"],
-  );
+      summaryVersion: 2,
+      speakerVersion: 3,
+    });
+  assert.deepEqual(parsedExportOptions.formats, ["json", "docx", "pdf"]);
+  assert.equal(parsedExportOptions.summaryVersion, 2);
+  assert.equal(parsedExportOptions.speakerVersion, 3);
   assert.throws(
     () =>
       parseExportOptions({
@@ -720,9 +774,137 @@ test("parses R4 summary jobs, citation links, and selectable export options", ()
         includeSpeaker: false,
         includeSummary: false,
         includeTimestamp: true,
+        speakerVersion: 0,
       }),
     /duplicate/,
   );
+  assert.throws(
+    () =>
+      parseExportOptions({
+        formats: ["json"],
+        includeOriginal: true,
+        includeTranslation: false,
+        bilingual: false,
+        includeSpeaker: true,
+        includeSummary: false,
+        includeTimestamp: true,
+        speakerVersion: 0,
+      }),
+    /speakerVersion/,
+  );
+});
+
+test("parses R5 speaker versions and diarization results with strict bounds", () => {
+  const speakerVersion = {
+    meetingId: "meeting-20260725-001",
+    version: 2,
+    parentVersion: 1,
+    algorithm: "meetingrelay.speaker.local-window-cluster.v1",
+    digest: "d".repeat(64),
+    createdAt: "2026-07-25T02:00:00Z",
+    operation: "diarize",
+    identities: [
+      { speakerId: "spk-1", displayName: "Alice" },
+      { speakerId: "spk-2", displayName: "Speaker 2" },
+    ],
+    assignments: [
+      {
+        segmentId: "segment-1",
+        sequence: "1",
+        sourceRevision: 1,
+        speakerId: "spk-1",
+        confidence: 0.94,
+      },
+    ],
+  };
+
+  const parsed = parseSpeakerVersion(speakerVersion);
+  assert.equal(parsed?.version, 2);
+  assert.equal(parsed?.identities[0].displayName, "Alice");
+  assert.equal(parsed?.assignments[0].sequence, "1");
+  assert.equal(parseSpeakerVersion(null), null);
+  assert.deepEqual(
+    parseSpeakerDiarizationResult({
+      meetingId: "meeting-20260725-001",
+      version: 3,
+      status: "completed",
+      reason: null,
+    }),
+    {
+      meetingId: "meeting-20260725-001",
+      version: 3,
+      status: "completed",
+      reason: null,
+    },
+  );
+  assert.equal(
+    parseSpeakerDiarizationResult({
+      meetingId: "meeting-20260725-001",
+      version: null,
+      status: "unavailable",
+      reason: "SPEAKER_RAW_AUDIO_REQUIRED",
+    }).status,
+    "unavailable",
+  );
+  assert.throws(
+    () =>
+      parseSpeakerVersion({
+        ...speakerVersion,
+        identities: [{ speakerId: "spk-1", displayName: "Alice\nbad" }],
+      }),
+    /displayName/,
+  );
+  assert.throws(
+    () =>
+      parseSpeakerVersion({
+        ...speakerVersion,
+        assignments: [{ ...speakerVersion.assignments[0], confidence: 1.2 }],
+      }),
+    /confidence/,
+  );
+  assert.throws(() => parseSpeakerVersion({ ...speakerVersion, version: 0 }), /version/);
+  assert.throws(
+    () =>
+      parseSpeakerVersion({
+        ...speakerVersion,
+        assignments: [{ ...speakerVersion.assignments[0], speakerId: "spk-missing" }],
+      }),
+    /unknown identity/,
+  );
+});
+
+test("wires R5 export to an explicit selected speaker version", () => {
+  const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+  assert.match(mainSource, /id="speaker-version-input" type="number" min="1" step="1"/);
+  assert.match(mainSource, /"mvp_speaker_version"/);
+  assert.match(mainSource, /latestSpeakerVersion/);
+  assert.match(
+    mainSource,
+    /speakerVersion:\s*[\s\S]*controls\.exportSpeaker\.checked[\s\S]*speakerVersion\.version[\s\S]*null/,
+  );
+  assert.match(mainSource, /SPEAKER_EDIT_REQUIRES_LATEST_VERSION/);
+});
+
+test("uses Tauri window API for compact overlay controls", () => {
+  const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+  assert.match(mainSource, /import \{ Window \} from "@tauri-apps\/api\/window"/);
+  assert.match(mainSource, /Window\.getByLabel\(CAPTION_OVERLAY_WINDOW_LABEL\)/);
+  assert.match(mainSource, /CAPTION_OVERLAY_WINDOW_MISSING/);
+  assert.match(mainSource, /overlayWindow\.isVisible\(\)/);
+  assert.match(mainSource, /overlayWindow\.show\(\)/);
+  assert.match(mainSource, /overlayWindow\.hide\(\)/);
+  assert.doesNotMatch(mainSource, /mvp_overlay_(?:show|hide|state)/);
+});
+
+test("pauses compact overlay snapshot polling while the native window is hidden", () => {
+  const overlaySource = readFileSync(new URL("./caption-overlay.ts", import.meta.url), "utf8");
+  assert.match(overlaySource, /getCurrentWindow/);
+  assert.match(
+    overlaySource,
+    /await overlayWindow\.isVisible\(\)[\s\S]*invoke<unknown>\("mvp_snapshot"\)/,
+  );
+  assert.match(overlaySource, /refreshInFlight/);
+  assert.match(overlaySource, /visibilitychange/);
 });
 
 test("parses paused snapshots and treats paused as an active session", () => {

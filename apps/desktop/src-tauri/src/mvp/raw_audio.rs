@@ -13,10 +13,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::mvp::{
-    audio::{AudioSourceId, RawAudioPacket},
-    storage::sha256_hex,
-};
+use crate::mvp::audio::{AudioSourceId, RawAudioPacket};
+#[cfg(test)]
+use crate::mvp::storage::sha256_hex;
 
 const RAW_DIR: &str = "raw";
 const DERIVED_DIR: &str = "derived";
@@ -128,6 +127,53 @@ pub fn read_mixed_window_16khz(
             }
         })
         .collect())
+}
+
+/// Reads at most `max_samples` deterministic samples from a meeting window
+/// without allocating the full span when the target segment is large.
+pub fn read_mixed_feature_window_16khz(
+    manifest: &RawAudioManifest,
+    start: u64,
+    end: u64,
+    max_samples: usize,
+) -> Result<Vec<f32>, RawAudioError> {
+    if max_samples == 0 {
+        return Ok(Vec::new());
+    }
+    let span = end.checked_sub(start).ok_or(RawAudioError::InvalidPacket(
+        "feature window end precedes start",
+    ))?;
+    if span <= u64::try_from(max_samples).unwrap_or(u64::MAX) {
+        return read_mixed_window_16khz(manifest, start, end);
+    }
+
+    let chunk_size = 1024_u64.min(u64::try_from(max_samples).unwrap_or(u64::MAX));
+    let chunk_count = u64::try_from(max_samples)
+        .unwrap_or(u64::MAX)
+        .saturating_add(chunk_size - 1)
+        / chunk_size;
+    let mut output = Vec::with_capacity(max_samples);
+    for chunk_index in 0..chunk_count {
+        let offset = if chunk_count <= 1 {
+            0
+        } else {
+            chunk_index.saturating_mul(span.saturating_sub(chunk_size)) / (chunk_count - 1)
+        };
+        let chunk_start = start.saturating_add(offset).min(end);
+        let chunk_end = chunk_start
+            .saturating_add(chunk_size.min(end.saturating_sub(chunk_start)))
+            .min(end);
+        if chunk_end <= chunk_start {
+            continue;
+        }
+        let chunk = read_mixed_window_16khz(manifest, chunk_start, chunk_end)?;
+        let remaining = max_samples.saturating_sub(output.len());
+        output.extend(chunk.into_iter().take(remaining));
+        if output.len() >= max_samples {
+            break;
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -335,6 +381,76 @@ impl RawAudioStore {
         Ok(Some(manifest))
     }
 
+    pub fn load_manifest(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Option<RawAudioManifest>, RawAudioError> {
+        validate_id(meeting_id)?;
+        let manifest_path = self.derived_root().join(meeting_id).join(MANIFEST_FILE);
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut manifest: RawAudioManifest = serde_json::from_slice(&bytes)?;
+        self.validate_manifest_paths_and_checksums(meeting_id, &mut manifest)?;
+        Ok(Some(manifest))
+    }
+
+    fn validate_manifest_paths_and_checksums(
+        &self,
+        meeting_id: &str,
+        manifest: &mut RawAudioManifest,
+    ) -> Result<(), RawAudioError> {
+        if manifest.meeting_id != meeting_id || manifest.sources.len() > 8 {
+            return Err(RawAudioError::InvalidPacket("raw audio manifest invalid"));
+        }
+        let expected_raw_dir = self.raw_root().join(meeting_id);
+        let expected_derived_dir = self.derived_root().join(meeting_id);
+        let canonical_raw_dir = expected_raw_dir.canonicalize()?;
+        let canonical_derived_dir = expected_derived_dir.canonicalize()?;
+        if manifest.raw_dir.canonicalize()? != canonical_raw_dir
+            || manifest.derived_dir.canonicalize()? != canonical_derived_dir
+        {
+            return Err(RawAudioError::InvalidPacket(
+                "raw audio manifest root mismatch",
+            ));
+        }
+        manifest.raw_dir = canonical_raw_dir.clone();
+        manifest.derived_dir = canonical_derived_dir;
+        for source in &mut manifest.sources {
+            if source.gaps.len() > 10_000 {
+                return Err(RawAudioError::InvalidPacket(
+                    "raw audio manifest gap limit exceeded",
+                ));
+            }
+            let link_metadata = fs::symlink_metadata(&source.path)?;
+            if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+                return Err(RawAudioError::InvalidPacket(
+                    "raw audio source path invalid",
+                ));
+            }
+            if link_metadata.len() != source.byte_length {
+                return Err(RawAudioError::InvalidPacket(
+                    "raw audio source length mismatch",
+                ));
+            }
+            let canonical_source = source.path.canonicalize()?;
+            if !canonical_source.starts_with(&canonical_raw_dir) {
+                return Err(RawAudioError::InvalidPacket(
+                    "raw audio source path escapes raw dir",
+                ));
+            }
+            if sha256_hex_file(&canonical_source)? != source.sha256 {
+                return Err(RawAudioError::InvalidPacket(
+                    "raw audio source checksum mismatch",
+                ));
+            }
+            source.path = canonical_source;
+        }
+        Ok(())
+    }
+
     fn ensure_quota(&self, attempted_bytes: u64) -> Result<(), RawAudioError> {
         let Some(quota_bytes) = self.config.quota_bytes else {
             return Ok(());
@@ -352,6 +468,166 @@ impl RawAudioStore {
             });
         }
         Ok(())
+    }
+}
+
+fn sha256_hex_file(path: &Path) -> Result<String, RawAudioError> {
+    let mut file = File::open(path)?;
+    let mut hasher = StreamingSha256::new();
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize_hex())
+}
+
+struct StreamingSha256 {
+    h: [u32; 8],
+    total_len: u64,
+    buffer: Vec<u8>,
+}
+
+impl StreamingSha256 {
+    fn new() -> Self {
+        Self {
+            h: SHA256_H0,
+            total_len: 0,
+            buffer: Vec::with_capacity(64),
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.total_len = self
+            .total_len
+            .saturating_add(u64::try_from(input.len()).unwrap_or(u64::MAX));
+        if !self.buffer.is_empty() {
+            let take = (64 - self.buffer.len()).min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.buffer.len() == 64 {
+                process_sha256_chunk(&mut self.h, &self.buffer);
+                self.buffer.clear();
+            }
+        }
+        while input.len() >= 64 {
+            process_sha256_chunk(&mut self.h, &input[..64]);
+            input = &input[64..];
+        }
+        if !input.is_empty() {
+            self.buffer.extend_from_slice(input);
+        }
+    }
+
+    fn finalize_hex(mut self) -> String {
+        let bit_len = self.total_len.saturating_mul(8);
+        self.buffer.push(0x80);
+        if self.buffer.len() > 56 {
+            while self.buffer.len() < 64 {
+                self.buffer.push(0);
+            }
+            process_sha256_chunk(&mut self.h, &self.buffer);
+            self.buffer.clear();
+        }
+        while self.buffer.len() < 56 {
+            self.buffer.push(0);
+        }
+        self.buffer.extend_from_slice(&bit_len.to_be_bytes());
+        process_sha256_chunk(&mut self.h, &self.buffer);
+
+        let mut output = String::with_capacity(64);
+        for word in self.h {
+            for byte in word.to_be_bytes() {
+                output.push(hex_nibble(byte >> 4));
+                output.push(hex_nibble(byte & 0x0f));
+            }
+        }
+        output
+    }
+}
+
+const SHA256_H0: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn process_sha256_chunk(h: &mut [u32; 8], chunk: &[u8]) {
+    debug_assert_eq!(chunk.len(), 64);
+    let mut w = [0_u32; 64];
+    for (index, word) in w.iter_mut().take(16).enumerate() {
+        let base = index * 4;
+        *word = u32::from_be_bytes([
+            chunk[base],
+            chunk[base + 1],
+            chunk[base + 2],
+            chunk[base + 3],
+        ]);
+    }
+    for index in 16..64 {
+        let s0 =
+            w[index - 15].rotate_right(7) ^ w[index - 15].rotate_right(18) ^ (w[index - 15] >> 3);
+        let s1 =
+            w[index - 2].rotate_right(17) ^ w[index - 2].rotate_right(19) ^ (w[index - 2] >> 10);
+        w[index] = w[index - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[index - 7])
+            .wrapping_add(s1);
+    }
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut hh = h[7];
+    for index in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[index])
+            .wrapping_add(w[index]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'a' + (value - 10)) as char,
     }
 }
 
@@ -514,8 +790,9 @@ impl SourceWriter {
     fn finalize(mut self) -> Result<RawAudioSourceManifest, RawAudioError> {
         self.rewrite_header()?;
         self.file.flush()?;
+        let byte_length = self.file.metadata()?.len();
         drop(self.file);
-        let bytes = fs::read(&self.path)?;
+        let sha256 = sha256_hex_file(&self.path)?;
         Ok(RawAudioSourceManifest {
             source: self
                 .source
@@ -527,8 +804,8 @@ impl SourceWriter {
             meeting_sample_start: self.meeting_sample_start.unwrap_or(0),
             meeting_sample_end: self.meeting_sample_end,
             frame_count: self.frame_count,
-            byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            sha256: sha256_hex(&bytes),
+            byte_length,
+            sha256,
             gaps: self.gaps,
         })
     }
@@ -630,8 +907,9 @@ fn recover_source_manifest(
     file.seek(SeekFrom::Start(0))?;
     write_wav_header(&mut file, sample_rate, channels, data_bytes)?;
     file.flush()?;
+    let byte_length = file.metadata()?.len();
     drop(file);
-    let bytes = fs::read(&path)?;
+    let sha256 = sha256_hex_file(&path)?;
     let frame_count = data_bytes / block_align;
     let meeting_sample_end = frame_count
         .saturating_mul(16_000)
@@ -645,8 +923,8 @@ fn recover_source_manifest(
         meeting_sample_start: 0,
         meeting_sample_end,
         frame_count,
-        byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        sha256: sha256_hex(&bytes),
+        byte_length,
+        sha256,
         gaps: Vec::new(),
     })
 }
@@ -1030,6 +1308,117 @@ mod tests {
         assert!((mixed[80] - 0.125).abs() < 0.001);
         assert!((mixed[240] + 0.25).abs() < 0.001);
         assert!((mixed[400] - 0.125).abs() < 0.001);
+    }
+
+    #[test]
+    fn feature_window_is_bounded_for_large_segments() {
+        let root = test_root("feature-window");
+        let store = enabled_store(&root, None);
+        let mut writer = store.begin_meeting("meeting-1").unwrap().unwrap();
+        writer
+            .append_packet(
+                &packet(AudioSourceId::Microphone, 16_000, 1, &vec![0.5; 32_000]),
+                MeetingSampleRange::new(0, 32_000),
+                None,
+            )
+            .unwrap();
+
+        let manifest = writer.finalize().unwrap();
+        let mixed = read_mixed_feature_window_16khz(&manifest, 0, 32_000, 1024).unwrap();
+
+        assert_eq!(mixed.len(), 1024);
+        assert!(mixed.iter().all(|sample| (*sample - 0.5).abs() < 0.001));
+    }
+
+    #[test]
+    fn load_manifest_rejects_source_path_escape_and_checksum_mismatch() {
+        let root = test_root("manifest-trust");
+        let store = enabled_store(&root, None);
+        let mut writer = store.begin_meeting("meeting-1").unwrap().unwrap();
+        writer
+            .append_packet(
+                &packet(AudioSourceId::Microphone, 16_000, 1, &[0.25, -0.25]),
+                MeetingSampleRange::new(0, 2),
+                None,
+            )
+            .unwrap();
+
+        let mut manifest = writer.finalize().unwrap();
+        assert!(store.load_manifest("meeting-1").unwrap().is_some());
+
+        let original_path = manifest.sources[0].path.clone();
+        let original_bytes = fs::read(&original_path).unwrap();
+        let outside_path = root.join("outside.wav");
+        fs::write(&outside_path, &original_bytes).unwrap();
+        manifest.sources[0].path = outside_path;
+        fs::write(
+            store.derived_root().join("meeting-1").join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_manifest("meeting-1"),
+            Err(RawAudioError::InvalidPacket(_))
+        ));
+
+        manifest.sources[0].path = original_path;
+        manifest.sources[0].sha256 = sha256_hex(b"tampered");
+        fs::write(
+            store.derived_root().join("meeting-1").join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_manifest("meeting-1"),
+            Err(RawAudioError::InvalidPacket(_))
+        ));
+    }
+
+    #[test]
+    fn streaming_sha256_matches_known_vector_and_handles_sparse_large_file() {
+        let mut hasher = StreamingSha256::new();
+        hasher.update(b"a");
+        hasher.update(b"bc");
+        assert_eq!(
+            hasher.finalize_hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let root = test_root("streaming-sha");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sparse-large.wav");
+        let file = File::create(&path).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        drop(file);
+        let digest = sha256_hex_file(&path).unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, sha256_hex_file(&path).unwrap());
+    }
+
+    #[test]
+    fn finalize_and_recovery_hash_sparse_audio_without_whole_file_buffers() {
+        const SPARSE_BYTES: u64 = 8 * 1024 * 1024;
+
+        let root = test_root("streaming-production-paths");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("microphone.wav");
+        let mut source = SourceWriter::new(path.clone());
+        source
+            .append(
+                &packet(AudioSourceId::Microphone, 16_000, 1, &[0.25, -0.25]),
+                MeetingSampleRange::new(0, 2),
+                None,
+            )
+            .unwrap();
+        source.file.set_len(SPARSE_BYTES).unwrap();
+
+        let finalized = source.finalize().unwrap();
+        assert_eq!(finalized.byte_length, SPARSE_BYTES);
+        assert_eq!(finalized.sha256, sha256_hex_file(&path).unwrap());
+
+        let recovered = recover_source_manifest(path.clone(), AudioSourceId::Microphone).unwrap();
+        assert_eq!(recovered.byte_length, SPARSE_BYTES);
+        assert_eq!(recovered.sha256, sha256_hex_file(&path).unwrap());
     }
 
     #[test]

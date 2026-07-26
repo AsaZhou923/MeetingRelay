@@ -27,6 +27,10 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
                 return;
             };
             api.prevent_close();
+            if window.label() == mvp::CAPTION_OVERLAY_LABEL {
+                let _ = window.hide();
+                return;
+            }
             if close_started.swap(true, Ordering::AcqRel) {
                 return;
             }
@@ -34,6 +38,9 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
             let deadline = Instant::now() + mvp::MVP_SHUTDOWN_TIMEOUT;
             let _ = window.hide();
             let app = window.app_handle().clone();
+            if let Some(overlay) = app.get_webview_window(mvp::CAPTION_OVERLAY_LABEL) {
+                let _ = overlay.hide();
+            }
             spawn_or_exit("meetingrelay-shutdown-watchdog", move || {
                 // `app.exit` only requests event-loop exit. Keep this fallback armed
                 // until process termination; the absolute deadline wins any race.
@@ -81,6 +88,12 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
             mvp::mvp_export_meeting,
             mvp::mvp_export_meeting_options,
             mvp::mvp_transcript_text,
+            mvp::mvp_speaker_diarize,
+            mvp::mvp_speaker_latest,
+            mvp::mvp_speaker_version,
+            mvp::mvp_speaker_rename,
+            mvp::mvp_speaker_merge,
+            mvp::mvp_speaker_undo,
             mvp::mvp_retry_translation_segment,
             mvp::mvp_retry_failed_translations,
             mvp::mvp_translation_retry_progress,

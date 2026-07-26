@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "caption-overlay",
+  "description": "Read-only capability for the compact caption overlay.",
+  "windows": ["caption-overlay"],
+  "platforms": ["windows"],
+  "permissions": ["core:window:allow-is-visible"]
+}

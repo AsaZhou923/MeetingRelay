@@ -3,6 +3,100 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-07-26 — R5 delivery and R6 Windows distribution engineering
+
+### Status
+
+- R5 development is complete: post-meeting speaker diarization and versioned
+  speaker editing/export, the read-only caption overlay, and automated
+  accessibility gates are implemented.
+- R6 distribution engineering is complete for local unsigned validation. Formal
+  release remains blocked by pending SenseVoice/Sherpa redistribution approval,
+  the absence of a code-signing certificate, and the unavailable second clean
+  Windows 10/11 acceptance machine.
+- R0/R2 real-device acceptance remains open for HTTPS 10–20 minute meetings,
+  fee evidence, a two-hour dual-source soak, and timeline accuracy measurements.
+
+### Added
+
+- Deterministic post-meeting diarization over persisted raw audio with separate
+  speaker identities and source metadata.
+- Versioned speaker rename, merge, and undo operations; exact retry is
+  idempotent and stale edits fail closed.
+- Explicit current/older speaker-version export in JSON, Markdown, TXT, DOCX,
+  and PDF, including valid speaker-only output in every format.
+- A static, read-only Tauri caption-overlay window that consumes the same
+  sequence/revision snapshot as the main window and pauses snapshot IPC while
+  hidden.
+- Keyboard-first focus/skip-link behavior, semantic labels, reduced-motion
+  support, non-color status cues, and responsive 200%-equivalent layouts.
+- Three original consent-safe 10–12 minute representative scripts for
+  `zh-CN→ja-JP`, `ja-JP→zh-CN`, and `en-US→zh-CN`, with a manifest, counts, and
+  SHA-256 hashes.
+- Windows NSIS/current-user distribution tooling for version `0.1.0`, including
+  locked resource staging, NOTICE/third-party notices, CycloneDX SBOM, signing
+  hooks, downgrade rejection, data-retention hooks, and uninstall policy.
+
+### Hardened and fixed
+
+- Bounded speaker work to 10,000 assignments, five minutes per segment,
+  twelve hours per meeting span, eight sources, and 10,000 gaps; acoustic
+  features now use fixed-size windows.
+- Reused the latest speaker version when the diarization digest is unchanged,
+  preventing duplicate version growth.
+- Revalidated raw-audio manifest roots, descendants, symlink/reparse points,
+  declared lengths, and hashes before diarization.
+- Replaced whole-file raw-audio hashing in manifest load, finalization, and
+  recovery with a fixed 32 KiB streaming implementation.
+- Fixed stale speaker labels in full-text search and aligned the frontend and
+  backend speaker-assignment limit.
+- Prevented a hidden overlay from continuing `mvp_snapshot` polling.
+- Prevented partial installed layouts from silently falling back to a source
+  checkout.
+- Rejected distribution cleanup/path traversal outside approved workspace
+  roots, stale installer mixing, and sealed-runtime sidecar pollution.
+- Made unsigned dry runs non-destructive and isolated test artifacts from real
+  distribution output.
+
+### Validation
+
+- Rust workspace: 193 passed, 6 ignored with all targets/features, offline and
+  locked; formatting and Clippy with warnings denied passed.
+- Frontend: 36 tests passed; TypeScript typecheck and production Vite build
+  passed.
+- Windows acceptance contracts: 17 assertions plus 4 live-provider-wrapper
+  assertions.
+- Windows distribution contract: 90 assertions.
+- Windows launcher contract: 8 assertions; personal release contract:
+  10 assertions.
+- Browser/native accessibility checks covered first-focus skip navigation,
+  keyboard activation, 200%-equivalent no-overflow layout, reduced motion,
+  non-color states, and the Windows UI Automation trees for the main and
+  overlay windows.
+
+### Real Provider validation
+
+- Read `OPENAI_API_KEY` and `OPENAI_API_BASE_URL` from
+  `E:\Project Code\PicSpeak\.env` only into the test process and used exactly
+  `gpt-5.4-mini`.
+- The live authenticated smoke, bidirectional matrix, and production
+  SecretStore/provenance service tests passed 3/3 after the final changes.
+- Temporary live-test credentials were removed; the matching Windows
+  Credential Manager residue count was verified as zero.
+- The configured endpoint remains HTTP-only and was used under the user's
+  explicit acknowledgement. It does not satisfy the formal HTTPS R0 gate.
+
+### Remaining external acceptance
+
+- Run at least two 10–20 minute language-pair meetings against an HTTPS provider
+  and capture complete quality, latency, failure, and fee evidence.
+- Run the two-hour dual-source hardware soak and the real-device timeline
+  benchmark.
+- Complete physical Narrator/high-DPI coverage and second-machine clean
+  install/upgrade/uninstall acceptance.
+- Approve redistribution licenses and provide a signing certificate before
+  producing a formal release.
+
 ## 2026-07-25 — R0–R4 delivery
 
 ### Status
@@ -16,6 +110,9 @@ decisions, and known acceptance gaps.
 
 ### Added
 
+- Repeatable Windows acceptance evidence tooling for the remaining R0/R2 gates:
+  HTTPS 10-20 minute provider meetings, cost/latency/quality evidence,
+  two-hour dual-source audio loss/gap thresholds, and timeline p95/max checks.
 - Translation provenance with endpoint hashing, model, prompt/config versions,
   attempt history, latency, and explicit completion/failure state.
 - Single-segment and meeting-wide translation retry, progress reporting,
@@ -85,6 +182,8 @@ decisions, and known acceptance gaps.
 - TypeScript typecheck and production Vite build passed.
 - Windows launcher contract: 8 assertions passed.
 - Personal release contract: 10 assertions passed.
+- Windows acceptance evidence contract validates a passing fixture and rejects
+  remote HTTP, audio gap, and timeline regression fixtures.
 - DOCX rendering was inspected through Microsoft Word and PDF rendering through
   Poppler with Chinese, Japanese, English, and long-text content.
 

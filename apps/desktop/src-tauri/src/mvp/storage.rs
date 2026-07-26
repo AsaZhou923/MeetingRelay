@@ -13,7 +13,13 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
 };
 
-use super::contract::{MAX_FINAL_SEGMENTS, MVP_CONTRACT_VERSION, TranscriptSegment};
+use super::{
+    contract::{MAX_FINAL_SEGMENTS, MVP_CONTRACT_VERSION, TranscriptSegment},
+    speaker::{
+        MAX_SPEAKER_ASSIGNMENTS, SpeakerIdentity, SpeakerSegmentAssignment, SpeakerVersionDraft,
+        SpeakerVersionSnapshot, speaker_digest,
+    },
+};
 
 const MVP_SCHEMA_V1_CHECKSUM: &str =
     "meetingrelay.mvp.sqlite.v1:meetings/finals/events/export-snapshots/exports";
@@ -23,9 +29,8 @@ const MVP_SCHEMA_V3_CHECKSUM: &str =
     "meetingrelay.mvp.sqlite.v3:durable-same-language-translation-status";
 const MVP_SCHEMA_V4_CHECKSUM: &str =
     "meetingrelay.mvp.sqlite.v4:translation-attempt-provenance-diagnostics";
-pub const MVP_SCHEMA_VERSION: i64 = 5;
-pub const MVP_SCHEMA_CHECKSUM: &str =
-    "meetingrelay.mvp.sqlite.v5:meeting-library-tags-provider-profiles-summary-delete";
+pub const MVP_SCHEMA_VERSION: i64 = 7;
+pub const MVP_SCHEMA_CHECKSUM: &str = "meetingrelay.mvp.sqlite.v7:meeting-library-tags-provider-profiles-summary-delete-speakers-binary-exports";
 pub const STORAGE_QUEUE_DEPTH: usize = 8;
 const STORAGE_PAGE_LIMIT_MAX: usize = 100;
 const STORAGE_SEARCH_LIMIT_MAX: usize = 100;
@@ -254,10 +259,11 @@ pub struct CommitAck {
     pub latency_micros: u128,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MeetingSnapshot {
     pub meeting: MeetingRecord,
     pub finals: Vec<DurableFinal>,
+    pub speaker_version: Option<SpeakerVersionSnapshot>,
     pub snapshot_id: String,
     pub snapshot_generation: u64,
     pub semantic_sha256: String,
@@ -944,6 +950,25 @@ impl MvpStorage {
         self.with_read_connection(|connection| summary_results_on_connection(connection, job_id))
     }
 
+    pub fn latest_speaker_version(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Option<SpeakerVersionSnapshot>, String> {
+        self.with_read_connection(|connection| {
+            latest_speaker_version_on_connection(connection, meeting_id)
+        })
+    }
+
+    pub fn speaker_version(
+        &self,
+        meeting_id: &str,
+        version: u32,
+    ) -> Result<Option<SpeakerVersionSnapshot>, String> {
+        self.with_read_connection(|connection| {
+            speaker_version_on_connection(connection, meeting_id, version)
+        })
+    }
+
     pub fn summary_progress(&self, job_id: &str) -> Result<Option<SummaryProgressRecord>, String> {
         self.with_read_connection(|connection| {
             let Some(job) = summary_job_by_id_optional(connection, job_id)? else {
@@ -1141,6 +1166,19 @@ impl MvpStorageWriter {
         self.request(|reply| StorageRequest::RecordExportSnapshot {
             snapshot,
             exports,
+            reply,
+        })
+    }
+
+    pub fn record_speaker_version(
+        &self,
+        meeting_id: &str,
+        draft: SpeakerVersionDraft,
+    ) -> Result<SpeakerVersionSnapshot, String> {
+        validate_speaker_draft(&draft)?;
+        self.request(|reply| StorageRequest::RecordSpeakerVersion {
+            meeting_id: meeting_id.to_owned(),
+            draft,
             reply,
         })
     }
@@ -1464,6 +1502,11 @@ enum StorageRequest {
         exports: Vec<CompletedExport>,
         reply: SyncSender<Result<(), String>>,
     },
+    RecordSpeakerVersion {
+        meeting_id: String,
+        draft: SpeakerVersionDraft,
+        reply: SyncSender<Result<SpeakerVersionSnapshot, String>>,
+    },
     CreateTag {
         name: String,
         color: Option<String>,
@@ -1630,6 +1673,17 @@ fn storage_writer_loop(
                     &mut connection,
                     &snapshot,
                     &exports,
+                ));
+            }
+            StorageRequest::RecordSpeakerVersion {
+                meeting_id,
+                draft,
+                reply,
+            } => {
+                let _ = reply.send(record_speaker_version_on_writer(
+                    &mut connection,
+                    &meeting_id,
+                    draft,
                 ));
             }
             StorageRequest::CreateTag { name, color, reply } => {
@@ -1898,12 +1952,55 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
     if current == MVP_SCHEMA_VERSION {
         return validate_schema_checksum(connection);
     }
+    if current == 6 {
+        validate_schema_checksum_version(
+            connection,
+            6,
+            "meetingrelay.mvp.sqlite.v6:meeting-library-tags-provider-profiles-summary-delete-speakers",
+        )?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+        add_v7_schema(&tx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
+             VALUES (?1, ?2, ?3)",
+            params![MVP_SCHEMA_VERSION, MVP_SCHEMA_CHECKSUM, now_ms_string()],
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.commit()
+            .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+        return validate_schema_checksum(connection);
+    }
+    if current == 5 {
+        validate_schema_checksum_version(
+            connection,
+            5,
+            "meetingrelay.mvp.sqlite.v5:meeting-library-tags-provider-profiles-summary-delete",
+        )?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+        add_v6_schema(&tx)?;
+        add_v7_schema(&tx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
+             VALUES (?1, ?2, ?3)",
+            params![MVP_SCHEMA_VERSION, MVP_SCHEMA_CHECKSUM, now_ms_string()],
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.commit()
+            .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+        return validate_schema_checksum(connection);
+    }
     if current == 4 {
         validate_schema_checksum_version(connection, 4, MVP_SCHEMA_V4_CHECKSUM)?;
         let tx = connection
             .transaction()
             .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
         add_v5_schema(&tx)?;
+        add_v6_schema(&tx)?;
+        add_v7_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -1971,6 +2068,8 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
         add_v5_schema(&tx)?;
+        add_v6_schema(&tx)?;
+        add_v7_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2060,6 +2159,8 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
         add_v5_schema(&tx)?;
+        add_v6_schema(&tx)?;
+        add_v7_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2126,6 +2227,8 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
         add_v5_schema(&tx)?;
+        add_v6_schema(&tx)?;
+        add_v7_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2255,7 +2358,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
             CREATE TABLE IF NOT EXISTS mvp_exports (
                 export_id TEXT PRIMARY KEY,
                 snapshot_id TEXT NOT NULL,
-                format TEXT NOT NULL CHECK (format IN ('json','markdown','txt')),
+                format TEXT NOT NULL CHECK (format IN ('json','markdown','txt','docx','pdf')),
                 target_path TEXT NOT NULL,
                 byte_length INTEGER NOT NULL,
                 sha256 TEXT NOT NULL,
@@ -2267,6 +2370,8 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
     add_v5_schema(&tx)?;
+    add_v6_schema(&tx)?;
+    add_v7_schema(&tx)?;
     tx.execute(
         "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2457,6 +2562,115 @@ fn add_v5_schema(tx: &Transaction<'_>) -> Result<(), String> {
     seed_default_provider_profiles(tx)
 }
 
+fn add_v6_schema(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS mvp_speaker_versions (
+            meeting_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            parent_version INTEGER,
+            base_version INTEGER,
+            algorithm TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (meeting_id, version),
+            UNIQUE (meeting_id, idempotency_key),
+            FOREIGN KEY (meeting_id) REFERENCES mvp_meetings(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS mvp_speaker_identities (
+            meeting_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            speaker_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (meeting_id, version, speaker_id),
+            FOREIGN KEY (meeting_id, version)
+              REFERENCES mvp_speaker_versions(meeting_id, version) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS mvp_speaker_segment_assignments (
+            meeting_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            segment_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            source_revision INTEGER NOT NULL,
+            speaker_id TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (meeting_id, version, segment_id, sequence),
+            FOREIGN KEY (meeting_id, version)
+              REFERENCES mvp_speaker_versions(meeting_id, version) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS mvp_speaker_edit_log (
+            meeting_id TEXT NOT NULL,
+            edit_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            base_version INTEGER,
+            operation TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (meeting_id, idempotency_key),
+            FOREIGN KEY (meeting_id, version)
+              REFERENCES mvp_speaker_versions(meeting_id, version) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_mvp_speaker_versions_latest
+            ON mvp_speaker_versions(meeting_id, version DESC);
+        CREATE INDEX IF NOT EXISTS idx_mvp_speaker_assignments_segment
+            ON mvp_speaker_segment_assignments(meeting_id, segment_id, sequence);
+        PRAGMA user_version = 6;
+        ",
+    )
+    .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())
+}
+
+fn add_v7_schema(tx: &Transaction<'_>) -> Result<(), String> {
+    let current_sql = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mvp_exports'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| "MVP_STORAGE_SCHEMA_QUERY_FAILED".to_owned())?;
+    if current_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("'docx'") && sql.contains("'pdf'"))
+    {
+        tx.execute_batch("PRAGMA user_version = 7;")
+            .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        "
+        DROP TABLE IF EXISTS mvp_exports_v7;
+        CREATE TABLE mvp_exports_v7 (
+            export_id TEXT PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            format TEXT NOT NULL CHECK (format IN ('json','markdown','txt','docx','pdf')),
+            target_path TEXT NOT NULL,
+            byte_length INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            validation_manifest_json TEXT NOT NULL,
+            FOREIGN KEY (snapshot_id) REFERENCES mvp_export_snapshots(snapshot_id) ON DELETE RESTRICT
+        );
+        INSERT INTO mvp_exports_v7 (
+            export_id, snapshot_id, format, target_path, byte_length, sha256,
+            completed_at, validation_manifest_json
+        )
+        SELECT export_id, snapshot_id, format, target_path, byte_length, sha256,
+               completed_at, validation_manifest_json
+        FROM mvp_exports;
+        DROP TABLE mvp_exports;
+        ALTER TABLE mvp_exports_v7 RENAME TO mvp_exports;
+        PRAGMA user_version = 7;
+        ",
+    )
+    .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())
+}
+
 fn seed_default_provider_profiles(tx: &Transaction<'_>) -> Result<(), String> {
     let now = now_ms_string();
     for (profile_id, label, class, secret_state) in [
@@ -2515,24 +2729,37 @@ fn ensure_search_index(connection: &mut Connection) -> Result<(), String> {
         AFTER INSERT ON mvp_final_segments BEGIN
             INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
             VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'original', NEW.text);
-            INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
-            VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'speaker', NEW.text);
         END;
         CREATE TRIGGER IF NOT EXISTS mvp_search_final_ad
         AFTER DELETE ON mvp_final_segments BEGIN
             DELETE FROM mvp_search_fts
             WHERE meeting_id=OLD.meeting_id AND segment_id=OLD.segment_id
-              AND source_revision=OLD.source_revision AND scope IN ('original','speaker');
+              AND source_revision=OLD.source_revision AND scope='original';
         END;
         CREATE TRIGGER IF NOT EXISTS mvp_search_final_au
         AFTER UPDATE OF text, sequence, source_revision ON mvp_final_segments BEGIN
             DELETE FROM mvp_search_fts
             WHERE meeting_id=OLD.meeting_id AND segment_id=OLD.segment_id
-              AND source_revision=OLD.source_revision AND scope IN ('original','speaker');
+              AND source_revision=OLD.source_revision AND scope='original';
             INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
             VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'original', NEW.text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS mvp_search_speaker_identity_ai
+        AFTER INSERT ON mvp_speaker_identities BEGIN
             INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
-            VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'speaker', NEW.text);
+            SELECT a.meeting_id, a.segment_id, a.sequence, a.source_revision, 'speaker', NEW.display_name
+            FROM mvp_speaker_segment_assignments a
+            WHERE a.meeting_id=NEW.meeting_id AND a.version=NEW.version
+              AND a.speaker_id=NEW.speaker_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mvp_search_speaker_assignment_ai
+        AFTER INSERT ON mvp_speaker_segment_assignments BEGIN
+            INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
+            SELECT NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'speaker', i.display_name
+            FROM mvp_speaker_identities i
+            WHERE i.meeting_id=NEW.meeting_id AND i.version=NEW.version
+              AND i.speaker_id=NEW.speaker_id;
         END;
 
         CREATE TRIGGER IF NOT EXISTS mvp_search_translation_ai
@@ -2590,6 +2817,22 @@ fn ensure_search_index(connection: &mut Connection) -> Result<(), String> {
         ",
     )
     .map_err(|_| "MVP_STORAGE_SEARCH_INDEX_FAILED".to_owned())?;
+    tx.execute("DELETE FROM mvp_search_fts WHERE scope='speaker'", [])
+        .map_err(|_| "MVP_STORAGE_SEARCH_INDEX_FAILED".to_owned())?;
+    tx.execute_batch(
+        "
+        INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
+        SELECT a.meeting_id, a.segment_id, a.sequence, a.source_revision, 'speaker', i.display_name
+        FROM mvp_speaker_segment_assignments a
+        JOIN mvp_speaker_identities i
+          ON i.meeting_id=a.meeting_id AND i.version=a.version AND i.speaker_id=a.speaker_id
+        JOIN (
+            SELECT meeting_id, MAX(version) AS version
+            FROM mvp_speaker_versions GROUP BY meeting_id
+        ) latest ON latest.meeting_id=a.meeting_id AND latest.version=a.version;
+        ",
+    )
+    .map_err(|_| "MVP_STORAGE_SEARCH_INDEX_FAILED".to_owned())?;
     let trigram_available = ensure_trigram_search_index(&tx)?;
     let indexed: i64 = tx
         .query_row("SELECT COUNT(*) FROM mvp_search_fts", [], |row| row.get(0))
@@ -2601,8 +2844,14 @@ fn ensure_search_index(connection: &mut Connection) -> Result<(), String> {
             SELECT meeting_id, segment_id, sequence, source_revision, 'original', text
             FROM mvp_final_segments;
             INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
-            SELECT meeting_id, segment_id, sequence, source_revision, 'speaker', text
-            FROM mvp_final_segments;
+            SELECT a.meeting_id, a.segment_id, a.sequence, a.source_revision, 'speaker', i.display_name
+            FROM mvp_speaker_segment_assignments a
+            JOIN mvp_speaker_identities i
+              ON i.meeting_id=a.meeting_id AND i.version=a.version AND i.speaker_id=a.speaker_id
+            JOIN (
+                SELECT meeting_id, MAX(version) AS version
+                FROM mvp_speaker_versions GROUP BY meeting_id
+            ) latest ON latest.meeting_id=a.meeting_id AND latest.version=a.version;
             INSERT INTO mvp_search_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
             SELECT t.meeting_id, t.segment_id, f.sequence, t.source_revision,
                    'translation', t.translated_text
@@ -2658,24 +2907,37 @@ fn ensure_trigram_search_index(tx: &Transaction<'_>) -> Result<bool, String> {
             AFTER INSERT ON mvp_final_segments BEGIN
                 INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
                 VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'original', NEW.text);
-                INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
-                VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'speaker', NEW.text);
             END;
             CREATE TRIGGER IF NOT EXISTS mvp_search_trigram_final_ad
             AFTER DELETE ON mvp_final_segments BEGIN
                 DELETE FROM mvp_search_trigram_fts
                 WHERE meeting_id=OLD.meeting_id AND segment_id=OLD.segment_id
-                  AND source_revision=OLD.source_revision AND scope IN ('original','speaker');
+                  AND source_revision=OLD.source_revision AND scope='original';
             END;
             CREATE TRIGGER IF NOT EXISTS mvp_search_trigram_final_au
             AFTER UPDATE OF text, sequence, source_revision ON mvp_final_segments BEGIN
                 DELETE FROM mvp_search_trigram_fts
                 WHERE meeting_id=OLD.meeting_id AND segment_id=OLD.segment_id
-                  AND source_revision=OLD.source_revision AND scope IN ('original','speaker');
+                  AND source_revision=OLD.source_revision AND scope='original';
                 INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
                 VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'original', NEW.text);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS mvp_search_trigram_speaker_identity_ai
+            AFTER INSERT ON mvp_speaker_identities BEGIN
                 INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
-                VALUES (NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'speaker', NEW.text);
+                SELECT a.meeting_id, a.segment_id, a.sequence, a.source_revision, 'speaker', NEW.display_name
+                FROM mvp_speaker_segment_assignments a
+                WHERE a.meeting_id=NEW.meeting_id AND a.version=NEW.version
+                  AND a.speaker_id=NEW.speaker_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS mvp_search_trigram_speaker_assignment_ai
+            AFTER INSERT ON mvp_speaker_segment_assignments BEGIN
+                INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
+                SELECT NEW.meeting_id, NEW.segment_id, NEW.sequence, NEW.source_revision, 'speaker', i.display_name
+                FROM mvp_speaker_identities i
+                WHERE i.meeting_id=NEW.meeting_id AND i.version=NEW.version
+                  AND i.speaker_id=NEW.speaker_id;
             END;
 
             CREATE TRIGGER IF NOT EXISTS mvp_search_trigram_translation_ai
@@ -2728,14 +2990,33 @@ fn ensure_trigram_search_index(tx: &Transaction<'_>) -> Result<bool, String> {
                 INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
                 SELECT sj.meeting_id, 'summary:' || NEW.job_id || ':' || NEW.section_kind,
                        NEW.section_index, 1, 'summary', NEW.text
-                FROM mvp_summary_jobs sj WHERE sj.job_id=NEW.job_id;
-            END;
-            ",
-        )
-        .is_err()
+            FROM mvp_summary_jobs sj WHERE sj.job_id=NEW.job_id;
+        END;
+        ",
+    )
+    .is_err()
     {
         return Ok(false);
     }
+    tx.execute(
+        "DELETE FROM mvp_search_trigram_fts WHERE scope='speaker'",
+        [],
+    )
+    .map_err(|_| "MVP_STORAGE_SEARCH_INDEX_FAILED".to_owned())?;
+    tx.execute_batch(
+        "
+        INSERT INTO mvp_search_trigram_fts(meeting_id, segment_id, sequence, source_revision, scope, text)
+        SELECT a.meeting_id, a.segment_id, a.sequence, a.source_revision, 'speaker', i.display_name
+        FROM mvp_speaker_segment_assignments a
+        JOIN mvp_speaker_identities i
+          ON i.meeting_id=a.meeting_id AND i.version=a.version AND i.speaker_id=a.speaker_id
+        JOIN (
+            SELECT meeting_id, MAX(version) AS version
+            FROM mvp_speaker_versions GROUP BY meeting_id
+        ) latest ON latest.meeting_id=a.meeting_id AND latest.version=a.version;
+        ",
+    )
+    .map_err(|_| "MVP_STORAGE_SEARCH_INDEX_FAILED".to_owned())?;
     Ok(true)
 }
 
@@ -3519,6 +3800,165 @@ fn record_export_snapshot_on_writer(
         .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())
 }
 
+fn record_speaker_version_on_writer(
+    connection: &mut Connection,
+    meeting_id: &str,
+    draft: SpeakerVersionDraft,
+) -> Result<SpeakerVersionSnapshot, String> {
+    let digest = speaker_digest(&draft.identities, &draft.assignments);
+    if let Some(key) = draft.idempotency_key.as_deref()
+        && let Some(existing) =
+            speaker_version_by_idempotency(connection, meeting_id, key, &draft, &digest)?
+    {
+        return Ok(existing);
+    }
+    let tx = connection
+        .transaction()
+        .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+    let meeting_exists = tx
+        .query_row(
+            "SELECT 1 FROM mvp_meetings WHERE id=?1 AND deleted_at IS NULL",
+            params![meeting_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| "MVP_STORAGE_MEETING_QUERY_FAILED".to_owned())?
+        .is_some();
+    if !meeting_exists {
+        return Err("MVP_STORAGE_MEETING_NOT_FOUND".to_owned());
+    }
+    let latest: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM mvp_speaker_versions WHERE meeting_id=?1",
+            params![meeting_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    if draft.idempotency_key.is_none()
+        && draft.operation == "diarize"
+        && let Some(existing) =
+            latest_speaker_version_if_same_digest(&tx, meeting_id, latest, &draft, &digest)?
+    {
+        return Ok(existing);
+    }
+    if let Some(base_version) = draft.base_version
+        && latest != i64::from(base_version)
+    {
+        return Err("SPEAKER_BASE_VERSION_CONFLICT".to_owned());
+    }
+    for assignment in &draft.assignments {
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM mvp_final_segments
+                 WHERE meeting_id=?1 AND segment_id=?2 AND sequence=?3 AND source_revision=?4",
+                params![
+                    meeting_id,
+                    assignment.segment_id,
+                    i64::try_from(assignment.sequence)
+                        .map_err(|_| "MVP_STORAGE_SEQUENCE_OVERFLOW".to_owned())?,
+                    i64::from(assignment.source_revision)
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| "MVP_STORAGE_FINAL_QUERY_FAILED".to_owned())?
+            .is_some();
+        if !exists {
+            return Err("SPEAKER_SEGMENT_NOT_FOUND".to_owned());
+        }
+    }
+    let version = latest + 1;
+    let now = now_ms_string();
+    tx.execute(
+        "DELETE FROM mvp_search_fts WHERE meeting_id=?1 AND scope='speaker'",
+        params![meeting_id],
+    )
+    .map_err(|_| "MVP_STORAGE_SEARCH_INDEX_FAILED".to_owned())?;
+    let _ = tx.execute(
+        "DELETE FROM mvp_search_trigram_fts WHERE meeting_id=?1 AND scope='speaker'",
+        params![meeting_id],
+    );
+    tx.execute(
+        "INSERT INTO mvp_speaker_versions (
+            meeting_id, version, parent_version, base_version, algorithm, digest,
+            operation, idempotency_key, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            meeting_id,
+            version,
+            draft.parent_version.map(i64::from),
+            draft.base_version.map(i64::from),
+            draft.algorithm,
+            digest,
+            draft.operation,
+            draft.idempotency_key,
+            now
+        ],
+    )
+    .map_err(|_| "MVP_STORAGE_SPEAKER_VERSION_FAILED".to_owned())?;
+    for identity in &draft.identities {
+        tx.execute(
+            "INSERT INTO mvp_speaker_identities(
+                meeting_id, version, speaker_id, display_name, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                meeting_id,
+                version,
+                identity.speaker_id,
+                identity.display_name,
+                now
+            ],
+        )
+        .map_err(|_| "MVP_STORAGE_SPEAKER_IDENTITY_FAILED".to_owned())?;
+    }
+    for assignment in &draft.assignments {
+        tx.execute(
+            "INSERT INTO mvp_speaker_segment_assignments(
+                meeting_id, version, segment_id, sequence, source_revision,
+                speaker_id, confidence, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                meeting_id,
+                version,
+                assignment.segment_id,
+                i64::try_from(assignment.sequence)
+                    .map_err(|_| "MVP_STORAGE_SEQUENCE_OVERFLOW".to_owned())?,
+                i64::from(assignment.source_revision),
+                assignment.speaker_id,
+                f64::from(assignment.confidence),
+                now
+            ],
+        )
+        .map_err(|_| "MVP_STORAGE_SPEAKER_ASSIGNMENT_FAILED".to_owned())?;
+    }
+    let payload_sha256 = speaker_digest(&draft.identities, &draft.assignments);
+    tx.execute(
+        "INSERT INTO mvp_speaker_edit_log(
+            meeting_id, edit_id, version, base_version, operation,
+            payload_sha256, idempotency_key, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            meeting_id,
+            next_id("speaker-edit"),
+            version,
+            draft.base_version.map(i64::from),
+            draft.operation,
+            payload_sha256,
+            draft.idempotency_key,
+            now
+        ],
+    )
+    .map_err(|_| "MVP_STORAGE_SPEAKER_EDIT_FAILED".to_owned())?;
+    tx.commit()
+        .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+    speaker_version_on_connection(
+        connection,
+        meeting_id,
+        u32::try_from(version).map_err(|_| "MVP_STORAGE_SPEAKER_VERSION_OVERFLOW".to_owned())?,
+    )?
+    .ok_or_else(|| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())
+}
+
 fn start_meeting_with_metadata_on_writer(
     connection: &mut Connection,
     consent_accepted: bool,
@@ -4005,6 +4445,10 @@ fn purge_meeting_metadata_on_writer(
     )
     .map_err(|_| "MVP_STORAGE_PURGE_FAILED".to_owned())?;
     for sql in [
+        "DELETE FROM mvp_speaker_edit_log WHERE meeting_id=?1",
+        "DELETE FROM mvp_speaker_segment_assignments WHERE meeting_id=?1",
+        "DELETE FROM mvp_speaker_identities WHERE meeting_id=?1",
+        "DELETE FROM mvp_speaker_versions WHERE meeting_id=?1",
         "DELETE FROM mvp_summary_jobs WHERE meeting_id=?1",
         "DELETE FROM mvp_translation_attempts WHERE meeting_id=?1",
         "DELETE FROM mvp_translations WHERE meeting_id=?1",
@@ -4152,6 +4596,47 @@ fn validate_summary_result(input: &SummaryResultInput) -> Result<(), String> {
         || input.text.contains('\0')
     {
         return Err("MVP_STORAGE_SUMMARY_INVALID".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_speaker_draft(input: &SpeakerVersionDraft) -> Result<(), String> {
+    if input.identities.is_empty()
+        || input.identities.len() > 32
+        || input.assignments.len() > MAX_SPEAKER_ASSIGNMENTS
+        || input.algorithm.is_empty()
+        || input.algorithm.len() > 128
+        || input.operation.is_empty()
+        || input.operation.len() > 64
+    {
+        return Err("MVP_STORAGE_SPEAKER_INVALID".to_owned());
+    }
+    for identity in &input.identities {
+        if identity.speaker_id.is_empty()
+            || identity.speaker_id.len() > 64
+            || identity.display_name.trim().is_empty()
+            || identity.display_name.len() > 80
+            || identity.speaker_id.chars().any(char::is_control)
+            || identity.display_name.chars().any(char::is_control)
+        {
+            return Err("MVP_STORAGE_SPEAKER_INVALID".to_owned());
+        }
+    }
+    for assignment in &input.assignments {
+        if assignment.segment_id.is_empty()
+            || assignment.segment_id.len() > 128
+            || assignment.speaker_id.is_empty()
+            || !(0.0..=1.0).contains(&assignment.confidence)
+            || assignment.segment_id.chars().any(char::is_control)
+            || assignment.speaker_id.chars().any(char::is_control)
+        {
+            return Err("MVP_STORAGE_SPEAKER_INVALID".to_owned());
+        }
+    }
+    if let Some(key) = input.idempotency_key.as_deref()
+        && (key.is_empty() || key.len() > 128 || key.chars().any(char::is_control))
+    {
+        return Err("MVP_STORAGE_SPEAKER_INVALID".to_owned());
     }
     Ok(())
 }
@@ -4353,6 +4838,185 @@ fn summary_results_on_connection(
         .map_err(|_| "MVP_STORAGE_SUMMARY_QUERY_FAILED".to_owned())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|_| "MVP_STORAGE_SUMMARY_QUERY_FAILED".to_owned())
+}
+
+fn latest_speaker_version_on_connection(
+    connection: &Connection,
+    meeting_id: &str,
+) -> Result<Option<SpeakerVersionSnapshot>, String> {
+    let version = connection
+        .query_row(
+            "SELECT MAX(version) FROM mvp_speaker_versions WHERE meeting_id=?1",
+            params![meeting_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    version
+        .and_then(|value| u32::try_from(value).ok())
+        .map(|value| speaker_version_on_connection(connection, meeting_id, value))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn speaker_version_by_idempotency(
+    connection: &Connection,
+    meeting_id: &str,
+    idempotency_key: &str,
+    draft: &SpeakerVersionDraft,
+    digest: &str,
+) -> Result<Option<SpeakerVersionSnapshot>, String> {
+    let row = connection
+        .query_row(
+            "SELECT version, parent_version, base_version, algorithm, digest, operation
+             FROM mvp_speaker_versions
+             WHERE meeting_id=?1 AND idempotency_key=?2",
+            params![meeting_id, idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    let Some((version, parent_version, base_version, algorithm, existing_digest, operation)) = row
+    else {
+        return Ok(None);
+    };
+    let same = parent_version.and_then(|value| u32::try_from(value).ok()) == draft.parent_version
+        && base_version.and_then(|value| u32::try_from(value).ok()) == draft.base_version
+        && algorithm == draft.algorithm
+        && existing_digest == digest
+        && operation == draft.operation;
+    if !same {
+        return Err("SPEAKER_IDEMPOTENCY_CONFLICT".to_owned());
+    }
+    speaker_version_on_connection(
+        connection,
+        meeting_id,
+        u32::try_from(version).map_err(|_| "MVP_STORAGE_SPEAKER_VERSION_OVERFLOW".to_owned())?,
+    )
+}
+
+fn latest_speaker_version_if_same_digest(
+    connection: &Connection,
+    meeting_id: &str,
+    latest: i64,
+    draft: &SpeakerVersionDraft,
+    digest: &str,
+) -> Result<Option<SpeakerVersionSnapshot>, String> {
+    if latest <= 0 {
+        return Ok(None);
+    }
+    let same = connection
+        .query_row(
+            "SELECT 1 FROM mvp_speaker_versions
+             WHERE meeting_id=?1 AND version=?2 AND algorithm=?3 AND digest=?4 AND operation=?5",
+            params![meeting_id, latest, draft.algorithm, digest, draft.operation],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?
+        .is_some();
+    if !same {
+        return Ok(None);
+    }
+    speaker_version_on_connection(
+        connection,
+        meeting_id,
+        u32::try_from(latest).map_err(|_| "MVP_STORAGE_SPEAKER_VERSION_OVERFLOW".to_owned())?,
+    )
+}
+
+fn speaker_version_on_connection(
+    connection: &Connection,
+    meeting_id: &str,
+    version: u32,
+) -> Result<Option<SpeakerVersionSnapshot>, String> {
+    let header = connection
+        .query_row(
+            "SELECT meeting_id, version, parent_version, algorithm, digest, created_at, operation
+             FROM mvp_speaker_versions WHERE meeting_id=?1 AND version=?2",
+            params![meeting_id, i64::from(version)],
+            |row| {
+                let version: i64 = row.get(1)?;
+                let parent_version: Option<i64> = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    u32::try_from(version).unwrap_or(0),
+                    parent_version.and_then(|value| u32::try_from(value).ok()),
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    let Some((meeting_id, version, parent_version, algorithm, digest, created_at, operation)) =
+        header
+    else {
+        return Ok(None);
+    };
+    let mut identity_statement = connection
+        .prepare(
+            "SELECT speaker_id, display_name FROM mvp_speaker_identities
+             WHERE meeting_id=?1 AND version=?2 ORDER BY speaker_id ASC",
+        )
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    let identities = identity_statement
+        .query_map(params![meeting_id, i64::from(version)], |row| {
+            Ok(SpeakerIdentity {
+                speaker_id: row.get(0)?,
+                display_name: row.get(1)?,
+            })
+        })
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    let mut assignment_statement = connection
+        .prepare(
+            "SELECT segment_id, sequence, source_revision, speaker_id, confidence
+             FROM mvp_speaker_segment_assignments
+             WHERE meeting_id=?1 AND version=?2 ORDER BY sequence ASC, segment_id ASC",
+        )
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    let assignments = assignment_statement
+        .query_map(params![meeting_id, i64::from(version)], |row| {
+            let sequence: i64 = row.get(1)?;
+            let source_revision: i64 = row.get(2)?;
+            let confidence: f64 = row.get(4)?;
+            Ok(SpeakerSegmentAssignment {
+                segment_id: row.get(0)?,
+                sequence: u64::try_from(sequence).unwrap_or(0),
+                source_revision: u32::try_from(source_revision).unwrap_or(0),
+                speaker_id: row.get(3)?,
+                confidence: confidence as f32,
+            })
+        })
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "MVP_STORAGE_SPEAKER_QUERY_FAILED".to_owned())?;
+    if assignments.len() > MAX_SPEAKER_ASSIGNMENTS {
+        return Err("MVP_STORAGE_SPEAKER_INVALID".to_owned());
+    }
+    Ok(Some(SpeakerVersionSnapshot {
+        meeting_id,
+        version,
+        parent_version,
+        algorithm,
+        digest,
+        created_at,
+        operation,
+        identities,
+        assignments,
+    }))
 }
 
 fn latest_summary_job_for_meeting(
@@ -4783,7 +5447,8 @@ fn snapshot_from_transaction(
         .map_err(|_| "MVP_STORAGE_MEETING_QUERY_FAILED".to_owned())?
         .ok_or_else(|| "MVP_STORAGE_MEETING_NOT_FOUND".to_owned())?;
     let finals = select_finals(tx, meeting_id)?;
-    let semantic_sha256 = semantic_digest(&meeting, &finals);
+    let speaker_version = latest_speaker_version_on_connection(tx, meeting_id)?;
+    let semantic_sha256 = semantic_digest(&meeting, &finals, speaker_version.as_ref());
     let snapshot_generation = snapshot_generation(tx, meeting_id)?.saturating_add(1);
     let snapshot_id = sha256_hex(
         format!(
@@ -4795,6 +5460,7 @@ fn snapshot_from_transaction(
     Ok(MeetingSnapshot {
         meeting,
         finals,
+        speaker_version,
         snapshot_id,
         snapshot_generation,
         semantic_sha256,
@@ -5033,7 +5699,11 @@ fn value_contains_sensitive_marker(value: &str) -> bool {
         || lower.contains('?')
 }
 
-pub fn semantic_digest(meeting: &MeetingRecord, finals: &[DurableFinal]) -> String {
+pub fn semantic_digest(
+    meeting: &MeetingRecord,
+    finals: &[DurableFinal],
+    speaker_version: Option<&SpeakerVersionSnapshot>,
+) -> String {
     let mut material = format!(
         "{}\n{}\n{}\n{}\n{}\n",
         meeting.id,
@@ -5059,6 +5729,13 @@ pub fn semantic_digest(meeting: &MeetingRecord, finals: &[DurableFinal]) -> Stri
                 .unwrap_or_default(),
             final_segment.translation_error.as_deref().unwrap_or("")
         ));
+    }
+    if let Some(speaker) = speaker_version {
+        material.push_str("speaker\n");
+        material.push_str(&speaker.version.to_string());
+        material.push('\n');
+        material.push_str(&speaker.digest);
+        material.push('\n');
     }
     sha256_hex(material.as_bytes())
 }
@@ -5261,7 +5938,7 @@ mod tests {
         drop(connection);
 
         let migrated = open_writer_connection(&db).unwrap();
-        assert_eq!(user_version(&migrated).unwrap(), 5);
+        assert_eq!(user_version(&migrated).unwrap(), MVP_SCHEMA_VERSION);
         let translation_table: String = migrated
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='mvp_translations'",
@@ -5310,7 +5987,7 @@ mod tests {
             .execute_batch(
                 "DROP TABLE mvp_translation_attempts;
                  DROP TABLE mvp_recovery_actions;
-                 DELETE FROM mvp_schema_migrations WHERE version IN (4,5);
+                 DELETE FROM mvp_schema_migrations WHERE version IN (4,5,6);
                  PRAGMA user_version = 2;",
             )
             .unwrap();
@@ -5324,7 +6001,7 @@ mod tests {
         drop(connection);
 
         let migrated = open_writer_connection(&db).unwrap();
-        assert_eq!(user_version(&migrated).unwrap(), 5);
+        assert_eq!(user_version(&migrated).unwrap(), MVP_SCHEMA_VERSION);
         let text: String = migrated
             .query_row("SELECT text FROM mvp_final_segments", [], |row| row.get(0))
             .unwrap();
@@ -5414,7 +6091,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(user_version(&migrated).unwrap(), 5);
+        assert_eq!(user_version(&migrated).unwrap(), MVP_SCHEMA_VERSION);
         assert_eq!(status, "skipped");
         assert_eq!(recovery_table, "mvp_recovery_actions");
     }
@@ -5856,6 +6533,255 @@ mod tests {
             .unwrap();
         assert_eq!(snapshots, 0);
         assert_eq!(exports, 0);
+    }
+
+    #[test]
+    fn speaker_versions_are_append_only_searchable_and_base_version_guarded() {
+        let (storage, writer) = storage_and_writer("speaker-version");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 1, "alpha turn"))
+            .unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 2, "beta turn"))
+            .unwrap();
+        writer.complete_meeting(&meeting.id).unwrap();
+
+        let draft = SpeakerVersionDraft {
+            parent_version: None,
+            base_version: None,
+            algorithm: "test.speaker.v1".to_owned(),
+            identities: vec![
+                SpeakerIdentity {
+                    speaker_id: "spk-1".to_owned(),
+                    display_name: "Alice".to_owned(),
+                },
+                SpeakerIdentity {
+                    speaker_id: "spk-2".to_owned(),
+                    display_name: "Bob".to_owned(),
+                },
+            ],
+            assignments: vec![
+                SpeakerSegmentAssignment {
+                    segment_id: "segment-1".to_owned(),
+                    sequence: 1,
+                    source_revision: 1,
+                    speaker_id: "spk-1".to_owned(),
+                    confidence: 0.91,
+                },
+                SpeakerSegmentAssignment {
+                    segment_id: "segment-2".to_owned(),
+                    sequence: 2,
+                    source_revision: 1,
+                    speaker_id: "spk-2".to_owned(),
+                    confidence: 0.88,
+                },
+            ],
+            operation: "diarize".to_owned(),
+            idempotency_key: Some("speaker-run-1".to_owned()),
+        };
+        let version = writer
+            .record_speaker_version(&meeting.id, draft.clone())
+            .unwrap();
+        assert_eq!(version.version, 1);
+        assert_eq!(
+            writer
+                .record_speaker_version(&meeting.id, draft)
+                .unwrap()
+                .version,
+            1
+        );
+        let search = storage
+            .search_segments(SegmentSearchQuery {
+                text: Some("Alice".to_owned()),
+                scopes: vec!["speaker".to_owned()],
+                meeting_id: Some(meeting.id.clone()),
+                tag_ids: Vec::new(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(search.hits.len(), 1);
+        assert_eq!(search.hits[0].segment_id, "segment-1");
+
+        let renamed = writer
+            .record_speaker_version(
+                &meeting.id,
+                SpeakerVersionDraft {
+                    parent_version: Some(1),
+                    base_version: Some(1),
+                    algorithm: "test.speaker.rename.v1".to_owned(),
+                    identities: vec![
+                        SpeakerIdentity {
+                            speaker_id: "spk-1".to_owned(),
+                            display_name: "Alicia".to_owned(),
+                        },
+                        SpeakerIdentity {
+                            speaker_id: "spk-2".to_owned(),
+                            display_name: "Bob".to_owned(),
+                        },
+                    ],
+                    assignments: version.assignments.clone(),
+                    operation: "rename".to_owned(),
+                    idempotency_key: Some("speaker-rename-1".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(renamed.version, 2);
+        let old_name = storage
+            .search_segments(SegmentSearchQuery {
+                text: Some("Alice".to_owned()),
+                scopes: vec!["speaker".to_owned()],
+                meeting_id: Some(meeting.id.clone()),
+                tag_ids: Vec::new(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(old_name.hits.len(), 0);
+        let new_name = storage
+            .search_segments(SegmentSearchQuery {
+                text: Some("Alicia".to_owned()),
+                scopes: vec!["speaker".to_owned()],
+                meeting_id: Some(meeting.id.clone()),
+                tag_ids: Vec::new(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(new_name.hits.len(), 1);
+        assert_eq!(
+            writer
+                .record_speaker_version(
+                    &meeting.id,
+                    SpeakerVersionDraft {
+                        parent_version: Some(1),
+                        base_version: Some(1),
+                        algorithm: "test.speaker.rename.v1".to_owned(),
+                        identities: vec![
+                            SpeakerIdentity {
+                                speaker_id: "spk-1".to_owned(),
+                                display_name: "Mallory".to_owned(),
+                            },
+                            SpeakerIdentity {
+                                speaker_id: "spk-2".to_owned(),
+                                display_name: "Bob".to_owned(),
+                            },
+                        ],
+                        assignments: version.assignments.clone(),
+                        operation: "rename".to_owned(),
+                        idempotency_key: Some("speaker-rename-1".to_owned()),
+                    },
+                )
+                .unwrap_err(),
+            "SPEAKER_IDEMPOTENCY_CONFLICT"
+        );
+        assert_eq!(
+            writer
+                .record_speaker_version(
+                    &meeting.id,
+                    SpeakerVersionDraft {
+                        parent_version: Some(2),
+                        base_version: Some(1),
+                        algorithm: "test.speaker.rename.v1".to_owned(),
+                        identities: renamed.identities,
+                        assignments: renamed.assignments,
+                        operation: "rename".to_owned(),
+                        idempotency_key: Some("speaker-stale".to_owned()),
+                    },
+                )
+                .unwrap_err(),
+            "SPEAKER_BASE_VERSION_CONFLICT"
+        );
+    }
+
+    #[test]
+    fn speaker_diarize_without_idempotency_reuses_latest_same_digest_only() {
+        let (storage, writer) = storage_and_writer("speaker-diarize-digest");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 1, "alpha turn"))
+            .unwrap();
+        writer.complete_meeting(&meeting.id).unwrap();
+
+        let draft = SpeakerVersionDraft {
+            parent_version: None,
+            base_version: None,
+            algorithm: "test.speaker.v1".to_owned(),
+            identities: vec![SpeakerIdentity {
+                speaker_id: "spk-1".to_owned(),
+                display_name: "Speaker 1".to_owned(),
+            }],
+            assignments: vec![SpeakerSegmentAssignment {
+                segment_id: "segment-1".to_owned(),
+                sequence: 1,
+                source_revision: 1,
+                speaker_id: "spk-1".to_owned(),
+                confidence: 0.9,
+            }],
+            operation: "diarize".to_owned(),
+            idempotency_key: None,
+        };
+        let first = writer
+            .record_speaker_version(&meeting.id, draft.clone())
+            .unwrap();
+        let retry = writer
+            .record_speaker_version(&meeting.id, draft.clone())
+            .unwrap();
+        assert_eq!(retry.version, first.version);
+
+        let mut changed = draft;
+        changed.assignments[0].confidence = 0.7;
+        let appended = writer.record_speaker_version(&meeting.id, changed).unwrap();
+        assert_eq!(appended.version, first.version + 1);
+        assert_eq!(
+            storage
+                .latest_speaker_version(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .version,
+            appended.version
+        );
+    }
+
+    #[test]
+    fn speaker_writer_rejects_frontend_assignment_limit() {
+        let (_storage, writer) = storage_and_writer("speaker-assignment-limit");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 1, "alpha turn"))
+            .unwrap();
+        writer.complete_meeting(&meeting.id).unwrap();
+        let assignments = (0..=MAX_SPEAKER_ASSIGNMENTS)
+            .map(|_| SpeakerSegmentAssignment {
+                segment_id: "segment-1".to_owned(),
+                sequence: 1,
+                source_revision: 1,
+                speaker_id: "spk-1".to_owned(),
+                confidence: 0.9,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            writer
+                .record_speaker_version(
+                    &meeting.id,
+                    SpeakerVersionDraft {
+                        parent_version: None,
+                        base_version: None,
+                        algorithm: "test.speaker.v1".to_owned(),
+                        identities: vec![SpeakerIdentity {
+                            speaker_id: "spk-1".to_owned(),
+                            display_name: "Speaker 1".to_owned(),
+                        }],
+                        assignments,
+                        operation: "diarize".to_owned(),
+                        idempotency_key: None,
+                    },
+                )
+                .unwrap_err(),
+            "MVP_STORAGE_SPEAKER_INVALID"
+        );
     }
 
     #[test]

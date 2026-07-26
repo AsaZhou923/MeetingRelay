@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic, consent-safe R0 representative meeting material pack for live translation acceptance evidence.",
+  "count_method": {
+    "words": "Regex token count over Unicode letters/numbers plus apostrophe or hyphen continuations.",
+    "non_whitespace_characters": "UTF-8 text decoded as Unicode, with all whitespace removed before counting code units."
+  },
+  "materials": [
+    {
+      "id": "r0-material-zh-cn-ops-sync-001",
+      "file": "r0-zh-cn-ops-sync-001.md",
+      "source_language": "zh-CN",
+      "recommended_directions": [
+        {
+          "target_language": "ja-JP",
+          "direction": "zh-CN->ja-JP"
+        }
+      ],
+      "estimated_duration_minutes": "10-12",
+      "count": {
+        "unit": "non_whitespace_characters",
+        "value": 4039
+      },
+      "sha256_utf8": "6fbcd7eef3b22421df9b7ea1b0595a811d8eeeb10ba0f0310b62110c5e11f747"
+    },
+    {
+      "id": "r0-material-ja-jp-ops-sync-001",
+      "file": "r0-ja-jp-ops-sync-001.md",
+      "source_language": "ja-JP",
+      "recommended_directions": [
+        {
+          "target_language": "zh-CN",
+          "direction": "ja-JP->zh-CN"
+        }
+      ],
+      "estimated_duration_minutes": "10-12",
+      "count": {
+        "unit": "non_whitespace_characters",
+        "value": 5459
+      },
+      "sha256_utf8": "7e9beb48f649e9b188177a0c43007cb4f95002e3340ceecd44c422bf136efbbb"
+    },
+    {
+      "id": "r0-material-en-us-ops-sync-001",
+      "file": "r0-en-us-ops-sync-001.md",
+      "source_language": "en-US",
+      "recommended_directions": [
+        {
+          "target_language": "zh-CN",
+          "direction": "en-US->zh-CN"
+        }
+      ],
+      "estimated_duration_minutes": "10-12",
+      "count": {
+        "unit": "words",
+        "value": 2092
+      },
+      "sha256_utf8": "b6974119d31de6f850318e7c26758d2d130dec61d00c0f1637cca73ce0170a2c"
+    }
+  ]
+}

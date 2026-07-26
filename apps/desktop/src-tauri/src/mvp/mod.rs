@@ -6,19 +6,26 @@ pub mod document_export;
 pub mod dsp;
 pub mod export;
 pub mod governance;
+pub(crate) mod overlay;
 pub mod raw_audio;
 pub mod secret_store;
 mod service;
+pub mod speaker;
 pub mod storage;
 pub mod summary;
 pub mod translation;
 
+pub(crate) use overlay::CAPTION_OVERLAY_LABEL;
 pub(crate) use service::MVP_SHUTDOWN_TIMEOUT;
 pub use service::MvpService;
 
 use audio::{AudioDeviceInventory, AudioDeviceSelection, AudioSourceMode};
 use contract::MvpSnapshot;
 use export::ExportResult;
+use speaker::{
+    SpeakerDiarizationResult, SpeakerMergeRequest, SpeakerRenameRequest, SpeakerUndoRequest,
+    SpeakerVersionSnapshot,
+};
 use translation::{TranslationConfig, TranslationProbe};
 
 #[tauri::command(async)]
@@ -276,6 +283,55 @@ pub fn mvp_transcript_text(
     meeting_id: String,
 ) -> Result<String, String> {
     service.transcript_text(&meeting_id)
+}
+
+#[tauri::command(async)]
+pub fn mvp_speaker_diarize(
+    service: tauri::State<'_, MvpService>,
+    meeting_id: String,
+) -> Result<SpeakerDiarizationResult, String> {
+    service.diarize_speakers(&meeting_id)
+}
+
+#[tauri::command]
+pub fn mvp_speaker_latest(
+    service: tauri::State<'_, MvpService>,
+    meeting_id: String,
+) -> Result<Option<SpeakerVersionSnapshot>, String> {
+    service.latest_speaker_version(&meeting_id)
+}
+
+#[tauri::command]
+pub fn mvp_speaker_version(
+    service: tauri::State<'_, MvpService>,
+    meeting_id: String,
+    version: u32,
+) -> Result<Option<SpeakerVersionSnapshot>, String> {
+    service.speaker_version(&meeting_id, version)
+}
+
+#[tauri::command(async)]
+pub fn mvp_speaker_rename(
+    service: tauri::State<'_, MvpService>,
+    request: SpeakerRenameRequest,
+) -> Result<SpeakerVersionSnapshot, String> {
+    service.rename_speaker(request)
+}
+
+#[tauri::command(async)]
+pub fn mvp_speaker_merge(
+    service: tauri::State<'_, MvpService>,
+    request: SpeakerMergeRequest,
+) -> Result<SpeakerVersionSnapshot, String> {
+    service.merge_speakers(request)
+}
+
+#[tauri::command(async)]
+pub fn mvp_speaker_undo(
+    service: tauri::State<'_, MvpService>,
+    request: SpeakerUndoRequest,
+) -> Result<SpeakerVersionSnapshot, String> {
+    service.undo_speaker_edit(request)
 }
 
 #[tauri::command(async)]

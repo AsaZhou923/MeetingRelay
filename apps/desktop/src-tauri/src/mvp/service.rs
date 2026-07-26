@@ -18,6 +18,10 @@ use super::{
         read_mixed_window_16khz,
     },
     secret_store::{ProductionSecretStore, SecretStore, SecretStoreStatus},
+    speaker::{
+        SpeakerDiarizationResult, SpeakerMergeRequest, SpeakerRenameRequest, SpeakerUndoRequest,
+        SpeakerVersionSnapshot, draft_from_raw_audio, merge_draft, rename_draft, undo_draft,
+    },
     storage::{
         DurableFinal, FinalCandidate, MeetingLibraryItem, MeetingLibraryQuery, MvpStorage,
         MvpStorageWriter, ProviderProfileInput, ProviderProfileRecord, RecoveryActionKind,
@@ -1412,6 +1416,182 @@ impl MvpService {
             .as_ref()
             .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
         transcript_text(storage, meeting_id)
+    }
+
+    pub fn diarize_speakers(&self, meeting_id: &str) -> Result<SpeakerDiarizationResult, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let snapshot = storage.snapshot(meeting_id)?;
+        if matches!(snapshot.meeting.state.as_str(), "recording" | "paused") {
+            return Err("SPEAKER_MEETING_ACTIVE".to_owned());
+        }
+        let draft = match self.raw_audio_manifest(meeting_id) {
+            Ok(Some(manifest)) => match draft_from_raw_audio(&manifest, &snapshot.finals) {
+                Ok(Some(draft)) => draft,
+                Ok(None) => {
+                    return Ok(SpeakerDiarizationResult {
+                        meeting_id: meeting_id.to_owned(),
+                        version: None,
+                        status: "skipped".to_owned(),
+                        reason: Some("SPEAKER_NO_FINALS".to_owned()),
+                    });
+                }
+                Err(error) => {
+                    return Ok(SpeakerDiarizationResult {
+                        meeting_id: meeting_id.to_owned(),
+                        version: None,
+                        status: "failed".to_owned(),
+                        reason: Some(error),
+                    });
+                }
+            },
+            Ok(None) => {
+                return Ok(SpeakerDiarizationResult {
+                    meeting_id: meeting_id.to_owned(),
+                    version: None,
+                    status: "unavailable".to_owned(),
+                    reason: Some("SPEAKER_RAW_AUDIO_REQUIRED".to_owned()),
+                });
+            }
+            Err(error) => {
+                return Ok(SpeakerDiarizationResult {
+                    meeting_id: meeting_id.to_owned(),
+                    version: None,
+                    status: "failed".to_owned(),
+                    reason: Some(error),
+                });
+            }
+        };
+        let version = writer.record_speaker_version(meeting_id, draft)?;
+        Ok(SpeakerDiarizationResult {
+            meeting_id: meeting_id.to_owned(),
+            version: Some(version.version),
+            status: "completed".to_owned(),
+            reason: None,
+        })
+    }
+
+    pub fn latest_speaker_version(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Option<SpeakerVersionSnapshot>, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        storage.latest_speaker_version(meeting_id)
+    }
+
+    pub fn speaker_version(
+        &self,
+        meeting_id: &str,
+        version: u32,
+    ) -> Result<Option<SpeakerVersionSnapshot>, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        storage.speaker_version(meeting_id, version)
+    }
+
+    pub fn rename_speaker(
+        &self,
+        request: SpeakerRenameRequest,
+    ) -> Result<SpeakerVersionSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        ensure_speaker_meeting_inactive(storage, &request.meeting_id)?;
+        let current = storage
+            .speaker_version(&request.meeting_id, request.base_version)?
+            .ok_or_else(|| "SPEAKER_VERSION_NOT_FOUND".to_owned())?;
+        let draft = rename_draft(&current, &request)?;
+        writer.record_speaker_version(&request.meeting_id, draft)
+    }
+
+    pub fn merge_speakers(
+        &self,
+        request: SpeakerMergeRequest,
+    ) -> Result<SpeakerVersionSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        ensure_speaker_meeting_inactive(storage, &request.meeting_id)?;
+        let current = storage
+            .speaker_version(&request.meeting_id, request.base_version)?
+            .ok_or_else(|| "SPEAKER_VERSION_NOT_FOUND".to_owned())?;
+        let draft = merge_draft(&current, &request)?;
+        writer.record_speaker_version(&request.meeting_id, draft)
+    }
+
+    pub fn undo_speaker_edit(
+        &self,
+        request: SpeakerUndoRequest,
+    ) -> Result<SpeakerVersionSnapshot, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let writer = self
+            .storage_writer
+            .as_ref()
+            .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        ensure_speaker_meeting_inactive(storage, &request.meeting_id)?;
+        let current = storage
+            .speaker_version(&request.meeting_id, request.base_version)?
+            .ok_or_else(|| "SPEAKER_VERSION_NOT_FOUND".to_owned())?;
+        let parent_version = current
+            .parent_version
+            .ok_or_else(|| "SPEAKER_UNDO_NOT_AVAILABLE".to_owned())?;
+        let parent = storage
+            .speaker_version(&request.meeting_id, parent_version)?
+            .ok_or_else(|| "SPEAKER_VERSION_NOT_FOUND".to_owned())?;
+        let draft = undo_draft(&current, &parent, &request)?;
+        writer.record_speaker_version(&request.meeting_id, draft)
+    }
+
+    fn raw_audio_manifest(&self, meeting_id: &str) -> Result<Option<RawAudioManifest>, String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?;
+        let data_root = storage
+            .default_export_dir()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
+        RawAudioStore::new(RawAudioConfig {
+            enabled: true,
+            root_dir: data_root,
+            quota_bytes: None,
+            retention: RawAudioRetentionPolicy::NeverAutoDelete,
+        })
+        .load_manifest(meeting_id)
+        .map_err(|error| match error {
+            RawAudioError::InvalidMeetingId => "RAW_AUDIO_MANIFEST_INVALID".to_owned(),
+            RawAudioError::InvalidPacket(_) => "RAW_AUDIO_MANIFEST_INVALID".to_owned(),
+            RawAudioError::Json(_) => "RAW_AUDIO_MANIFEST_INVALID".to_owned(),
+            RawAudioError::Io(_) => "RAW_AUDIO_MANIFEST_READ_FAILED".to_owned(),
+            RawAudioError::SourceFormatChanged { .. } | RawAudioError::QuotaExceeded { .. } => {
+                "RAW_AUDIO_MANIFEST_INVALID".to_owned()
+            }
+        })
     }
 
     pub fn retry_translation_segment(
@@ -2960,6 +3140,14 @@ fn storage_error_from_snapshot(snapshot: &Mutex<MvpSnapshot>) -> String {
         .unwrap_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())
 }
 
+fn ensure_speaker_meeting_inactive(storage: &MvpStorage, meeting_id: &str) -> Result<(), String> {
+    let snapshot = storage.snapshot(meeting_id)?;
+    if matches!(snapshot.meeting.state.as_str(), "recording" | "paused") {
+        return Err("SPEAKER_MEETING_ACTIVE".to_owned());
+    }
+    Ok(())
+}
+
 fn provider_secret_id(provider_profile_id: &str) -> Result<String, String> {
     if provider_profile_id.is_empty()
         || provider_profile_id.len() > 128
@@ -3861,32 +4049,163 @@ fn public_raw_audio_policy_error(error: &RawAudioError) -> String {
 
 #[cfg(windows)]
 fn resolve_model_paths() -> Result<LockedSherpaRealtimePaths, String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
+    let workspace_candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let workspace_root = workspace_candidate
         .canonicalize()
-        .map_err(|_| "MVP_WORKSPACE_ROOT_UNAVAILABLE".to_owned())?;
-    let extracted = root.join("target/sherpa-native/extracted");
-    let model_root = extracted.join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17");
-    let runtime_root = extracted.join("sherpa-onnx-v1.13.4-win-x64-shared-MT-Release-lib/lib");
+        .unwrap_or(workspace_candidate);
+    let executable = env::current_exe().map_err(|_| "SHERPA_ASSET_MISSING".to_owned())?;
+    let exe_dir = executable
+        .parent()
+        .ok_or_else(|| "SHERPA_ASSET_MISSING".to_owned())?
+        .canonicalize()
+        .map_err(|_| "SHERPA_ASSET_MISSING".to_owned())?;
+
+    resolve_model_paths_from(&exe_dir, &workspace_root, ModelPathOverrides::from_env())
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct ModelPathOverrides {
+    model_path: Option<std::ffi::OsString>,
+    tokens_path: Option<std::ffi::OsString>,
+    runtime_lib_dir: Option<std::ffi::OsString>,
+    asset_lock_path: Option<std::ffi::OsString>,
+    package_lock_path: Option<std::ffi::OsString>,
+}
+
+#[cfg(windows)]
+impl ModelPathOverrides {
+    fn from_env() -> Self {
+        Self {
+            model_path: env::var_os("MEETINGRELAY_SHERPA_MODEL"),
+            tokens_path: env::var_os("MEETINGRELAY_SHERPA_TOKENS"),
+            runtime_lib_dir: env::var_os("SHERPA_ONNX_LIB_DIR"),
+            asset_lock_path: env::var_os("MEETINGRELAY_SHERPA_LOCK"),
+            package_lock_path: env::var_os("MEETINGRELAY_PACKAGE_LOCK"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resolve_model_paths_from(
+    exe_dir: &Path,
+    workspace_root: &Path,
+    overrides: ModelPathOverrides,
+) -> Result<LockedSherpaRealtimePaths, String> {
+    let installed = installed_model_path_candidates(exe_dir);
+    let installed_layout_present = model_path_candidates_have_any_entry(&installed);
+    let running_from_workspace_target = exe_dir.starts_with(workspace_root.join("target"));
+    let use_installed_layout = installed_layout_present || !running_from_workspace_target;
+    let defaults = if use_installed_layout {
+        let missing = missing_model_path_candidates(&installed, &overrides);
+        if !missing.is_empty() {
+            return Err(format!(
+                "SHERPA_ASSET_MISSING installed_layout={}",
+                missing.join(",")
+            ));
+        }
+        installed
+    } else {
+        workspace_model_path_candidates(workspace_root)
+    };
 
     Ok(LockedSherpaRealtimePaths {
-        model_path: canonical_env_or(
-            "MEETINGRELAY_SHERPA_MODEL",
-            model_root.join("model.int8.onnx"),
+        model_path: canonical_env_or_value(overrides.model_path, defaults.model_path)?,
+        tokens_path: canonical_env_or_value(overrides.tokens_path, defaults.tokens_path)?,
+        runtime_lib_dir: canonical_env_or_value(
+            overrides.runtime_lib_dir,
+            defaults.runtime_lib_dir,
         )?,
-        tokens_path: canonical_env_or("MEETINGRELAY_SHERPA_TOKENS", model_root.join("tokens.txt"))?,
-        runtime_lib_dir: canonical_env_or("SHERPA_ONNX_LIB_DIR", runtime_root)?,
-        asset_lock_path: canonical_env_or(
-            "MEETINGRELAY_SHERPA_LOCK",
-            root.join("tools/sherpa-native/assets.lock.json"),
+        asset_lock_path: canonical_env_or_value(
+            overrides.asset_lock_path,
+            defaults.asset_lock_path,
         )?,
-        package_lock_path: canonical_env_or("MEETINGRELAY_PACKAGE_LOCK", root.join("Cargo.lock"))?,
+        package_lock_path: canonical_env_or_value(
+            overrides.package_lock_path,
+            defaults.package_lock_path,
+        )?,
     })
 }
 
 #[cfg(windows)]
-fn canonical_env_or(name: &str, fallback: PathBuf) -> Result<PathBuf, String> {
-    canonical_env_or_value(env::var_os(name), fallback)
+fn model_path_candidates_have_any_entry(paths: &ModelPathCandidates) -> bool {
+    paths.model_path.exists()
+        || paths.tokens_path.exists()
+        || paths.runtime_lib_dir.exists()
+        || paths.asset_lock_path.exists()
+        || paths.package_lock_path.exists()
+}
+
+#[cfg(windows)]
+fn missing_model_path_candidates(
+    paths: &ModelPathCandidates,
+    overrides: &ModelPathOverrides,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if overrides.model_path.is_none() && !paths.model_path.is_file() {
+        missing.push("model");
+    }
+    if overrides.tokens_path.is_none() && !paths.tokens_path.is_file() {
+        missing.push("tokens");
+    }
+    if overrides.runtime_lib_dir.is_none() && !paths.runtime_lib_dir.is_dir() {
+        missing.push("runtime");
+    }
+    if overrides.asset_lock_path.is_none() && !paths.asset_lock_path.is_file() {
+        missing.push("asset-lock");
+    }
+    if overrides.package_lock_path.is_none() && !paths.package_lock_path.is_file() {
+        missing.push("package-lock");
+    }
+    missing
+}
+
+#[cfg(windows)]
+struct ModelPathCandidates {
+    model_path: PathBuf,
+    tokens_path: PathBuf,
+    runtime_lib_dir: PathBuf,
+    asset_lock_path: PathBuf,
+    package_lock_path: PathBuf,
+}
+
+#[cfg(windows)]
+fn installed_model_path_candidates(exe_dir: &Path) -> ModelPathCandidates {
+    ModelPathCandidates {
+        model_path: exe_dir.join("model/model.int8.onnx"),
+        tokens_path: exe_dir.join("model/tokens.txt"),
+        runtime_lib_dir: exe_dir.join("runtime/lib"),
+        asset_lock_path: exe_dir.join("locks/assets.lock.json"),
+        package_lock_path: exe_dir.join("locks/Cargo.lock"),
+    }
+}
+
+#[cfg(windows)]
+fn workspace_model_path_candidates(workspace_root: &Path) -> ModelPathCandidates {
+    let extracted = workspace_root.join("target/sherpa-native/extracted");
+    let model_root = extracted.join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17");
+    let runtime_root = extracted.join("sherpa-onnx-v1.13.4-win-x64-shared-MT-Release-lib/lib");
+
+    ModelPathCandidates {
+        model_path: model_root.join("model.int8.onnx"),
+        tokens_path: model_root.join("tokens.txt"),
+        runtime_lib_dir: runtime_root,
+        asset_lock_path: workspace_root.join("tools/sherpa-native/assets.lock.json"),
+        package_lock_path: workspace_root.join("Cargo.lock"),
+    }
+}
+
+#[cfg(all(windows, test))]
+fn canonical_model_path_candidates(
+    paths: ModelPathCandidates,
+) -> Result<ModelPathCandidates, String> {
+    Ok(ModelPathCandidates {
+        model_path: canonical_asset(paths.model_path)?,
+        tokens_path: canonical_asset(paths.tokens_path)?,
+        runtime_lib_dir: canonical_asset(paths.runtime_lib_dir)?,
+        asset_lock_path: canonical_asset(paths.asset_lock_path)?,
+        package_lock_path: canonical_asset(paths.package_lock_path)?,
+    })
 }
 
 #[cfg(windows)]
@@ -5061,6 +5380,54 @@ mod tests {
         dsp::{BLOCK_SAMPLES, SPEECH_START_BLOCKS},
     };
 
+    #[cfg(windows)]
+    fn unique_temp_root(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "meetingrelay-service-{test_name}-{}-{}",
+            std::process::id(),
+            crate::mvp::storage::now_ms_string()
+        ))
+    }
+
+    #[cfg(windows)]
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("file has parent")).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_installed_model_layout(exe_dir: &Path) -> LockedSherpaRealtimePaths {
+        let paths = installed_model_path_candidates(exe_dir);
+        write_file(&paths.model_path, "installed model");
+        write_file(&paths.tokens_path, "installed tokens");
+        std::fs::create_dir_all(&paths.runtime_lib_dir).unwrap();
+        write_file(&paths.asset_lock_path, "installed asset lock");
+        write_file(&paths.package_lock_path, "installed cargo lock");
+        locked_paths_from_candidates(canonical_model_path_candidates(paths).unwrap())
+    }
+
+    #[cfg(windows)]
+    fn create_workspace_model_layout(workspace_root: &Path) -> LockedSherpaRealtimePaths {
+        let paths = workspace_model_path_candidates(workspace_root);
+        write_file(&paths.model_path, "workspace model");
+        write_file(&paths.tokens_path, "workspace tokens");
+        std::fs::create_dir_all(&paths.runtime_lib_dir).unwrap();
+        write_file(&paths.asset_lock_path, "workspace asset lock");
+        write_file(&paths.package_lock_path, "workspace cargo lock");
+        locked_paths_from_candidates(canonical_model_path_candidates(paths).unwrap())
+    }
+
+    #[cfg(windows)]
+    fn locked_paths_from_candidates(paths: ModelPathCandidates) -> LockedSherpaRealtimePaths {
+        LockedSherpaRealtimePaths {
+            model_path: paths.model_path,
+            tokens_path: paths.tokens_path,
+            runtime_lib_dir: paths.runtime_lib_dir,
+            asset_lock_path: paths.asset_lock_path,
+            package_lock_path: paths.package_lock_path,
+        }
+    }
+
     #[test]
     fn provider_secret_status_never_exposes_secret_bytes() {
         let root = std::env::temp_dir().join(format!(
@@ -5532,6 +5899,7 @@ mod tests {
                         include_summary: true,
                         include_timestamp: true,
                         summary_version: Some(1),
+                        speaker_version: None,
                         summary: None,
                     },
                 )
@@ -5694,6 +6062,190 @@ mod tests {
             );
             assert!(reader.snapshot(&faulted.id).is_ok());
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn speaker_diarization_requires_completed_raw_audio_without_writing_fallback_version() {
+        let (storage, writer) = temp_storage_writer("speaker-raw-required");
+        let service = MvpService::new_with_dependencies(
+            Ok(storage.clone()),
+            Arc::new(MemorySecretStore::new()),
+        );
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(crate::mvp::storage::FinalCandidate {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                sequence: 1,
+                revision: 1,
+                text: "speaker source".to_owned(),
+                started_at_ms: "0".to_owned(),
+                ended_at_ms: "1000".to_owned(),
+                meeting_sample_start: 0,
+                meeting_sample_end: 16_000,
+                timeline_revision: 1,
+            })
+            .unwrap();
+        writer.complete_meeting(&meeting.id).unwrap();
+
+        let result = service.diarize_speakers(&meeting.id).unwrap();
+        assert_eq!(result.status, "unavailable");
+        assert_eq!(result.version, None);
+        assert_eq!(result.reason.as_deref(), Some("SPEAKER_RAW_AUDIO_REQUIRED"));
+        assert!(
+            storage
+                .latest_speaker_version(&meeting.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn speaker_diarization_rejects_active_meetings_before_raw_audio_access() {
+        let (storage, writer) = temp_storage_writer("speaker-active");
+        let service =
+            MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+
+        assert_eq!(
+            service.diarize_speakers(&meeting.id).unwrap_err(),
+            "SPEAKER_MEETING_ACTIVE"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn speaker_manual_edits_allow_exact_retry_but_reject_stale_new_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-service-speaker-edit-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let service = MvpService::new_with_dependencies(
+            Ok(storage.clone()),
+            Arc::new(MemorySecretStore::new()),
+        );
+        let writer = service.storage_writer.as_ref().unwrap();
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        for sequence in 1..=2 {
+            writer
+                .commit_final(crate::mvp::storage::FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: format!("segment-{sequence}"),
+                    sequence,
+                    revision: 1,
+                    text: format!("speaker {sequence}"),
+                    started_at_ms: "0".to_owned(),
+                    ended_at_ms: "1000".to_owned(),
+                    meeting_sample_start: sequence * 16_000,
+                    meeting_sample_end: sequence * 16_000 + 16_000,
+                    timeline_revision: 1,
+                })
+                .unwrap();
+        }
+        writer.complete_meeting(&meeting.id).unwrap();
+        writer
+            .record_speaker_version(
+                &meeting.id,
+                crate::mvp::speaker::SpeakerVersionDraft {
+                    parent_version: None,
+                    base_version: None,
+                    algorithm: "test.speaker.v1".to_owned(),
+                    identities: vec![
+                        crate::mvp::speaker::SpeakerIdentity {
+                            speaker_id: "spk-1".to_owned(),
+                            display_name: "Speaker 1".to_owned(),
+                        },
+                        crate::mvp::speaker::SpeakerIdentity {
+                            speaker_id: "spk-2".to_owned(),
+                            display_name: "Speaker 2".to_owned(),
+                        },
+                    ],
+                    assignments: vec![
+                        crate::mvp::speaker::SpeakerSegmentAssignment {
+                            segment_id: "segment-1".to_owned(),
+                            sequence: 1,
+                            source_revision: 1,
+                            speaker_id: "spk-1".to_owned(),
+                            confidence: 0.9,
+                        },
+                        crate::mvp::speaker::SpeakerSegmentAssignment {
+                            segment_id: "segment-2".to_owned(),
+                            sequence: 2,
+                            source_revision: 1,
+                            speaker_id: "spk-2".to_owned(),
+                            confidence: 0.9,
+                        },
+                    ],
+                    operation: "diarize".to_owned(),
+                    idempotency_key: Some("initial".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let rename_request = SpeakerRenameRequest {
+            meeting_id: meeting.id.clone(),
+            speaker_id: "spk-1".to_owned(),
+            display_name: "Alice".to_owned(),
+            base_version: 1,
+            idempotency_key: "rename-exact".to_owned(),
+        };
+        assert_eq!(
+            service
+                .rename_speaker(rename_request.clone())
+                .unwrap()
+                .version,
+            2
+        );
+        assert_eq!(service.rename_speaker(rename_request).unwrap().version, 2);
+
+        let merge_request = SpeakerMergeRequest {
+            meeting_id: meeting.id.clone(),
+            from_speaker_id: "spk-2".to_owned(),
+            into_speaker_id: "spk-1".to_owned(),
+            display_name: Some("Alice".to_owned()),
+            base_version: 2,
+            idempotency_key: "merge-exact".to_owned(),
+        };
+        assert_eq!(
+            service
+                .merge_speakers(merge_request.clone())
+                .unwrap()
+                .version,
+            3
+        );
+        assert_eq!(service.merge_speakers(merge_request).unwrap().version, 3);
+
+        let undo_request = SpeakerUndoRequest {
+            meeting_id: meeting.id.clone(),
+            base_version: 3,
+            idempotency_key: "undo-exact".to_owned(),
+        };
+        assert_eq!(
+            service
+                .undo_speaker_edit(undo_request.clone())
+                .unwrap()
+                .version,
+            4
+        );
+        assert_eq!(service.undo_speaker_edit(undo_request).unwrap().version, 4);
+
+        assert_eq!(
+            service
+                .rename_speaker(SpeakerRenameRequest {
+                    meeting_id: meeting.id.clone(),
+                    speaker_id: "spk-1".to_owned(),
+                    display_name: "Stale".to_owned(),
+                    base_version: 2,
+                    idempotency_key: "rename-stale-new".to_owned(),
+                })
+                .unwrap_err(),
+            "SPEAKER_BASE_VERSION_CONFLICT"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6285,6 +6837,125 @@ mod tests {
             canonical_env_or_value(Some(override_lock.clone().into_os_string()), fallback).unwrap(),
             override_lock.canonicalize().unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_model_paths_prefers_complete_installed_layout_without_env_overrides() {
+        let root = unique_temp_root("installed-layout");
+        let exe_dir = root.join("app");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let installed = create_installed_model_layout(&exe_dir);
+        let _workspace = create_workspace_model_layout(&workspace_root);
+
+        let resolved = resolve_model_paths_from(
+            &exe_dir.canonicalize().unwrap(),
+            &workspace_root.canonicalize().unwrap(),
+            ModelPathOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, installed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_model_paths_uses_installed_layout_when_build_checkout_is_absent() {
+        let root = unique_temp_root("installed-without-checkout");
+        let exe_dir = root.join("app");
+        let missing_workspace_root = root.join("removed-build-checkout");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let installed = create_installed_model_layout(&exe_dir);
+
+        let resolved = resolve_model_paths_from(
+            &exe_dir.canonicalize().unwrap(),
+            &missing_workspace_root,
+            ModelPathOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, installed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_model_paths_rejects_partial_installed_layout_without_workspace_fallback() {
+        let root = unique_temp_root("partial-installed-layout");
+        let exe_dir = root.join("app");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let partial = installed_model_path_candidates(&exe_dir);
+        write_file(&partial.model_path, "installed model only");
+        let _workspace = create_workspace_model_layout(&workspace_root);
+
+        let error = resolve_model_paths_from(
+            &exe_dir.canonicalize().unwrap(),
+            &workspace_root.canonicalize().unwrap(),
+            ModelPathOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("SHERPA_ASSET_MISSING installed_layout="));
+        assert!(error.contains("tokens"));
+        assert!(error.contains("runtime"));
+        assert!(error.contains("asset-lock"));
+        assert!(error.contains("package-lock"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_model_paths_uses_workspace_only_for_target_dev_executables() {
+        let root = unique_temp_root("workspace-dev-layout");
+        let workspace_root = root.join("workspace");
+        let exe_dir = workspace_root.join("target/debug");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let workspace = create_workspace_model_layout(&workspace_root);
+
+        let resolved = resolve_model_paths_from(
+            &exe_dir.canonicalize().unwrap(),
+            &workspace_root.canonicalize().unwrap(),
+            ModelPathOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, workspace);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_model_paths_applies_explicit_overrides_to_selected_defaults() {
+        let root = unique_temp_root("override-layout");
+        let exe_dir = root.join("app");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let installed = create_installed_model_layout(&exe_dir);
+        let override_model = root.join("override/model.int8.onnx");
+        write_file(&override_model, "override model");
+
+        let resolved = resolve_model_paths_from(
+            &exe_dir.canonicalize().unwrap(),
+            &workspace_root.canonicalize().unwrap(),
+            ModelPathOverrides {
+                model_path: Some(override_model.clone().into_os_string()),
+                ..ModelPathOverrides::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.model_path, override_model.canonicalize().unwrap());
+        assert_eq!(resolved.tokens_path, installed.tokens_path);
+        assert_eq!(resolved.runtime_lib_dir, installed.runtime_lib_dir);
+        assert_eq!(resolved.asset_lock_path, installed.asset_lock_path);
+        assert_eq!(resolved.package_lock_path, installed.package_lock_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

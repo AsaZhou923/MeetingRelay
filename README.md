@@ -232,6 +232,7 @@ Launch and release contracts:
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/mvp/start.test.ps1
 pnpm mvp:release:personal:test
+pnpm mvp:acceptance:test
 ```
 
 CI is defined in [`.github/workflows/mvp.yml`](.github/workflows/mvp.yml). It runs on Windows Server 2022 and validates locked dependencies, the frontend, Rust formatting/Clippy/tests, pinned Sherpa assets, and the package-local Release build.
@@ -245,6 +246,7 @@ MeetingRelay/
 ├── crates/model-worker-contract/        # Internal ASR interface types
 ├── tools/sherpa-native/                 # Pinned assets, validation, and runtime staging
 ├── tools/mvp/                           # Windows launch and release tooling
+├── tools/distribution/                  # NSIS staging, SBOM, signing, and release gates
 └── .github/workflows/mvp.yml            # Windows product CI
 ```
 
@@ -256,9 +258,9 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 - Mixed-language recognition is not supported. Each meeting uses one selected recognition language.
 - OpenAI-compatible translation uses non-streaming requests per final segment. Manual segment/meeting retry and sanitized attempt provenance are included; token streaming, context windows, proxies, and custom headers/bodies are not.
 - The 60-minute microphone path and an audible system-loopback short meeting have passed real-device validation. Device hot-plug behavior still requires validation.
-- A short real Windows system-audio meeting has passed the full local-ASR → remote-translation → SQLite path with `gpt-5.4-mini`. A 10–20 minute translated meeting over HTTPS, a second clean Windows machine, and a signed installer have not been validated.
-- `MeetingRelay.exe` is unsigned, and public assets do not include the model or Sherpa runtime.
-- Speaker diarization is not implemented. Versioned meeting summaries, full-text search, tags, optional raw-audio capture, and segment-level playback location are available; raw audio remains disabled by default.
+- A short real Windows system-audio meeting has passed the full local-ASR → remote-translation → SQLite path with `gpt-5.4-mini`. The repository now includes a repeatable Windows acceptance evidence gate for 10–20 minute HTTPS meetings, cost/latency/quality reporting, two-hour dual-source loss/gap, and timeline p95/max thresholds. A real evidence run on representative hardware, a second clean Windows machine, and a signed installer have not been validated.
+- The published `MeetingRelay.exe` is unsigned, and public assets do not include the model or Sherpa runtime. The repository can build an explicitly marked unsigned NSIS test installer; a formal installer remains blocked until asset redistribution is approved and an Authenticode certificate is supplied.
+- Post-meeting speaker diarization is available when raw audio was explicitly captured. If raw audio is missing or unreadable, MeetingRelay reports speaker analysis as unavailable/failed and does not create a text-derived speaker version.
 
 ## Roadmap
 
@@ -266,7 +268,7 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 - Validate audible system-output loopback and device hot-plug behavior.
 - Evaluate streaming translation only if complete-result latency proves disruptive in real meetings.
 - Validate system-only, microphone-only, both-source, raw-audio recovery, and disk-pressure behavior on representative Windows hardware.
-- Validate a signed installer and a second clean-machine test; Windows Credential Manager integration and a real credential round trip are complete.
+- Approve the pinned model/runtime redistribution records, sign the NSIS installer and bundled Windows binaries, and complete the second clean-machine install/upgrade/uninstall test. Windows Credential Manager integration and a real credential round trip are complete.
 
 ## Contributing
 
@@ -288,7 +290,7 @@ Keep changes small and reviewable. Do not commit API tokens, real meeting conten
 
 This repository does not currently include a standalone `LICENSE` file. Until a code license is explicitly added, do not assume permission to copy, modify, or redistribute the repository's source code.
 
-The SenseVoice model, Sherpa native runtime, and other third-party components remain subject to their respective upstream licenses. The formal GitHub Release provides only an unsigned EXE and does not bundle models or the native runtime.
+The SenseVoice model, Sherpa native runtime, and other third-party components remain subject to their respective upstream licenses. `NOTICE.md`, `THIRD_PARTY_NOTICES.md`, SBOM generation, and a strict redistribution-approval gate are present, but the locked distribution statuses are still pending. The current formal GitHub Release therefore remains the unsigned EXE and does not bundle models or the native runtime.
 
 ## Acknowledgements
 

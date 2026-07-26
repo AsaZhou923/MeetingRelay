@@ -115,6 +115,9 @@ export type TranscriptSegment = {
   endedAtMs: string | null;
   committedAt: string | null;
   commitId: string | null;
+  meetingSampleStart: string;
+  meetingSampleEnd: string;
+  timelineRevision: number;
   translationStatus: MvpTranslationStatus;
   translationTarget: MvpRecognitionLanguage | null;
   translationText: string | null;
@@ -279,6 +282,40 @@ export type SummaryJob = {
   result: SummaryResult | null;
 };
 
+export type SpeakerIdentity = {
+  speakerId: string;
+  displayName: string;
+};
+
+export type SpeakerAssignment = {
+  segmentId: string;
+  sequence: string;
+  sourceRevision: number;
+  speakerId: string;
+  confidence: number;
+};
+
+export type SpeakerVersion = {
+  meetingId: string;
+  version: number;
+  parentVersion: number | null;
+  algorithm: string;
+  digest: string;
+  createdAt: string;
+  operation: string;
+  identities: SpeakerIdentity[];
+  assignments: SpeakerAssignment[];
+};
+
+export type SpeakerDiarizationStatus = "completed" | "skipped" | "failed" | "unavailable";
+
+export type SpeakerDiarizationResult = {
+  meetingId: string;
+  version: number | null;
+  status: SpeakerDiarizationStatus;
+  reason: string | null;
+};
+
 export type ExportOptions = {
   formats: MvpExportFormat[];
   includeOriginal: boolean;
@@ -288,6 +325,7 @@ export type ExportOptions = {
   includeSummary: boolean;
   includeTimestamp: boolean;
   summaryVersion: number | null;
+  speakerVersion: number | null;
 };
 
 export type DiskHealthSnapshot = {
@@ -488,6 +526,7 @@ const MAX_AUDIO_DEVICE_ID_LENGTH = 1024;
 const MAX_TAGS_PER_MEETING = 32;
 const TAG_TEXT = /^[^\u0000-\u001f\u007f]{1,64}$/;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+const SPEAKER_STATUSES = ["completed", "skipped", "failed", "unavailable"] as const;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -655,6 +694,21 @@ function safeCount(value: unknown, label: string): number {
   return value;
 }
 
+function positiveSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${label} must be a positive safe integer.`);
+  }
+  return value;
+}
+
+function u32(value: unknown, label: string): number {
+  const parsed = positiveSafeInteger(value, label);
+  if (parsed > 4_294_967_295) {
+    throw new Error(`${label} exceeds u32.`);
+  }
+  return parsed;
+}
+
 function audioSource(value: unknown, expectedId: AudioSourceId): AudioSourceSnapshot {
   const source = object(value, `${expectedId} source`);
   const status = enumValue(source.status, `${expectedId}.status`, SOURCE_STATUSES);
@@ -762,6 +816,9 @@ function transcript(value: unknown, expectedFinal: boolean): TranscriptSegment {
       ? boundedString(segment.committedAt, "segment.committedAt", 64)
       : null,
     commitId: expectedFinal ? identifier(segment.commitId, "segment.commitId") : null,
+    meetingSampleStart: uint64(segment.meetingSampleStart, "segment.meetingSampleStart"),
+    meetingSampleEnd: uint64(segment.meetingSampleEnd, "segment.meetingSampleEnd"),
+    timelineRevision: positiveSafeInteger(segment.timelineRevision, "segment.timelineRevision"),
     translationStatus,
     translationTarget,
     translationText,
@@ -1218,6 +1275,98 @@ export function parseSummaryJob(value: unknown): SummaryJob {
   };
 }
 
+function speakerDisplayName(value: unknown, label: string): string {
+  const text = boundedString(value, label, 80).trim();
+  if (text.length === 0 || CONTROL_CHARACTER.test(text)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return text;
+}
+
+function speakerIdentity(value: unknown, label: string): SpeakerIdentity {
+  const identity = object(value, label);
+  return {
+    speakerId: identifier(identity.speakerId, `${label}.speakerId`),
+    displayName: speakerDisplayName(identity.displayName, `${label}.displayName`),
+  };
+}
+
+function speakerAssignment(value: unknown, label: string): SpeakerAssignment {
+  const assignment = object(value, label);
+  const confidence = assignment.confidence;
+  if (
+    typeof confidence !== "number" ||
+    !Number.isFinite(confidence) ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    throw new Error(`${label}.confidence must be between zero and one.`);
+  }
+  return {
+    segmentId: identifier(assignment.segmentId, `${label}.segmentId`),
+    sequence: uint64(assignment.sequence, `${label}.sequence`),
+    sourceRevision: u32(assignment.sourceRevision, `${label}.sourceRevision`),
+    speakerId: identifier(assignment.speakerId, `${label}.speakerId`),
+    confidence,
+  };
+}
+
+export function parseSpeakerVersion(value: unknown): SpeakerVersion | null {
+  if (value === null) return null;
+  const version = object(value, "speaker version");
+  const digest = boundedString(version.digest, "speaker.digest", 64);
+  if (!SHA256.test(digest)) {
+    throw new Error("speaker.digest must be a SHA-256 hex digest.");
+  }
+  if (!Array.isArray(version.identities) || version.identities.length > 64) {
+    throw new Error("speaker identities must be a bounded array.");
+  }
+  if (!Array.isArray(version.assignments) || version.assignments.length > 10_000) {
+    throw new Error("speaker assignments must be a bounded array.");
+  }
+  const identities = version.identities.map((entry, index) =>
+    speakerIdentity(entry, `speaker.identities[${index}]`),
+  );
+  const identityIds = new Set(identities.map((identity) => identity.speakerId));
+  if (identityIds.size !== identities.length) {
+    throw new Error("speaker identities contain duplicates.");
+  }
+  const assignments = version.assignments.map((entry, index) =>
+    speakerAssignment(entry, `speaker.assignments[${index}]`),
+  );
+  for (const assignment of assignments) {
+    if (!identityIds.has(assignment.speakerId)) {
+      throw new Error("speaker assignment references an unknown identity.");
+    }
+  }
+  return {
+    meetingId: identifier(version.meetingId, "speaker.meetingId"),
+    version: u32(version.version, "speaker.version"),
+    parentVersion: version.parentVersion === null ? null : u32(version.parentVersion, "speaker.parentVersion"),
+    algorithm: boundedString(version.algorithm, "speaker.algorithm", 256),
+    digest,
+    createdAt: boundedString(version.createdAt, "speaker.createdAt", 64),
+    operation: boundedString(version.operation, "speaker.operation", 64),
+    identities,
+    assignments,
+  };
+}
+
+export function parseSpeakerDiarizationResult(value: unknown): SpeakerDiarizationResult {
+  const result = object(value, "speaker diarization result");
+  const version = result.version === null ? null : u32(result.version, "speaker result.version");
+  const status = enumValue(result.status, "speaker result.status", SPEAKER_STATUSES);
+  if ((status === "completed") !== (version !== null)) {
+    throw new Error("speaker result status and version are inconsistent.");
+  }
+  return {
+    meetingId: identifier(result.meetingId, "speaker result.meetingId"),
+    version,
+    status,
+    reason: nullableString(result.reason, "speaker result.reason", 512),
+  };
+}
+
 export function parseExportOptions(value: unknown): ExportOptions {
   const options = object(value, "export options");
   if (!Array.isArray(options.formats) || options.formats.length === 0) {
@@ -1234,6 +1383,13 @@ export function parseExportOptions(value: unknown): ExportOptions {
   if (summaryVersion === 0) {
     throw new Error("export summaryVersion must be positive.");
   }
+  const speakerVersion =
+    options.speakerVersion === null || options.speakerVersion === undefined
+      ? null
+      : safeCount(options.speakerVersion, "export.speakerVersion");
+  if (speakerVersion === 0) {
+    throw new Error("export speakerVersion must be positive.");
+  }
   return {
     formats,
     includeOriginal: boolean(options.includeOriginal, "export.includeOriginal"),
@@ -1243,6 +1399,7 @@ export function parseExportOptions(value: unknown): ExportOptions {
     includeSummary: boolean(options.includeSummary, "export.includeSummary"),
     includeTimestamp: boolean(options.includeTimestamp, "export.includeTimestamp"),
     summaryVersion,
+    speakerVersion,
   };
 }
 

@@ -81,6 +81,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "personal start contract tests failed" }
           pnpm mvp:release:personal:test
           if ($LASTEXITCODE -ne 0) { throw "personal release contract tests failed" }
+          pnpm mvp:acceptance:test
+          if ($LASTEXITCODE -ne 0) { throw "Windows acceptance evidence tests failed" }
         timeout-minutes: 10
 
       - name: Check Rust formatting
@@ -159,6 +161,13 @@ jobs:
           cargo test -p meetingrelay-model-worker-sherpa-native --test native_sherpa_smoke --features native-sherpa --offline --locked -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw "native sherpa smoke failed" }
         timeout-minutes: 20
+
+      - name: Validate Windows distribution contracts
+        shell: pwsh
+        run: |
+          pnpm distribution:test
+          if ($LASTEXITCODE -ne 0) { throw "Windows distribution contract tests failed" }
+        timeout-minutes: 10
 
       - name: Build the package-local personal release
         shell: pwsh

@@ -1,6 +1,6 @@
 {
   "name": "meetingrelay-workspace",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@9.15.9",
   "scripts": {
@@ -10,6 +10,11 @@
     "desktop:test": "pnpm --dir apps/desktop test",
     "mvp:release:personal": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/mvp/release.ps1",
     "mvp:release:personal:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/mvp/release.test.ps1",
+    "mvp:acceptance:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command \"& { & 'tools/mvp/acceptance/Measure-WindowsAcceptance.test.ps1'; & 'tools/mvp/acceptance/Run-LiveProviderMatrix.test.ps1' }\"",
+    "distribution:release": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/release.ps1",
+    "distribution:release:dry-run": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/release.ps1 -DryRun",
+    "distribution:release:unsigned-test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/release.ps1 -UnsignedTestBuild",
+    "distribution:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/Assert-DistributionContract.test.ps1",
     "tauri": "pnpm --dir apps/desktop tauri"
   }
 }

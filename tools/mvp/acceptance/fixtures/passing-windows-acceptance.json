@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "meetingrelay.windows.acceptance.v1",
+  "runId": "fixture-pass",
+  "meetings": [
+    {
+      "id": "fixture-ja-zh",
+      "sourceLanguage": "ja",
+      "targetLanguage": "zh",
+      "durationMinutes": 12.5,
+      "provider": {
+        "baseUrl": "https://api.example.com/v1",
+        "model": "fixture-model",
+        "endpointHash": "redacted-fixture-hash"
+      },
+      "latencyMs": [900, 1100, 1200, 1300, 1400],
+      "failures": [],
+      "cost": {
+        "promptTokens": 3000,
+        "completionTokens": 1500,
+        "estimatedUsd": 0.01
+      },
+      "qualityScore": 0.92
+    },
+    {
+      "id": "fixture-zh-en",
+      "sourceLanguage": "zh",
+      "targetLanguage": "en",
+      "durationMinutes": 15,
+      "provider": {
+        "baseUrl": "https://api.example.com/v1",
+        "model": "fixture-model",
+        "endpointHash": "redacted-fixture-hash"
+      },
+      "latencyMs": [950, 1150, 1250, 1350, 1450],
+      "failures": [],
+      "cost": {
+        "promptTokens": 3200,
+        "completionTokens": 1700,
+        "estimatedUsd": 0.012
+      },
+      "qualityScore": 0.9
+    }
+  ],
+  "audio": {
+    "sampleRateHz": 16000,
+    "expectedDurationSeconds": 7200,
+    "sources": [
+      {
+        "source": "system-output",
+        "meetingSampleStart": 0,
+        "meetingSampleEnd": 115200000,
+        "frameCount": 115200000,
+        "gaps": []
+      },
+      {
+        "source": "microphone",
+        "meetingSampleStart": 0,
+        "meetingSampleEnd": 115200000,
+        "frameCount": 115198000,
+        "gaps": [
+          {
+            "start": 57600000,
+            "end": 57602000,
+            "reason": "DEVICE_BUFFER_RECOVERY"
+          }
+        ]
+      }
+    ]
+  },
+  "timeline": {
+    "sampleRateHz": 16000,
+    "points": [
+      {
+        "segmentId": "s1",
+        "expectedStartSample": 0,
+        "actualStartSample": 800,
+        "expectedEndSample": 32000,
+        "actualEndSample": 33600
+      },
+      {
+        "segmentId": "s2",
+        "expectedStartSample": 64000,
+        "actualStartSample": 67200,
+        "expectedEndSample": 96000,
+        "actualEndSample": 99200
+      },
+      {
+        "segmentId": "s3",
+        "expectedStartSample": 128000,
+        "actualStartSample": 131200,
+        "expectedEndSample": 160000,
+        "actualEndSample": 163200
+      }
+    ]
+  }
+}

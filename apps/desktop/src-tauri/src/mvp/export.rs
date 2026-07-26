@@ -8,8 +8,10 @@ use std::{
 use std::cell::{Cell, RefCell};
 
 use super::document_export::{DocumentModel, Section, render_docx, render_pdf};
+use super::speaker::assignment_display_names;
 use super::storage::{
-    CompletedExport, MeetingSnapshot, MvpStorage, MvpStorageWriter, now_ms_string, sha256_hex,
+    CompletedExport, MeetingSnapshot, MvpStorage, MvpStorageWriter, now_ms_string, semantic_digest,
+    sha256_hex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -49,6 +51,8 @@ pub struct ExportOptions {
     #[serde(default)]
     pub summary_version: Option<u32>,
     #[serde(default)]
+    pub speaker_version: Option<u32>,
+    #[serde(default)]
     pub summary: Option<ExportSummary>,
 }
 
@@ -84,6 +88,7 @@ impl ExportOptions {
             include_summary: false,
             include_timestamp: true,
             summary_version: None,
+            speaker_version: None,
             summary: None,
         }
     }
@@ -100,6 +105,7 @@ impl ExportOptions {
             && !self.include_summary
             && self.include_timestamp
             && self.summary_version.is_none()
+            && self.speaker_version.is_none()
             && self.summary.is_none()
     }
 }
@@ -145,7 +151,34 @@ pub fn export_meeting_with_options(
     options: ExportOptions,
 ) -> Result<ExportResult, String> {
     validate_export_options(&options)?;
-    let snapshot = storage.snapshot(meeting_id)?;
+    let mut snapshot = storage.snapshot(meeting_id)?;
+    if options.include_speaker
+        && let Some(version) = options.speaker_version
+    {
+        snapshot.speaker_version = Some(
+            storage
+                .speaker_version(meeting_id, version)?
+                .ok_or_else(|| "SPEAKER_VERSION_NOT_FOUND".to_owned())?,
+        );
+        snapshot.semantic_sha256 = semantic_digest(
+            &snapshot.meeting,
+            &snapshot.finals,
+            snapshot.speaker_version.as_ref(),
+        );
+        snapshot.snapshot_id = sha256_hex(
+            format!(
+                "{}\n{}\n{}\n{}",
+                snapshot.meeting.id,
+                snapshot.meeting.state,
+                snapshot.snapshot_generation,
+                snapshot.semantic_sha256
+            )
+            .as_bytes(),
+        );
+    }
+    if options.include_speaker && snapshot.speaker_version.is_none() {
+        return Err("SPEAKER_VERSION_NOT_FOUND".to_owned());
+    }
     if snapshot.meeting.state == "recording" {
         return Err("MVP_EXPORT_RECORDING_NOT_ALLOWED".to_owned());
     }
@@ -752,7 +785,11 @@ fn validate_export_options(options: &ExportOptions) -> Result<(), String> {
         }
         seen.push(format);
     }
-    if !options.include_original && !options.include_translation && !options.include_summary {
+    if !options.include_original
+        && !options.include_translation
+        && !options.include_summary
+        && !options.include_speaker
+    {
         return Err("MVP_EXPORT_EMPTY_PROJECTION".to_owned());
     }
     Ok(())
@@ -838,6 +875,7 @@ fn validate_render(format: &str, content: &str) -> Result<(), String> {
 }
 
 fn render_json_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) -> String {
+    let speakers = assignment_display_names(snapshot.speaker_version.as_ref());
     let mut output = String::new();
     output.push_str("{\n");
     output.push_str("  \"schemaVersion\": 3,\n");
@@ -854,6 +892,21 @@ fn render_json_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions)
         "  \"projection\": {},\n",
         json_string(&projection_id(options))
     ));
+    if options.include_speaker {
+        output.push_str(&format!(
+            "  \"speakerVersion\": {},\n  \"speakerDigest\": {},\n",
+            snapshot
+                .speaker_version
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), |version| version.version.to_string()),
+            json_nullable(
+                snapshot
+                    .speaker_version
+                    .as_ref()
+                    .map(|version| version.digest.as_str())
+            )
+        ));
+    }
     output.push_str("  \"segments\": [\n");
     for (index, final_segment) in snapshot.finals.iter().enumerate() {
         output.push_str("    {\n");
@@ -870,7 +923,14 @@ fn render_json_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions)
             ));
         }
         if options.include_speaker {
-            output.push_str("      \"speaker\": null,\n");
+            output.push_str(&format!(
+                "      \"speaker\": {},\n",
+                json_nullable(
+                    speakers
+                        .get(&(final_segment.segment_id.clone(), final_segment.sequence))
+                        .map(String::as_str)
+                )
+            ));
         }
         if options.include_original {
             output.push_str(&format!(
@@ -902,6 +962,7 @@ fn render_json_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions)
 }
 
 fn render_markdown_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) -> String {
+    let speakers = assignment_display_names(snapshot.speaker_version.as_ref());
     let mut output = String::new();
     output.push_str("# MeetingRelay Export\n\n");
     output.push_str(&format!(
@@ -915,6 +976,9 @@ fn render_markdown_with_options(snapshot: &MeetingSnapshot, options: &ExportOpti
     if options.include_summary {
         push_summary_markdown(&mut output, options.summary.as_ref());
     }
+    if options.include_speaker {
+        push_speaker_markdown(&mut output, snapshot);
+    }
     output.push_str("## Transcript\n\n");
     for final_segment in &snapshot.finals {
         let mut prefix = final_segment.sequence.to_string();
@@ -926,7 +990,15 @@ fn render_markdown_with_options(snapshot: &MeetingSnapshot, options: &ExportOpti
             ));
         }
         if options.include_speaker {
-            prefix.push_str(" [speaker: unassigned]");
+            prefix.push_str(&format!(
+                " [speaker: {}]",
+                escape_markdown_inline(
+                    speakers
+                        .get(&(final_segment.segment_id.clone(), final_segment.sequence))
+                        .map(String::as_str)
+                        .unwrap_or("unassigned")
+                )
+            ));
         }
         if options.include_original {
             output.push_str(&format!(
@@ -948,11 +1020,19 @@ fn render_markdown_with_options(snapshot: &MeetingSnapshot, options: &ExportOpti
                 escape_markdown_text(translation)
             ));
         }
+        if options.include_speaker
+            && !options.include_original
+            && !options.include_translation
+            && !options.bilingual
+        {
+            output.push_str(&format!("{prefix}\n\n"));
+        }
     }
     output
 }
 
 fn render_txt_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) -> String {
+    let speakers = assignment_display_names(snapshot.speaker_version.as_ref());
     let mut output = String::new();
     output.push_str("MeetingRelay Export\n");
     output.push_str(&format!(
@@ -972,6 +1052,9 @@ fn render_txt_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) 
     if options.include_summary {
         push_summary_txt(&mut output, options.summary.as_ref());
     }
+    if options.include_speaker {
+        push_speaker_txt(&mut output, snapshot);
+    }
     output.push_str("Transcript\n");
     for final_segment in &snapshot.finals {
         let mut prefix = final_segment.sequence.to_string();
@@ -983,7 +1066,15 @@ fn render_txt_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) 
             ));
         }
         if options.include_speaker {
-            prefix.push_str(" [speaker: unassigned]");
+            prefix.push_str(&format!(
+                " [speaker: {}]",
+                sanitize_plain(
+                    speakers
+                        .get(&(final_segment.segment_id.clone(), final_segment.sequence))
+                        .map(String::as_str)
+                        .unwrap_or("unassigned")
+                )
+            ));
         }
         if options.include_original {
             output.push_str(&format!(
@@ -1005,11 +1096,19 @@ fn render_txt_with_options(snapshot: &MeetingSnapshot, options: &ExportOptions) 
                 sanitize_plain(translation)
             ));
         }
+        if options.include_speaker
+            && !options.include_original
+            && !options.include_translation
+            && !options.bilingual
+        {
+            output.push_str(&format!("{prefix}\n"));
+        }
     }
     output
 }
 
 fn document_model(snapshot: &MeetingSnapshot, options: &ExportOptions) -> DocumentModel {
+    let speakers = assignment_display_names(snapshot.speaker_version.as_ref());
     let mut document = DocumentModel::new(format!("MeetingRelay {}", snapshot.meeting.id));
     let metadata = Section::new("Manifest")
         .with_paragraph(format!("Meeting ID: {}", snapshot.meeting.id))
@@ -1020,6 +1119,9 @@ fn document_model(snapshot: &MeetingSnapshot, options: &ExportOptions) -> Docume
     if options.include_summary {
         document = document.with_section(summary_document_section(options.summary.as_ref()));
     }
+    if options.include_speaker {
+        document = document.with_section(speaker_document_section(snapshot));
+    }
     let mut transcript = Section::new("Transcript");
     for final_segment in &snapshot.finals {
         if options.include_original {
@@ -1028,6 +1130,9 @@ fn document_model(snapshot: &MeetingSnapshot, options: &ExportOptions) -> Docume
                 options,
                 &final_segment.started_at_ms,
                 &final_segment.ended_at_ms,
+                speakers
+                    .get(&(final_segment.segment_id.clone(), final_segment.sequence))
+                    .map(String::as_str),
                 "Original",
                 &final_segment.text,
             ));
@@ -1040,6 +1145,9 @@ fn document_model(snapshot: &MeetingSnapshot, options: &ExportOptions) -> Docume
                 options,
                 &final_segment.started_at_ms,
                 &final_segment.ended_at_ms,
+                speakers
+                    .get(&(final_segment.segment_id.clone(), final_segment.sequence))
+                    .map(String::as_str),
                 &format!(
                     "Translation ({})",
                     final_segment
@@ -1048,6 +1156,25 @@ fn document_model(snapshot: &MeetingSnapshot, options: &ExportOptions) -> Docume
                         .unwrap_or("unknown")
                 ),
                 translation,
+            ));
+        }
+        if options.include_speaker
+            && !options.include_original
+            && !options.include_translation
+            && !options.bilingual
+        {
+            let speaker = speakers
+                .get(&(final_segment.segment_id.clone(), final_segment.sequence))
+                .map(String::as_str)
+                .unwrap_or("unassigned");
+            transcript = transcript.with_paragraph(projected_segment_line(
+                final_segment.sequence,
+                options,
+                &final_segment.started_at_ms,
+                &final_segment.ended_at_ms,
+                Some(speaker),
+                "Speaker",
+                speaker,
             ));
         }
     }
@@ -1059,6 +1186,7 @@ fn projected_segment_line(
     options: &ExportOptions,
     started_at_ms: &str,
     ended_at_ms: &str,
+    speaker: Option<&str>,
     label: &str,
     text: &str,
 ) -> String {
@@ -1067,7 +1195,7 @@ fn projected_segment_line(
         prefix.push_str(&format!(" [{started_at_ms}-{ended_at_ms} ms]"));
     }
     if options.include_speaker {
-        prefix.push_str(" [speaker: unassigned]");
+        prefix.push_str(&format!(" [speaker: {}]", speaker.unwrap_or("unassigned")));
     }
     format!("{prefix} {label}: {text}")
 }
@@ -1087,6 +1215,74 @@ fn summary_document_section(summary: Option<&ExportSummary>) -> Section {
         }
     }
     section
+}
+
+fn speaker_document_section(snapshot: &MeetingSnapshot) -> Section {
+    let mut section = Section::new("Speakers");
+    match snapshot.speaker_version.as_ref() {
+        Some(version) => {
+            section = section
+                .with_paragraph(format!("Version: {}", version.version))
+                .with_paragraph(format!("Digest: {}", version.digest));
+            for identity in &version.identities {
+                section = section.with_paragraph(format!(
+                    "{}: {}",
+                    identity.speaker_id, identity.display_name
+                ));
+            }
+        }
+        None => {
+            section = section.with_paragraph(
+                "Speaker requested but no speaker version is linked to this export.",
+            );
+        }
+    }
+    section
+}
+
+fn push_speaker_markdown(output: &mut String, snapshot: &MeetingSnapshot) {
+    output.push_str("## Speakers\n\n");
+    match snapshot.speaker_version.as_ref() {
+        Some(version) => {
+            output.push_str(&format!(
+                "- Version: `{}`\n- Digest: `{}`\n",
+                version.version,
+                escape_markdown_inline(&version.digest)
+            ));
+            for identity in &version.identities {
+                output.push_str(&format!(
+                    "- `{}`: {}\n",
+                    escape_markdown_inline(&identity.speaker_id),
+                    escape_markdown_text(&identity.display_name)
+                ));
+            }
+        }
+        None => output
+            .push_str("- Speaker requested but no speaker version is linked to this export.\n"),
+    }
+    output.push('\n');
+}
+
+fn push_speaker_txt(output: &mut String, snapshot: &MeetingSnapshot) {
+    output.push_str("Speakers\n");
+    match snapshot.speaker_version.as_ref() {
+        Some(version) => {
+            output.push_str(&format!(
+                "Version: {}\nDigest: {}\n",
+                version.version, version.digest
+            ));
+            for identity in &version.identities {
+                output.push_str(&format!(
+                    "- {}: {}\n",
+                    sanitize_plain(&identity.speaker_id),
+                    sanitize_plain(&identity.display_name)
+                ));
+            }
+        }
+        None => output
+            .push_str("- Speaker requested but no speaker version is linked to this export.\n"),
+    }
+    output.push('\n');
 }
 
 fn push_summary_json(output: &mut String, summary: Option<&ExportSummary>) {
@@ -1256,14 +1452,24 @@ fn validation_manifest_base(
         .as_ref()
         .and_then(|summary| summary.version)
         .or(options.summary_version);
+    let speaker_version = snapshot
+        .speaker_version
+        .as_ref()
+        .map(|version| version.version);
+    let speaker_digest = snapshot
+        .speaker_version
+        .as_ref()
+        .map(|version| version.digest.as_str());
     format!(
-        "{{\"format\":{},\"renderer\":\"meetingrelay.export.v4\",\"snapshotId\":{},\"meetingId\":{},\"semanticSha256\":{},\"projection\":{},\"summaryVersion\":{}}}",
+        "{{\"format\":{},\"renderer\":\"meetingrelay.export.v4\",\"snapshotId\":{},\"meetingId\":{},\"semanticSha256\":{},\"projection\":{},\"summaryVersion\":{},\"speakerVersion\":{},\"speakerDigest\":{}}}",
         json_string(format),
         json_string(&snapshot.snapshot_id),
         json_string(&snapshot.meeting.id),
         json_string(&snapshot.semantic_sha256),
         json_string(projection),
-        summary_version.map_or_else(|| "null".to_owned(), |version| version.to_string())
+        summary_version.map_or_else(|| "null".to_owned(), |version| version.to_string()),
+        speaker_version.map_or_else(|| "null".to_owned(), |version| version.to_string()),
+        json_nullable(speaker_digest)
     )
 }
 
@@ -1513,6 +1719,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::mvp::speaker::{SpeakerIdentity, SpeakerSegmentAssignment, SpeakerVersionDraft};
     use crate::mvp::storage::{FinalCandidate, MvpStorage, MvpStorageWriter};
 
     fn temp_root(test_name: &str) -> PathBuf {
@@ -1600,6 +1807,7 @@ mod tests {
                     translation_error: None,
                 },
             ],
+            speaker_version: None,
             snapshot_id: "snapshot-options".to_owned(),
             snapshot_generation: 1,
             semantic_sha256: sha256_hex("snapshot-options".as_bytes()),
@@ -1622,6 +1830,7 @@ mod tests {
             include_summary: true,
             include_timestamp: true,
             summary_version: Some(7),
+            speaker_version: None,
             summary: Some(ExportSummary {
                 version: Some(7),
                 sections: vec![ExportSummarySection {
@@ -1676,6 +1885,127 @@ mod tests {
         let pdf_text = String::from_utf8_lossy(&pdf.bytes);
         assert!(pdf_text.contains("source-manifest.json"));
         assert!(pdf_text.contains("segment-1"));
+    }
+
+    #[test]
+    fn speaker_only_export_requires_and_uses_speaker_version() {
+        let root = temp_root("speaker-only");
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let writer = MvpStorageWriter::start(storage.clone()).unwrap();
+        let meeting_id = seed_meeting(&writer);
+        assert_eq!(
+            export_meeting_with_options(
+                &storage,
+                &writer,
+                &meeting_id,
+                "missing-speaker",
+                ExportOptions {
+                    formats: vec!["json".to_owned()],
+                    include_original: false,
+                    include_translation: false,
+                    bilingual: false,
+                    include_speaker: true,
+                    include_summary: false,
+                    include_timestamp: false,
+                    summary_version: None,
+                    speaker_version: None,
+                    summary: None,
+                },
+            )
+            .unwrap_err(),
+            "SPEAKER_VERSION_NOT_FOUND"
+        );
+        let speaker = writer
+            .record_speaker_version(
+                &meeting_id,
+                SpeakerVersionDraft {
+                    parent_version: None,
+                    base_version: None,
+                    algorithm: "test.speaker.v1".to_owned(),
+                    identities: vec![SpeakerIdentity {
+                        speaker_id: "spk-1".to_owned(),
+                        display_name: "Alice".to_owned(),
+                    }],
+                    assignments: vec![SpeakerSegmentAssignment {
+                        segment_id: "segment-1".to_owned(),
+                        sequence: 1,
+                        source_revision: 1,
+                        speaker_id: "spk-1".to_owned(),
+                        confidence: 0.9,
+                    }],
+                    operation: "diarize".to_owned(),
+                    idempotency_key: Some("speaker-export".to_owned()),
+                },
+            )
+            .unwrap();
+        let newer_speaker = writer
+            .record_speaker_version(
+                &meeting_id,
+                SpeakerVersionDraft {
+                    parent_version: Some(speaker.version),
+                    base_version: Some(speaker.version),
+                    algorithm: "test.speaker.rename.v1".to_owned(),
+                    identities: vec![SpeakerIdentity {
+                        speaker_id: "spk-1".to_owned(),
+                        display_name: "Bob".to_owned(),
+                    }],
+                    assignments: speaker.assignments.clone(),
+                    operation: "rename".to_owned(),
+                    idempotency_key: Some("speaker-export-newer".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(newer_speaker.version, 2);
+        fail_db_record_for_test(false);
+        for format in ["json", "markdown", "txt", "docx", "pdf"] {
+            let result = export_meeting_with_options(
+                &storage,
+                &writer,
+                &meeting_id,
+                format!("speaker-only-{format}"),
+                ExportOptions {
+                    formats: vec![format.to_owned()],
+                    include_original: false,
+                    include_translation: false,
+                    bilingual: false,
+                    include_speaker: true,
+                    include_summary: false,
+                    include_timestamp: false,
+                    summary_version: None,
+                    speaker_version: Some(speaker.version),
+                    summary: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(result.artifacts.len(), 1);
+            let artifact = &result.artifacts[0];
+            let bytes = fs::read(&artifact.path).unwrap();
+            assert_eq!(artifact.byte_length, bytes.len());
+            assert_eq!(artifact.sha256, sha256_hex(&bytes));
+            let content = String::from_utf8_lossy(&bytes);
+            assert!(
+                content.contains("Alice"),
+                "{} did not include explicit old speaker label",
+                artifact.format
+            );
+            assert!(
+                !content.contains("Bob"),
+                "{} ignored explicit old speaker version",
+                artifact.format
+            );
+            assert!(
+                !content.contains("line 1"),
+                "{} included original text in speaker-only projection",
+                artifact.format
+            );
+            if format == "json" {
+                let content = fs::read_to_string(&artifact.path).unwrap();
+                assert!(content.contains("\"speakerVersion\": 1"));
+                assert!(content.contains("\"speaker\": \"Alice\""));
+                assert!(!content.contains("\"original\""));
+            }
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
