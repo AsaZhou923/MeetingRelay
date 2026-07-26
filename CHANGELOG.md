@@ -3,6 +3,26 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-07-26 — v0.1.0 GitHub Release
+
+- Published the Windows V1 engineering release as an unsigned x64
+  `MeetingRelay.exe`.
+- The release includes the completed R1–R6 implementation: durable translation
+  workflows, raw-audio recovery and governance, meeting search and export,
+  provider profiles and Windows Credential Manager secrets, structured summaries,
+  speaker diarization/editing, the caption overlay, accessibility gates, and
+  Windows distribution engineering.
+- Release artifact: 14,356,992 bytes, SHA-256
+  `5FEC2634933D37D0E42E6BC864809F0D6349CA9FBAC792D58AF6E067CAEB3CB6`.
+- GitHub Actions `Personal MVP CI` passed on the release baseline, including
+  frontend validation, Rust format/Clippy/tests, locked ASR asset materialization,
+  Windows acceptance/distribution contracts, and the package-local personal
+  release build.
+- The public asset remains unsigned and intentionally excludes the SenseVoice
+  model and Sherpa runtime. A signed NSIS installer is still gated by
+  redistribution approval, an Authenticode certificate, and clean-machine
+  acceptance.
+
 ## 2026-07-26 — R5 delivery and R6 Windows distribution engineering
 
 ### Status
@@ -10,10 +30,10 @@ decisions, and known acceptance gaps.
 - R5 development is complete: post-meeting speaker diarization and versioned
   speaker editing/export, the read-only caption overlay, and automated
   accessibility gates are implemented.
-- R6 distribution engineering is complete for local unsigned validation. Formal
-  release remains blocked by pending SenseVoice/Sherpa redistribution approval,
-  the absence of a code-signing certificate, and the unavailable second clean
-  Windows 10/11 acceptance machine.
+- R6 distribution engineering is complete for local unsigned validation. A signed
+  NSIS release remains blocked by pending SenseVoice/Sherpa redistribution
+  approval, the absence of a code-signing certificate, and the unavailable
+  second clean Windows 10/11 acceptance machine.
 - R0/R2 real-device acceptance remains open for HTTPS 10–20 minute meetings,
   fee evidence, a two-hour dual-source soak, and timeline accuracy measurements.
 
@@ -98,7 +118,7 @@ decisions, and known acceptance gaps.
 - Complete physical Narrator/high-DPI coverage and second-machine clean
   install/upgrade/uninstall acceptance.
 - Approve redistribution licenses and provide a signing certificate before
-  producing a formal release.
+  producing a signed installer release.
 
 ## 2026-07-25 — R0–R4 delivery
 
