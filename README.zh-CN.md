@@ -169,11 +169,11 @@ API Token 只保存在当前应用进程内存，不写入 localStorage、SQLite
 
 ## 下载与发布
 
-最新正式版本：[MeetingRelay v0.1.0](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+最新正式版本：[MeetingRelay v0.1.1](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.0/MeetingRelay.exe) | 14,356,992 bytes | `FD5DD25B45C2A46E87E09074402634B99F61305F6E2953C8901D64C0C6338F28` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.1/MeetingRelay.exe) | 14,357,504 bytes | `B2276B4EFBF974EFCFA5B7D4A09C9DAE9789D8052880DBB0BDEC45C4C178997C` |
 
 生成完整的同机运行目录：
 
@@ -267,6 +267,8 @@ MeetingRelay/
 - 验证设备热插拔以及 2 小时 system/microphone/both 双源采集。
 - 根据真实使用结果评估流式翻译是否必要。
 - 审批锁定模型/runtime 的再分发记录，签名 NSIS 安装包与 bundled binary，并在第二台干净 Windows 电脑完成安装、升级、回滚拒绝和卸载验收。
+- 建立以同材料基准为门禁的 ASR model registry，允许用户在建会前选择稳定默认模型或确有准确率提升的高质量模型。
+- 将 Ollama / LM Studio 等本地翻译模型的发现与会前选择做成一等能力，支持完全断网链路并禁止静默回退到云端。
 
 ## 贡献
 

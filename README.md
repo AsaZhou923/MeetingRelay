@@ -170,11 +170,11 @@ API tokens are loaded into process memory only while needed and are persisted ex
 
 ## Downloads and releases
 
-Latest formal release: [MeetingRelay v0.1.0](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+Latest formal release: [MeetingRelay v0.1.1](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | File | Size | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.0/MeetingRelay.exe) | 14,356,992 bytes | `FD5DD25B45C2A46E87E09074402634B99F61305F6E2953C8901D64C0C6338F28` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.1/MeetingRelay.exe) | 14,357,504 bytes | `B2276B4EFBF974EFCFA5B7D4A09C9DAE9789D8052880DBB0BDEC45C4C178997C` |
 
 Build a complete same-machine package:
 
@@ -269,6 +269,8 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 - Evaluate streaming translation only if complete-result latency proves disruptive in real meetings.
 - Validate system-only, microphone-only, both-source, raw-audio recovery, and disk-pressure behavior on representative Windows hardware.
 - Approve the pinned model/runtime redistribution records, sign the NSIS installer and bundled Windows binaries, and complete the second clean-machine install/upgrade/uninstall test. Windows Credential Manager integration and a real credential round trip are complete.
+- Add a benchmark-gated ASR model registry and let users choose between the stable default and a demonstrably higher-quality model before starting a meeting.
+- Make local Ollama / LM Studio translation-model discovery and per-meeting selection first-class, with a fully offline path and no silent cloud fallback.
 
 ## Contributing
 

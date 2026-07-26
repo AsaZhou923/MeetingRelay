@@ -3,6 +3,24 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-07-27 — v0.1.1 Maintenance Release
+
+- Published a maintenance release of the current Windows V1 engineering
+  baseline with coherent `0.1.1` metadata across Cargo, Tauri, and both npm
+  packages.
+- Added the planned R7/R8 directions to the public roadmap: benchmark-gated
+  selection of a demonstrably higher-quality ASR model, and first-class local
+  Ollama / LM Studio translation-model selection with no silent cloud fallback.
+  These capabilities are roadmap items and are not implemented in v0.1.1.
+- Release artifact: 14,357,504 bytes, SHA-256
+  `B2276B4EFBF974EFCFA5B7D4A09C9DAE9789D8052880DBB0BDEC45C4C178997C`.
+- Windows distribution and package-local personal release contracts passed
+  before freezing the upload candidate. The complete GitHub Actions release
+  baseline must pass before the tag is published.
+- The public asset remains unsigned and intentionally excludes the SenseVoice
+  model and Sherpa runtime. The signed NSIS path remains gated by redistribution
+  approval, an Authenticode certificate, and clean-machine acceptance.
+
 ## 2026-07-26 — v0.1.0 GitHub Release
 
 - Published the Windows V1 engineering release as an unsigned x64
