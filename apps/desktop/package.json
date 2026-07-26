@@ -12,8 +12,8 @@
     "tauri:build:ci": "tauri build --no-bundle -- --offline --locked",
     "release:personal": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../tools/mvp/release.ps1",
     "release:personal:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../tools/mvp/release.test.ps1",
-    "distribution:release": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../tools/distribution/release.ps1",
-    "distribution:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../tools/distribution/Assert-DistributionContract.test.ps1"
+    "distribution:release": "node ../../tools/powershell/Run-WindowsPowerShell.mjs ../../tools/distribution/release.ps1",
+    "distribution:test": "node ../../tools/powershell/Run-WindowsPowerShell.mjs ../../tools/distribution/Assert-DistributionContract.test.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1"

@@ -58,8 +58,8 @@ decisions, and known acceptance gaps.
 - Made unsigned dry runs non-destructive and isolated test artifacts from real
   distribution output.
 - Made nested Windows PowerShell validation independent of inherited PowerShell
-  7 module paths: SHA-256 uses a streaming .NET helper, while signing scripts
-  restore their own built-in module root before importing Authenticode support.
+  7 module paths: SHA-256 uses a streaming .NET helper, and distribution package
+  entries sanitize `PSModulePath` before launching `powershell.exe`.
 
 ### Validation
 

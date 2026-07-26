@@ -11,10 +11,10 @@
     "mvp:release:personal": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/mvp/release.ps1",
     "mvp:release:personal:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/mvp/release.test.ps1",
     "mvp:acceptance:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command \"& { & 'tools/mvp/acceptance/Measure-WindowsAcceptance.test.ps1'; & 'tools/mvp/acceptance/Run-LiveProviderMatrix.test.ps1' }\"",
-    "distribution:release": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/release.ps1",
-    "distribution:release:dry-run": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/release.ps1 -DryRun",
-    "distribution:release:unsigned-test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/release.ps1 -UnsignedTestBuild",
-    "distribution:test": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/distribution/Assert-DistributionContract.test.ps1",
+    "distribution:release": "node tools/powershell/Run-WindowsPowerShell.mjs tools/distribution/release.ps1",
+    "distribution:release:dry-run": "node tools/powershell/Run-WindowsPowerShell.mjs tools/distribution/release.ps1 -DryRun",
+    "distribution:release:unsigned-test": "node tools/powershell/Run-WindowsPowerShell.mjs tools/distribution/release.ps1 -UnsignedTestBuild",
+    "distribution:test": "node tools/powershell/Run-WindowsPowerShell.mjs tools/distribution/Assert-DistributionContract.test.ps1",
     "tauri": "pnpm --dir apps/desktop tauri"
   }
 }

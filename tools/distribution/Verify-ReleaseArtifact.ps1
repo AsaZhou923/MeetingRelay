@@ -7,9 +7,6 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-. (Join-Path $PSScriptRoot "..\shared\Initialize-MeetingRelayPowerShell.ps1")
-Initialize-MeetingRelayPowerShell -RequiredModules "Microsoft.PowerShell.Security"
-
 function Test-MeetingRelaySignature {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
