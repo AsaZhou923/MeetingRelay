@@ -11,6 +11,9 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "..\shared\Initialize-MeetingRelayPowerShell.ps1")
+Initialize-MeetingRelayPowerShell -RequiredModules "Microsoft.PowerShell.Security"
+
 function Assert-DistributionSigningPolicy {
     param(
         [string]$CertificateThumbprint = $env:MEETINGRELAY_SIGNING_CERT_THUMBPRINT,

@@ -57,9 +57,9 @@ decisions, and known acceptance gaps.
   roots, stale installer mixing, and sealed-runtime sidecar pollution.
 - Made unsigned dry runs non-destructive and isolated test artifacts from real
   distribution output.
-- Replaced new acceptance/distribution tooling's dependency on the optional
-  `Get-FileHash` cmdlet with a streaming .NET SHA-256 helper so nested Windows
-  PowerShell validation works on GitHub runners with restricted module paths.
+- Made nested Windows PowerShell validation independent of inherited PowerShell
+  7 module paths: SHA-256 uses a streaming .NET helper, while signing scripts
+  restore their own built-in module root before importing Authenticode support.
 
 ### Validation
 
