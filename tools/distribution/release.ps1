@@ -281,7 +281,7 @@ function New-MeetingRelayDistributionManifest {
             path = [IO.Path]::GetFullPath($artifact)
             fileName = Split-Path -Leaf $artifact
             sizeBytes = (Get-Item -LiteralPath $artifact -Force).Length
-            sha256 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+            sha256 = Get-MeetingRelayFileSha256 -Path $artifact
         }
     }
     return [PSCustomObject]@{
@@ -362,7 +362,7 @@ function Invoke-MeetingRelayFormalBundledResourceSigning {
         targets = @($targets | ForEach-Object {
             [PSCustomObject]@{
                 path = [IO.Path]::GetFullPath($_)
-                sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+                sha256 = Get-MeetingRelayFileSha256 -Path $_
                 sizeBytes = (Get-Item -LiteralPath $_ -Force).Length
             }
         })
@@ -426,7 +426,7 @@ function Test-MeetingRelayFormalReleaseSignatures {
             path = $target.path
             status = [string]$signature.Status
             signerCertificate = $signature.SignerCertificate
-            sha256 = (Get-FileHash -LiteralPath $target.path -Algorithm SHA256).Hash.ToLowerInvariant()
+            sha256 = Get-MeetingRelayFileSha256 -Path $target.path
             sizeBytes = (Get-Item -LiteralPath $target.path -Force).Length
         }) | Out-Null
     }

@@ -7,6 +7,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "..\shared\Get-MeetingRelayFileSha256.ps1")
+
 function Get-DistributionRepositoryRoot {
     $root = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null)
     if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($root)) {
@@ -17,7 +19,7 @@ function Get-DistributionRepositoryRoot {
 
 function Get-FileSha256Lower {
     param([Parameter(Mandatory = $true)][string]$Path)
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    return Get-MeetingRelayFileSha256 -Path $Path
 }
 
 function New-MeetingRelaySbom {

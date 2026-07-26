@@ -51,7 +51,7 @@ function Get-NullableFileState {
     }
     return [PSCustomObject]@{
         Exists = $true
-        Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        Sha256 = Get-MeetingRelayFileSha256 -Path $Path
     }
 }
 

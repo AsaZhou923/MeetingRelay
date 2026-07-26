@@ -96,7 +96,7 @@ function Copy-DistributionStagedFile {
     if (-not $SkipHashVerification -and $ExpectedSizeBytes -ge 0 -and $sourceItem.Length -ne $ExpectedSizeBytes) {
         throw "MEETINGRELAY_DISTRIBUTION_STAGE_SOURCE_SIZE_MISMATCH source=$Source expected=$ExpectedSizeBytes actual=$($sourceItem.Length)"
     }
-    $sourceSha256 = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sourceSha256 = Get-MeetingRelayFileSha256 -Path $Source
     if (-not $SkipHashVerification -and -not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and $sourceSha256 -ne $ExpectedSha256.ToLowerInvariant()) {
         throw "MEETINGRELAY_DISTRIBUTION_STAGE_SOURCE_HASH_MISMATCH source=$Source expected=$ExpectedSha256 actual=$sourceSha256"
     }
@@ -107,7 +107,7 @@ function Copy-DistributionStagedFile {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
     return [PSCustomObject]@{
         path = [IO.Path]::GetFullPath($Destination)
-        sha256 = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        sha256 = Get-MeetingRelayFileSha256 -Path $Destination
         sizeBytes = (Get-Item -LiteralPath $Destination -Force).Length
     }
 }
@@ -293,7 +293,7 @@ function Stage-MeetingRelayDistributionResources {
     $null = New-MeetingRelaySbom -RepositoryRoot $RepositoryRoot -OutputPath $sbomPath
     $files.Add([PSCustomObject]@{
         path = [IO.Path]::GetFullPath($sbomPath)
-        sha256 = (Get-FileHash -LiteralPath $sbomPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        sha256 = Get-MeetingRelayFileSha256 -Path $sbomPath
         sizeBytes = (Get-Item -LiteralPath $sbomPath -Force).Length
     }) | Out-Null
 
@@ -315,7 +315,7 @@ function Update-MeetingRelayDistributionResourcesManifest {
         if (-not (Test-Path -LiteralPath $file.path -PathType Leaf)) {
             throw "MEETINGRELAY_DISTRIBUTION_STAGE_MANIFEST_FILE_MISSING path=$($file.path)"
         }
-        $file.sha256 = (Get-FileHash -LiteralPath $file.path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $file.sha256 = Get-MeetingRelayFileSha256 -Path $file.path
         $file.sizeBytes = (Get-Item -LiteralPath $file.path -Force).Length
     }
     $StageManifest | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date).ToUniversalTime().ToString("o") -Force

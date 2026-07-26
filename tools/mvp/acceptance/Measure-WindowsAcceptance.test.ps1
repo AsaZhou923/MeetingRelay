@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "..\..\shared\Get-MeetingRelayFileSha256.ps1")
+
 function Assert-Equal {
     param(
         [Parameter(Mandatory = $true)]$Expected,
@@ -101,7 +103,7 @@ foreach ($material in @($materialsManifest.materials)) {
     }
 
     $text = Get-Content -LiteralPath $materialPath -Raw -Encoding UTF8
-    $actualHash = (Get-FileHash -LiteralPath $materialPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = Get-MeetingRelayFileSha256 -Path $materialPath
     Assert-Equal `
         -Expected ([string]$material.sha256_utf8).ToLowerInvariant() `
         -Actual $actualHash `
