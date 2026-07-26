@@ -13,7 +13,7 @@ decisions, and known acceptance gaps.
   speaker diarization/editing, the caption overlay, accessibility gates, and
   Windows distribution engineering.
 - Release artifact: 14,356,992 bytes, SHA-256
-  `5FEC2634933D37D0E42E6BC864809F0D6349CA9FBAC792D58AF6E067CAEB3CB6`.
+  `FD5DD25B45C2A46E87E09074402634B99F61305F6E2953C8901D64C0C6338F28`.
 - GitHub Actions `Personal MVP CI` passed on the release baseline, including
   frontend validation, Rust format/Clippy/tests, locked ASR asset materialization,
   Windows acceptance/distribution contracts, and the package-local personal

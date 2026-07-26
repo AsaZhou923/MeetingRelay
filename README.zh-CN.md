@@ -173,7 +173,7 @@ API Token 只保存在当前应用进程内存，不写入 localStorage、SQLite
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.0/MeetingRelay.exe) | 14,356,992 bytes | `5FEC2634933D37D0E42E6BC864809F0D6349CA9FBAC792D58AF6E067CAEB3CB6` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.0/MeetingRelay.exe) | 14,356,992 bytes | `FD5DD25B45C2A46E87E09074402634B99F61305F6E2953C8901D64C0C6338F28` |
 
 生成完整的同机运行目录：
 
