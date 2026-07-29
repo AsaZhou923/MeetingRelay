@@ -18,10 +18,12 @@ import {
   parseMvpTranscriptText,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
+  parseAsrModelProfiles,
   parseProviderProfiles,
   parseProviderProfileDraft,
   parseDiagnosticBundleResult,
   parseInterruptedMeetings,
+  parseLocalTranslationDiscovery,
   parseMvpAudioSourceMode,
   parseMvpExportResult,
   parseMvpRecognitionLanguage,
@@ -37,6 +39,7 @@ import {
   requiresInsecureRemoteHttpAcknowledgement,
   resolveAudioDeviceSelection,
   type AudioDeviceInventory,
+  type AsrModelProfile,
   type DiagnosticBundleResult,
   type AudioSourceSnapshot,
   type InterruptedMeeting,
@@ -106,6 +109,13 @@ app.innerHTML = `
               <option value="en">English · EN</option>
             </select>
             <small>会议开始后锁定；下一次会议可重新选择。</small>
+          </label>
+          <label class="device-picker language-picker">
+            <span>本地识别模型</span>
+            <select id="asr-model" disabled>
+              <option value="">正在读取模型注册表…</option>
+            </select>
+            <small>只显示已校验、可选择的本地模型；会议开始后锁定。</small>
           </label>
           <label class="device-picker">
             <span>音源模式</span>
@@ -183,8 +193,10 @@ app.innerHTML = `
           </label>
           <label class="device-picker">
             <span>模型名称</span>
-            <input id="translation-model" type="text" placeholder="填写供应商提供的模型 ID" spellcheck="false" />
+            <input id="translation-model" type="text" list="translation-model-options" placeholder="填写供应商提供的模型 ID" spellcheck="false" />
+            <datalist id="translation-model-options"></datalist>
           </label>
+          <button id="discover-local-models" class="secondary-button" type="button">刷新本地模型</button>
           <label class="device-picker translation-api-key">
             <span>API Token（多数云服务必填；测试/开始时写入 Windows Credential Manager）</span>
             <input id="translation-api-key" type="password" autocomplete="off" spellcheck="false" />
@@ -480,6 +492,7 @@ const controls = {
   systemDevice: element<HTMLSelectElement>("#system-device"),
   microphoneDevice: element<HTMLSelectElement>("#microphone-device"),
   recognitionLanguage: element<HTMLSelectElement>("#recognition-language"),
+  asrModel: element<HTMLSelectElement>("#asr-model"),
   sourceMode: element<HTMLSelectElement>("#source-mode"),
   rawAudioEnabled: element<HTMLInputElement>("#raw-audio-enabled"),
   translationEnabled: element<HTMLInputElement>("#translation-enabled"),
@@ -487,6 +500,8 @@ const controls = {
   translationLanguage: element<HTMLSelectElement>("#translation-language"),
   translationBaseUrl: element<HTMLInputElement>("#translation-base-url"),
   translationModel: element<HTMLInputElement>("#translation-model"),
+  translationModelOptions: element<HTMLDataListElement>("#translation-model-options"),
+  discoverLocalModels: element<HTMLButtonElement>("#discover-local-models"),
   translationApiKey: element<HTMLInputElement>("#translation-api-key"),
   translationAllowInsecureHttp: element<HTMLInputElement>(
     "#translation-allow-insecure-http",
@@ -602,6 +617,7 @@ for (const [control, label] of [
   [controls.systemDevice, "Windows system output device"],
   [controls.microphoneDevice, "Windows microphone device"],
   [controls.recognitionLanguage, "Meeting recognition language"],
+  [controls.asrModel, "Local ASR model"],
   [controls.sourceMode, "Meeting audio source mode"],
   [controls.translationProvider, "Translation provider preset"],
   [controls.translationLanguage, "Translation target language"],
@@ -625,8 +641,11 @@ let pollTimer: number | null = null;
 let audioDevices: AudioDeviceInventory | null = null;
 let audioDeviceLoadError: string | null = null;
 let preparedLanguage: MvpRecognitionLanguage = "zh";
+let preparedAsrModelId: string | null = null;
+let asrModels: AsrModelProfile[] = [];
 let languagePreparing = false;
 let translationTesting = false;
+let localModelDiscovering = false;
 let lastClipboardText: string | null = null;
 let latestRetryProgress: TranslationRetryProgress | null = null;
 let retryProgressTimer: number | null = null;
@@ -645,6 +664,7 @@ let deletePreviewState: DeletePreview | null = null;
 let summaryJob: SummaryJob | null = null;
 let summaryPollTimer: number | null = null;
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
+const ASR_MODEL_PREFERENCE_KEY = "meetingrelay.asr-model.v1";
 const R3_PAGE_SIZE = 50;
 const CAPTION_OVERLAY_WINDOW_LABEL = "caption-overlay";
 
@@ -680,6 +700,57 @@ function currentRecognitionLanguage(): MvpRecognitionLanguage {
   return parseMvpRecognitionLanguage(controls.recognitionLanguage.value);
 }
 
+function currentAsrModelId(): string | null {
+  const value = controls.asrModel.value.trim();
+  return value.length === 0 ? null : value;
+}
+
+function readAsrModelPreference(): string | null {
+  try {
+    const value = window.localStorage.getItem(ASR_MODEL_PREFERENCE_KEY)?.trim() ?? "";
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistAsrModelPreference(): void {
+  const modelId = currentAsrModelId();
+  if (modelId === null) return;
+  try {
+    window.localStorage.setItem(ASR_MODEL_PREFERENCE_KEY, modelId);
+  } catch {
+    // The in-memory selection remains valid if browser storage is unavailable.
+  }
+}
+
+function renderAsrModelOptions(preferredModelId: string | null = currentAsrModelId()): void {
+  const language = currentRecognitionLanguage();
+  const selectable = asrModels.filter(
+    (profile) =>
+      profile.selectable &&
+      profile.installState === "verified" &&
+      profile.supportedLanguages.includes(language),
+  );
+  controls.asrModel.replaceChildren(
+    ...selectable.map((profile) => {
+      const option = document.createElement("option");
+      option.value = profile.modelId;
+      const streaming = profile.nativeStreaming ? "原生流式" : "分段流式";
+      option.textContent = `${profile.label} · ${profile.executionProvider} · ${profile.quantization} · ${streaming}`;
+      option.title = `${profile.engine} ${profile.engineVersion} · ${profile.tier} · revision ${profile.modelRevision} · SHA-256 ${profile.modelSha256}`;
+      return option;
+    }),
+  );
+  const selected = selectable.find((profile) => profile.modelId === preferredModelId);
+  controls.asrModel.value = selected?.modelId ?? selectable[0]?.modelId ?? "";
+}
+
+async function loadAsrModels(): Promise<void> {
+  asrModels = parseAsrModelProfiles(await invoke<unknown>("mvp_asr_models"));
+  renderAsrModelOptions(readAsrModelPreference());
+}
+
 function currentSourceMode(): MvpAudioSourceMode {
   return parseMvpAudioSourceMode(controls.sourceMode.value);
 }
@@ -695,18 +766,21 @@ function currentTranslationConfig(): TranslationConfig {
   };
 }
 
-function translationProviderClass(baseUrl: string): "lan" | "cloud" {
+function isLoopbackTranslationBaseUrl(baseUrl: string): boolean {
   try {
     const url = new URL(baseUrl);
     const host = url.hostname.toLowerCase();
-    if (
-      url.protocol === "http:" ||
-      host === "localhost" ||
-      host === "127.0.0.1" ||
-      host === "::1"
-    ) {
-      return "lan";
-    }
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
+    // Backend validation returns the canonical endpoint error.
+    return false;
+  }
+}
+
+function translationProviderClass(baseUrl: string): "local" | "lan" | "cloud" {
+  if (isLoopbackTranslationBaseUrl(baseUrl)) return "local";
+  try {
+    if (new URL(baseUrl).protocol === "http:") return "lan";
   } catch {
     // Backend validation returns the canonical endpoint error.
   }
@@ -741,7 +815,7 @@ async function persistTranslationProviderProfile(): Promise<string | null> {
     });
   }
   const secret = controls.translationApiKey.value.trim();
-  if (secret.length > 0) {
+  if (profile.class !== "local" && secret.length > 0) {
     await invoke<unknown>("mvp_set_provider_secret", {
       profileId: profile.profileId,
       secret,
@@ -816,17 +890,20 @@ function applyTranslationPreference(preference: TranslationPreference | null): v
 
 function renderTranslationControls(active: boolean): void {
   const config = currentTranslationConfig();
+  const loopback = isLoopbackTranslationBaseUrl(config.baseUrl);
   const requiresInsecureHttp = requiresInsecureRemoteHttpAcknowledgement(config.baseUrl);
   controls.translationQueue.textContent = config.enabled
     ? `${latest?.translationQueueDepth ?? 0} / 32`
     : "关闭";
-  const locked = active || translationTesting;
+  const locked = active || translationTesting || localModelDiscovering;
   controls.translationEnabled.disabled = active;
   controls.translationProvider.disabled = locked || !config.enabled;
   controls.translationLanguage.disabled = locked || !config.enabled;
   controls.translationBaseUrl.disabled = locked || !config.enabled;
   controls.translationModel.disabled = locked || !config.enabled;
-  controls.translationApiKey.disabled = locked || !config.enabled;
+  controls.discoverLocalModels.disabled =
+    locked || !config.enabled || !isLoopbackTranslationBaseUrl(config.baseUrl);
+  controls.translationApiKey.disabled = locked || !config.enabled || loopback;
   controls.translationInsecureHttpRow.hidden = !config.enabled || !requiresInsecureHttp;
   controls.translationAllowInsecureHttp.disabled =
     locked || !config.enabled || !requiresInsecureHttp;
@@ -1635,6 +1712,7 @@ function render(snapshot: MvpSnapshot): void {
     translationTesting ||
     !translationConfigReady() ||
     preparedLanguage !== currentRecognitionLanguage() ||
+    preparedAsrModelId !== currentAsrModelId() ||
     !controls.consent.checked ||
     currentAudioDeviceSelection() === null;
   controls.pauseResume.disabled = !["recording", "paused"].includes(snapshot.lifecycle);
@@ -1648,6 +1726,12 @@ function render(snapshot: MvpSnapshot): void {
     languagePreparing ||
     snapshot.lifecycle !== "ready" ||
     !snapshot.modelReady;
+  controls.asrModel.disabled =
+    active ||
+    languagePreparing ||
+    snapshot.lifecycle !== "ready" ||
+    !snapshot.modelReady ||
+    asrModels.length === 0;
   controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
   renderAudioDeviceControls(active);
   renderTranslationControls(active);
@@ -2373,6 +2457,7 @@ controls.translationProvider.addEventListener("change", () => {
   const provider = controls.translationProvider.value as keyof typeof TRANSLATION_PROVIDER_URLS;
   const preset = TRANSLATION_PROVIDER_URLS[provider];
   if (preset !== undefined) controls.translationBaseUrl.value = preset;
+  controls.translationModelOptions.replaceChildren();
   translationSettingsChanged();
 });
 
@@ -2381,10 +2466,49 @@ controls.translationBaseUrl.addEventListener("input", () => {
     controls.translationBaseUrl.value.trim() as (typeof TRANSLATION_PROVIDER_URLS)[keyof typeof TRANSLATION_PROVIDER_URLS],
   );
   if (!matchesPreset) controls.translationProvider.value = "custom";
+  controls.translationModelOptions.replaceChildren();
   translationSettingsChanged();
 });
 
 controls.translationModel.addEventListener("input", translationSettingsChanged);
+
+controls.discoverLocalModels.addEventListener("click", async () => {
+  localModelDiscovering = true;
+  controls.translationStatus.dataset.status = "testing";
+  controls.translationStatus.textContent = "正在读取本机服务的 /v1/models…";
+  if (latest) render(latest);
+  try {
+    const discovery = parseLocalTranslationDiscovery(
+      await invoke<unknown>("mvp_discover_local_translation_models", {
+        baseUrl: controls.translationBaseUrl.value.trim(),
+      }),
+    );
+    controls.translationModelOptions.replaceChildren(
+      ...discovery.models.map((model) => {
+        const option = document.createElement("option");
+        option.value = model.id;
+        option.label = model.ownedBy === null ? model.id : `${model.id} · ${model.ownedBy}`;
+        return option;
+      }),
+    );
+    if (
+      controls.translationModel.value.trim().length === 0 ||
+      !discovery.models.some((model) => model.id === controls.translationModel.value.trim())
+    ) {
+      controls.translationModel.value = discovery.models[0].id;
+      persistTranslationPreference();
+    }
+    controls.translationStatus.dataset.status = "success";
+    controls.translationStatus.textContent = `发现 ${discovery.models.length} 个 ${discovery.providerFlavor} 本地模型 · ${discovery.latencyMs} ms；已选 ${controls.translationModel.value.trim()}。`;
+  } catch (error) {
+    controls.translationModelOptions.replaceChildren();
+    controls.translationStatus.dataset.status = "error";
+    controls.translationStatus.textContent = `本地模型发现失败：${message(error)}`;
+  } finally {
+    localModelDiscovering = false;
+    if (latest) render(latest);
+  }
+});
 
 for (const control of [
   controls.translationEnabled,
@@ -2424,32 +2548,46 @@ controls.testTranslation.addEventListener("click", async () => {
   }
 });
 
-controls.recognitionLanguage.addEventListener("change", async () => {
+async function prepareSelectedAsr(): Promise<void> {
   const language = currentRecognitionLanguage();
-  controls.footerLanguage.textContent = LANGUAGE_LABELS[language];
-  if (language === preparedLanguage) {
+  const asrModelId = currentAsrModelId();
+  if (language === preparedLanguage && asrModelId === preparedAsrModelId) {
     if (latest) render(latest);
     return;
   }
   languagePreparing = true;
   controls.recognitionLanguage.disabled = true;
+  controls.asrModel.disabled = true;
   controls.start.disabled = true;
   controls.model.dataset.ready = "false";
   controls.model.textContent = `正在准备 ${LANGUAGE_LABELS[language]} 识别模型…`;
   controls.error.textContent = "";
   let switchError: string | null = null;
   try {
-    const snapshot = await call("mvp_prepare_language", { language });
+    const snapshot = await call("mvp_prepare_language", { language, asrModelId });
     preparedLanguage = language;
+    preparedAsrModelId = asrModelId;
+    persistAsrModelPreference();
     render(snapshot);
   } catch (error) {
     controls.recognitionLanguage.value = preparedLanguage;
-    switchError = `无法切换识别语言：${message(error)}`;
+    renderAsrModelOptions(preparedAsrModelId);
+    switchError = `无法切换识别模型：${message(error)}`;
   } finally {
     languagePreparing = false;
     if (latest) render(latest);
     if (switchError !== null) controls.error.textContent = switchError;
   }
+}
+
+controls.recognitionLanguage.addEventListener("change", async () => {
+  controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
+  renderAsrModelOptions();
+  await prepareSelectedAsr();
+});
+
+controls.asrModel.addEventListener("change", async () => {
+  await prepareSelectedAsr();
 });
 
 controls.start.addEventListener("click", async () => {
@@ -2469,6 +2607,7 @@ controls.start.addEventListener("click", async () => {
       await call("mvp_start", {
         consentAccepted: controls.consent.checked,
         language: currentRecognitionLanguage(),
+        asrModelId: currentAsrModelId(),
         sourceMode: currentSourceMode(),
         rawAudioEnabled: controls.rawAudioEnabled.checked,
         translation: currentTranslationConfig(),
@@ -2927,6 +3066,13 @@ void (async () => {
   await syncOverlayState().catch((error) => {
     controls.error.textContent = `Overlay window unavailable: ${message(error)}`;
   });
+  await loadAsrModels()
+    .then(() => {
+      preparedAsrModelId = null;
+    })
+    .catch((error) => {
+      controls.error.textContent = `ASR model registry unavailable: ${message(error)}`;
+    });
   try {
     await loadAudioDevices();
   } catch (error) {
@@ -2935,6 +3081,9 @@ void (async () => {
   }
   try {
     render(await call("mvp_preflight"));
+    if (preparedAsrModelId !== currentAsrModelId()) {
+      await prepareSelectedAsr();
+    }
   } catch (error) {
     controls.lifecycle.textContent = "ERROR";
     controls.lifecycle.dataset.state = "error";

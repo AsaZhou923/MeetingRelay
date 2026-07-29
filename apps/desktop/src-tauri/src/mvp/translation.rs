@@ -25,6 +25,8 @@ const MAX_MODEL_LENGTH: usize = 256;
 const MAX_API_KEY_LENGTH: usize = 2_048;
 const MAX_TRANSLATION_INPUT_LENGTH: usize = 16_384;
 const MAX_TRANSLATION_OUTPUT_BYTES: u64 = 256 * 1_024;
+const MAX_LOCAL_MODEL_DISCOVERY_BYTES: u64 = 1024 * 1024;
+const LOCAL_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSLATION_QUEUE_DEPTH: usize = 32;
 const TRANSLATION_PROVIDER_OPENAI_COMPATIBLE: &str = "openai-compatible";
@@ -61,6 +63,23 @@ pub struct TranslationProbe {
     pub target_language: String,
     pub latency_ms: u128,
     pub preview: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTranslationModel {
+    pub id: String,
+    pub owned_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTranslationDiscovery {
+    pub base_url: String,
+    pub endpoint: String,
+    pub provider_flavor: String,
+    pub models: Vec<LocalTranslationModel>,
+    pub latency_ms: u128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +458,73 @@ pub fn test_translation(config: &TranslationConfig) -> Result<TranslationProbe, 
     })
 }
 
+pub fn discover_local_translation_models(
+    base_url: &str,
+) -> Result<LocalTranslationDiscovery, String> {
+    let endpoint = local_models_endpoint(base_url)?;
+    let started = Instant::now();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(LOCAL_MODEL_DISCOVERY_TIMEOUT)
+        .timeout_write(Duration::from_secs(2))
+        .build();
+    let response = agent
+        .get(&endpoint)
+        .call()
+        .map_err(map_local_discovery_error)?;
+    let mut response_text = String::new();
+    response
+        .into_reader()
+        .take(MAX_LOCAL_MODEL_DISCOVERY_BYTES)
+        .read_to_string(&mut response_text)
+        .map_err(|_| "LOCAL_TRANSLATION_MODELS_READ_FAILED".to_owned())?;
+    let value: Value = serde_json::from_str(&response_text)
+        .map_err(|_| "LOCAL_TRANSLATION_MODELS_RESPONSE_INVALID".to_owned())?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "LOCAL_TRANSLATION_MODELS_RESPONSE_INVALID".to_owned())?;
+    let mut models = data
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.trim();
+            if id.is_empty()
+                || id.len() > MAX_MODEL_LENGTH
+                || id.contains('\0')
+                || id.chars().any(char::is_control)
+            {
+                return None;
+            }
+            let owned_by = entry
+                .get("owned_by")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .map(str::to_owned);
+            Some(LocalTranslationModel {
+                id: id.to_owned(),
+                owned_by,
+            })
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    if models.is_empty() {
+        return Err("LOCAL_TRANSLATION_MODELS_EMPTY".to_owned());
+    }
+    Ok(LocalTranslationDiscovery {
+        base_url: bounded_clean(
+            base_url,
+            MAX_BASE_URL_LENGTH,
+            "TRANSLATION_BASE_URL_INVALID",
+        )?,
+        endpoint,
+        provider_flavor: local_provider_flavor(base_url).to_owned(),
+        models,
+        latency_ms: started.elapsed().as_millis(),
+    })
+}
+
 pub fn translate_text(
     config: &ValidatedTranslationConfig,
     text: &str,
@@ -513,6 +599,15 @@ fn map_http_error(error: ureq::Error) -> String {
     }
 }
 
+fn map_local_discovery_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(status, _) => {
+            format!("LOCAL_TRANSLATION_MODELS_HTTP_STATUS_{status}")
+        }
+        ureq::Error::Transport(_) => "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE".to_owned(),
+    }
+}
+
 #[allow(dead_code)]
 pub fn classify_translation_error_code(error_code: &str) -> TranslationFailureClass {
     TranslationFailureClass {
@@ -578,6 +673,36 @@ fn completion_endpoint(base_url: &str, allow_insecure_http: bool) -> Result<Stri
         Ok(base)
     } else {
         Ok(format!("{base}/chat/completions"))
+    }
+}
+
+pub fn validate_local_translation_base_url(base_url: &str) -> Result<(), String> {
+    local_models_endpoint(base_url).map(|_| ())
+}
+
+fn local_models_endpoint(base_url: &str) -> Result<String, String> {
+    let completion = completion_endpoint(base_url, true)?;
+    let origin = endpoint_origin(&completion)?;
+    let host = origin
+        .split_once("://")
+        .and_then(|(_, authority)| validate_authority(authority).ok())
+        .ok_or_else(|| "TRANSLATION_BASE_URL_INVALID".to_owned())?;
+    if !is_loopback_host(host) {
+        return Err("LOCAL_TRANSLATION_LOOPBACK_REQUIRED".to_owned());
+    }
+    completion
+        .strip_suffix("/chat/completions")
+        .map(|base| format!("{base}/models"))
+        .ok_or_else(|| "TRANSLATION_BASE_URL_INVALID".to_owned())
+}
+
+fn local_provider_flavor(base_url: &str) -> &'static str {
+    if base_url.contains(":11434") {
+        "ollama"
+    } else if base_url.contains(":1234") {
+        "lmstudio"
+    } else {
+        "openai-compatible"
     }
 }
 
@@ -956,6 +1081,45 @@ mod tests {
         let probe = test_translation(&enabled(format!("http://{address}/v1"))).unwrap();
         assert_eq!(probe.preview, "连接成功");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn discovers_and_sorts_openai_compatible_local_models() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4 * 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+            let body = r#"{"object":"list","data":[{"id":"qwen2.5:7b","owned_by":"ollama"},{"id":"gemma3:4b"},{"id":"qwen2.5:7b"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let discovery = discover_local_translation_models(&format!("http://{address}/v1")).unwrap();
+        assert_eq!(discovery.models.len(), 2);
+        assert_eq!(discovery.models[0].id, "gemma3:4b");
+        assert_eq!(discovery.models[1].id, "qwen2.5:7b");
+        assert_eq!(discovery.provider_flavor, "openai-compatible");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn local_model_discovery_is_loopback_only_and_fails_closed() {
+        assert_eq!(
+            discover_local_translation_models("http://192.168.1.3:11434/v1").unwrap_err(),
+            "LOCAL_TRANSLATION_LOOPBACK_REQUIRED"
+        );
+        assert_eq!(
+            discover_local_translation_models("http://127.0.0.1:9/v1").unwrap_err(),
+            "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE"
+        );
     }
 
     #[test]

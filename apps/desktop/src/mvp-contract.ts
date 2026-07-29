@@ -147,6 +147,40 @@ export type TranslationProbe = {
   preview: string;
 };
 
+export type AsrModelProfile = {
+  modelId: string;
+  label: string;
+  tier: "stable-default" | "high-quality-candidate" | "high-quality-default";
+  engine: string;
+  engineVersion: string;
+  runtimeVersion: string;
+  modelRevision: string;
+  modelSha256: string;
+  quantization: string;
+  executionProvider: string;
+  nativeStreaming: boolean;
+  supportedLanguages: MvpRecognitionLanguage[];
+  modelSizeBytes: string;
+  recommendedMemoryMb: number;
+  licenseId: string;
+  installState: "verified" | "missing" | "invalid";
+  benchmarkStatus: "baseline-locked" | "pending" | "verified" | "local-smoke-verified";
+  selectable: boolean;
+};
+
+export type LocalTranslationModel = {
+  id: string;
+  ownedBy: string | null;
+};
+
+export type LocalTranslationDiscovery = {
+  baseUrl: string;
+  endpoint: string;
+  providerFlavor: "ollama" | "lmstudio" | "openai-compatible";
+  models: LocalTranslationModel[];
+  latencyMs: number;
+};
+
 export type ExportArtifact = {
   format: MvpExportFormat;
   path: string;
@@ -449,10 +483,23 @@ export function formatMvpErrorMessage(value: unknown): string {
       "ASR_FINAL_OVERLOAD",
       "本地转写队列已满。请停止后重新开始；已经提交到 SQLite 的文字仍然安全。",
     ],
+    ["ASR_MODEL_NOT_FOUND", "所选本地识别模型不在已校验的模型注册表中。"],
+    ["ASR_MODEL_NOT_READY", "所选本地识别模型尚未安装或完整性校验失败。"],
+    ["ASR_MODEL_LANGUAGE_UNSUPPORTED", "所选本地识别模型不支持本次会议语言。"],
     [
       "SHERPA_REALTIME_RECOGNITION_UNAVAILABLE",
       "本地转写引擎重试后仍不可用。请停止后重新开始；已经保存的文字不会丢失。",
     ],
+    ["COHERE_ASR_RUNTIME_MISSING", "Cohere GPU 运行环境尚未安装，请运行 tools/cohere-transcribe/setup.ps1。"],
+    ["COHERE_ASR_WORKER_MISSING", "Cohere 本地 worker 文件缺失，请检查安装或开发工作区。"],
+    ["COHERE_ASR_MODEL_MISSING", "Cohere Transcribe 模型尚未下载到本机。"],
+    ["COHERE_ASR_MODEL_INVALID", "Cohere Transcribe 模型完整性校验失败，请重新下载。"],
+    ["COHERE_ASR_CUDA_UNAVAILABLE", "Cohere Transcribe 需要可用的 NVIDIA CUDA GPU。"],
+    ["COHERE_ASR_CUDA_OUT_OF_MEMORY", "GPU 显存不足，无法完成本段 Cohere 转写。"],
+    ["COHERE_ASR_WORKER_START_FAILED", "无法启动 Cohere GPU 识别进程。"],
+    ["COHERE_ASR_WORKER_STOPPED", "Cohere GPU 识别进程意外停止，系统将尝试重建。"],
+    ["COHERE_ASR_TIMEOUT", "Cohere GPU 识别超时，系统将尝试重建识别进程。"],
+    ["COHERE_ASR_INFERENCE_FAILED", "Cohere GPU 转写失败；已经保存的文字不会丢失。"],
     [
       "SHERPA_ASSET_MISSING",
       "本地模型或运行时路径无效。请检查个人 Release 启动器或模型路径配置。",
@@ -474,6 +521,27 @@ export function formatMvpErrorMessage(value: unknown): string {
       "TRANSLATION_CONNECTION_FAILED",
       "无法连接翻译服务。请检查服务状态、Base URL、网络连接和模型 ID。",
     ],
+    [
+      "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE",
+      "无法连接本地翻译服务。请先启动 Ollama 或 LM Studio 的本地服务器。",
+    ],
+    [
+      "LOCAL_TRANSLATION_MODELS_EMPTY",
+      "本地服务已启动，但没有可用模型；请先下载并加载翻译模型。",
+    ],
+    [
+      "LOCAL_TRANSLATION_MODELS_HTTP_STATUS_404",
+      "本地服务没有提供 OpenAI-compatible /v1/models；请确认已启动兼容 API 服务。",
+    ],
+    [
+      "LOCAL_TRANSLATION_MODELS_RESPONSE_INVALID",
+      "本地服务返回了无法识别的模型列表；请确认它兼容 OpenAI /v1/models。",
+    ],
+    [
+      "LOCAL_TRANSLATION_MODEL_NOT_AVAILABLE",
+      "所选模型不在本地服务的可用模型列表中；请刷新并重新选择。",
+    ],
+    ["LOCAL_TRANSLATION_LOOPBACK_REQUIRED", "本地翻译服务必须使用 localhost 或 127.0.0.1。"],
     [
       "TRANSLATION_HTTP_STATUS_401",
       "翻译服务拒绝授权，请检查 API Token。",
@@ -1154,6 +1222,114 @@ export function parseProviderProfiles(value: unknown): ProviderProfile[] {
   });
 }
 
+export function parseAsrModelProfiles(value: unknown): AsrModelProfile[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 16) {
+    throw new Error("ASR model profiles must be a non-empty bounded array.");
+  }
+  return value.map((entry, index) => {
+    const profile = object(entry, `asrModel[${index}]`);
+    if (!Array.isArray(profile.supportedLanguages) || profile.supportedLanguages.length === 0) {
+      throw new Error(`asrModel[${index}].supportedLanguages is invalid.`);
+    }
+    const sha256 = boundedString(profile.modelSha256, `asrModel[${index}].modelSha256`, 64);
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      throw new Error(`asrModel[${index}].modelSha256 is invalid.`);
+    }
+    return {
+      modelId: identifier(profile.modelId, `asrModel[${index}].modelId`),
+      label: boundedString(profile.label, `asrModel[${index}].label`, 128),
+      tier: enumValue(profile.tier, `asrModel[${index}].tier`, [
+        "stable-default",
+        "high-quality-candidate",
+        "high-quality-default",
+      ] as const),
+      engine: identifier(profile.engine, `asrModel[${index}].engine`),
+      engineVersion: boundedString(
+        profile.engineVersion,
+        `asrModel[${index}].engineVersion`,
+        64,
+      ),
+      runtimeVersion: boundedString(
+        profile.runtimeVersion,
+        `asrModel[${index}].runtimeVersion`,
+        64,
+      ),
+      modelRevision: boundedString(
+        profile.modelRevision,
+        `asrModel[${index}].modelRevision`,
+        128,
+      ),
+      modelSha256: sha256,
+      quantization: boundedString(
+        profile.quantization,
+        `asrModel[${index}].quantization`,
+        32,
+      ),
+      executionProvider: boundedString(
+        profile.executionProvider,
+        `asrModel[${index}].executionProvider`,
+        32,
+      ),
+      nativeStreaming: boolean(
+        profile.nativeStreaming,
+        `asrModel[${index}].nativeStreaming`,
+      ),
+      supportedLanguages: profile.supportedLanguages.map((language, languageIndex) =>
+        enumValue(
+          language,
+          `asrModel[${index}].supportedLanguages[${languageIndex}]`,
+          MVP_RECOGNITION_LANGUAGES,
+        ),
+      ),
+      modelSizeBytes: uint64(profile.modelSizeBytes, `asrModel[${index}].modelSizeBytes`),
+      recommendedMemoryMb: safeCount(
+        profile.recommendedMemoryMb,
+        `asrModel[${index}].recommendedMemoryMb`,
+      ),
+      licenseId: boundedString(profile.licenseId, `asrModel[${index}].licenseId`, 256),
+      installState: enumValue(profile.installState, `asrModel[${index}].installState`, [
+        "verified",
+        "missing",
+        "invalid",
+      ] as const),
+      benchmarkStatus: enumValue(
+        profile.benchmarkStatus,
+        `asrModel[${index}].benchmarkStatus`,
+        ["baseline-locked", "pending", "verified", "local-smoke-verified"] as const,
+      ),
+      selectable: boolean(profile.selectable, `asrModel[${index}].selectable`),
+    };
+  });
+}
+
+export function parseLocalTranslationDiscovery(value: unknown): LocalTranslationDiscovery {
+  const discovery = object(value, "local translation discovery");
+  if (!Array.isArray(discovery.models) || discovery.models.length === 0 || discovery.models.length > 512) {
+    throw new Error("local translation models are invalid.");
+  }
+  return {
+    baseUrl: boundedString(discovery.baseUrl, "local translation baseUrl", 640),
+    endpoint: boundedString(discovery.endpoint, "local translation endpoint", 640),
+    providerFlavor: enumValue(discovery.providerFlavor, "local translation providerFlavor", [
+      "ollama",
+      "lmstudio",
+      "openai-compatible",
+    ] as const),
+    models: discovery.models.map((entry, index) => {
+      const model = object(entry, `local translation model[${index}]`);
+      return {
+        id: boundedString(model.id, `local translation model[${index}].id`, 256),
+        ownedBy: nullableString(
+          model.ownedBy,
+          `local translation model[${index}].ownedBy`,
+          128,
+        ),
+      };
+    }),
+    latencyMs: safeCount(discovery.latencyMs, "local translation latencyMs"),
+  };
+}
+
 export function parseProviderProfileDraft(value: unknown): ProviderProfileDraft {
   const profile = object(value, "provider profile draft");
   const configVersion = safeCount(profile.configVersion, "provider draft.configVersion");
@@ -1438,7 +1614,7 @@ export function parseMvpSnapshot(value: unknown): MvpSnapshot {
     contractVersion: MVP_CONTRACT_VERSION,
     lifecycle,
     modelReady: boolean(snapshot.modelReady, "modelReady"),
-    modelLabel: boundedString(snapshot.modelLabel, "modelLabel", 256),
+    modelLabel: boundedString(snapshot.modelLabel, "modelLabel", 512),
     localOnly: true,
     memoryOnly: false,
     meetingId: nullableIdentifier(snapshot.meetingId, "meetingId"),

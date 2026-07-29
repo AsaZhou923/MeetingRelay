@@ -2673,10 +2673,34 @@ fn add_v7_schema(tx: &Transaction<'_>) -> Result<(), String> {
 
 fn seed_default_provider_profiles(tx: &Transaction<'_>) -> Result<(), String> {
     let now = now_ms_string();
-    for (profile_id, label, class, secret_state) in [
-        ("provider-local-default", "Local", "local", "not_required"),
-        ("provider-lan-default", "LAN", "lan", "missing"),
-        ("provider-cloud-default", "Cloud", "cloud", "missing"),
+    for (profile_id, label, class, base_url, model, secret_state, data_flow) in [
+        (
+            "provider-local-default",
+            "Local · Ollama / LM Studio",
+            "local",
+            "http://127.0.0.1:11434/v1",
+            "qwen2.5:7b",
+            "not_required",
+            "Final transcript text is sent only to the selected loopback service; raw audio is not sent.",
+        ),
+        (
+            "provider-lan-default",
+            "LAN · OpenAI-compatible",
+            "lan",
+            "http://192.168.1.10:11434/v1",
+            "qwen2.5:7b",
+            "missing",
+            "Final transcript text is sent to the configured LAN endpoint; raw audio is not sent.",
+        ),
+        (
+            "provider-cloud-default",
+            "Cloud · OpenAI-compatible",
+            "cloud",
+            "https://api.openai.com/v1",
+            "gpt-4o-mini",
+            "missing",
+            "Final transcript text is sent over HTTPS; raw audio remains on this device.",
+        ),
     ] {
         tx.execute(
             "INSERT OR IGNORE INTO mvp_provider_profiles (
@@ -2684,8 +2708,8 @@ fn seed_default_provider_profiles(tx: &Transaction<'_>) -> Result<(), String> {
                 data_flow, policy_url, config_version, label, provider_class, base_url,
                 model, config_version_number, secret_state, last_error,
                 last_test_at, last_test_status, created_at
-             ) VALUES (?1, 1, ?2, ?3, NULL, '', ?4, NULL, '1', ?2, ?5, NULL,
-                       '', 1, ?6, NULL, NULL, 'untested', ?7)",
+             ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, NULL, '1', ?2, ?7, ?4,
+                       ?8, 1, ?9, NULL, NULL, 'untested', ?10)",
             params![
                 profile_id,
                 label,
@@ -2694,12 +2718,11 @@ fn seed_default_provider_profiles(tx: &Transaction<'_>) -> Result<(), String> {
                     "lan" => "LAN",
                     _ => "Cloud",
                 },
-                match class {
-                    "local" => "local processing; no network egress",
-                    "lan" => "LAN endpoint; configure base URL and secret before use",
-                    _ => "Cloud endpoint; configure base URL and secret before use",
-                },
+                base_url,
+                sha256_hex(base_url.as_bytes()),
+                data_flow,
                 class,
+                model,
                 secret_state,
                 now
             ],

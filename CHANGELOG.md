@@ -3,6 +3,63 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-07-29 — Cohere Transcribe GPU ASR
+
+- Added Cohere Transcribe 2B as the high-quality Windows GPU profile, using a
+  persistent local Python/CUDA worker with framed PCM16 transport. The model is
+  loaded once in BF16 and remains resident across segment requests.
+- Pinned the gated Hugging Face model revision, size, SHA-256, Apache-2.0
+  identity, PyTorch/CUDA runtime, and Transformers version. Startup is
+  fail-closed when the runtime, worker, CUDA device, or exact model asset is
+  missing or invalid; the worker verifies the full model hash before loading.
+- Connected the existing ASR selector and inference queue to the Cohere backend.
+  Sherpa / SenseVoice remains available as the CPU option, and MeetingRelay
+  never silently changes models after a failure.
+- Verified the Rust-to-Python CUDA sidecar in a live ignored integration test.
+  A four-sample Japanese smoke benchmark on an RTX 5070 Ti Laptop GPU produced
+  normalized CER `0`, average RTF `0.029` (about 35× real time), peak VRAM
+  `3.894 GiB`, and a roughly `10.5 s` cold load.
+- Added a repeatable Windows Chinese/Japanese/English GPU smoke harness. The
+  final run produced normalized CER `0` for all three languages, RTF `0.102`,
+  `0.040`, and `0.029`, and a `11.0 s` cold load on the same GPU.
+- Ran the package-local personal release against the real default Windows
+  speaker loopback and microphone. Two synthetic Chinese passages produced four
+  committed finals, the meeting closed as `completed`, and SQLite contained no
+  repeated-pattern noise segments.
+- Fixed two product regressions found by that real release test: full Cohere
+  provenance labels now fit the bounded frontend contract, and short repeated
+  silence/noise hallucinations are rejected without suppressing normal short
+  utterances. The worker also uses a tighter duration-based generation cap.
+- Revalidated 39 frontend tests, TypeScript/Vite production build, strict Rust
+  formatting and Clippy, 202 Rust tests (7 explicitly ignored), the Windows
+  launcher/release/acceptance/distribution contracts, the two-test native
+  SenseVoice smoke, and the live Cohere CUDA sidecar test.
+- Cohere currently receives endpointed/partial audio chunks rather than using
+  native token streaming. Representative same-material Chinese/Japanese/English,
+  noisy-room, and long-meeting quality comparisons remain pending.
+- Ollama and LM Studio were both unreachable on loopback during this validation,
+  so R8's real offline local-translation meeting E2E remains open; discovery,
+  model selection, Chat Completions, persistence, and no-silent-cloud-fallback
+  continue to be covered by the local HTTP integration suite.
+
+## 2026-07-28 — R7/R8 Development Baseline
+
+- Added a bounded ASR model registry with the sealed SenseVoice baseline,
+  capability/resource/license metadata, pre-meeting selection, restart
+  preference, model-and-language worker identity, and fail-closed selection
+  errors. Meeting identity now includes the engine, runtime, model revision,
+  full model SHA-256, and quantization.
+- Added loopback OpenAI-compatible model discovery for Ollama and LM Studio via
+  `/v1/models`, including UI refresh/selection with a manual model-ID fallback.
+- Replaced the Local Provider's synthetic success shortcut with real model
+  availability validation followed by a Chat Completions probe. Local profiles
+  cannot be overridden by caller-supplied cloud configuration and never
+  silently fall back to Cloud.
+- R7 remains in progress: a second license-approved, benchmark-verified model,
+  controlled materialization, and structured meeting/segment provenance are
+  still required. R8 still requires a real offline Ollama/LM Studio meeting E2E,
+  network audit, and long-meeting quality/resource measurements.
+
 ## 2026-07-27 — v0.1.1 Maintenance Release
 
 - Published a maintenance release of the current Windows V1 engineering
@@ -11,7 +68,8 @@ decisions, and known acceptance gaps.
 - Added the planned R7/R8 directions to the public roadmap: benchmark-gated
   selection of a demonstrably higher-quality ASR model, and first-class local
   Ollama / LM Studio translation-model selection with no silent cloud fallback.
-  These capabilities are roadmap items and are not implemented in v0.1.1.
+  These capabilities were roadmap items in v0.1.1; the first implementation
+  baseline is recorded in the 2026-07-28 entry above.
 - Release artifact: 14,357,504 bytes, SHA-256
   `B2276B4EFBF974EFCFA5B7D4A09C9DAE9789D8052880DBB0BDEC45C4C178997C`.
 - Windows distribution and package-local personal release contracts passed

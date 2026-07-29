@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use super::{
+    asr_models::{AsrModelProfile, resolve_asr_model, resolve_asr_model_from_label},
     audio::{AudioDeviceInventory, AudioDeviceSelection, AudioSourceMode},
     contract::{
         AudioSourceSnapshot, DiskHealthSnapshot, Lifecycle, MvpSnapshot, SourceId, SourceStatus,
@@ -34,8 +35,10 @@ use super::{
         SummarySegment, SummaryStage, run_summary,
     },
     translation::{
-        TranslationConfig, TranslationProbe, TranslationSubmitter, TranslationWorker,
-        ValidatedTranslationConfig, test_translation, translate_text, translation_error_retryable,
+        LocalTranslationDiscovery, TranslationConfig, TranslationProbe, TranslationSubmitter,
+        TranslationWorker, ValidatedTranslationConfig, discover_local_translation_models,
+        test_translation, translate_text, translation_error_retryable,
+        validate_local_translation_base_url,
     },
 };
 
@@ -74,6 +77,7 @@ use super::{
         AudioCapture, AudioCaptureMetrics, AudioCaptureOptions, AudioCaptureOutput,
         AudioDevicePreflight, AudioSourceId, AudioSourceStats, RawAudioPacket,
     },
+    cohere_asr::{self, CohereAsrConfig, CohereAsrError, CohereAsrSidecar},
     contract::{MAX_INFERENCE_QUEUE_DEPTH, TranscriptSegment},
     dsp::{
         AudioBlock, AudioSegment, BlockPacketizer, EnergyEndpointSegmenter, Mono16kResampler,
@@ -360,8 +364,8 @@ impl RecognitionLanguage {
         }
     }
 
-    fn model_label(self) -> String {
-        format!("SenseVoice · {} · CPU · local", self.code())
+    fn model_label(self, model: &AsrModelProfile) -> String {
+        model.meeting_label(self.code())
     }
 
     fn from_model_label(model_label: &str) -> Self {
@@ -513,24 +517,29 @@ impl MvpService {
             .provider_profile_latest(provider_profile_id)?
             .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
         if profile.provider_class == "local" {
-            let probe = TranslationProbe {
-                endpoint: profile
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "local://meetingrelay".to_owned()),
-                model: profile.model.clone(),
-                target_language: "zh".to_owned(),
-                latency_ms: 0,
-                preview: "Local provider ready".to_owned(),
-            };
-            self.record_provider_test(&profile, "passed", None)?;
-            return Ok(probe);
+            let base_url = profile.base_url.clone().unwrap_or_default();
+            let discovery = discover_local_translation_models(&base_url).inspect_err(|error| {
+                let _ = self.record_provider_test(&profile, "failed", Some(error));
+            })?;
+            if !discovery
+                .models
+                .iter()
+                .any(|model| model.id == profile.model)
+            {
+                let error = "LOCAL_TRANSLATION_MODEL_NOT_AVAILABLE".to_owned();
+                let _ = self.record_provider_test(&profile, "failed", Some(&error));
+                return Err(error);
+            }
         }
         let config = TranslationConfig {
             enabled: true,
             base_url: profile.base_url.clone().unwrap_or_default(),
             model: profile.model.clone(),
-            api_key: self.provider_api_key(provider_profile_id)?,
+            api_key: if profile.provider_class == "local" {
+                None
+            } else {
+                self.provider_api_key(provider_profile_id)?
+            },
             target_language: "zh".to_owned(),
             allow_insecure_http: profile.provider_class == "lan",
         };
@@ -544,6 +553,13 @@ impl MvpService {
                 Err(error)
             }
         }
+    }
+
+    pub fn discover_local_translation_models(
+        &self,
+        base_url: &str,
+    ) -> Result<LocalTranslationDiscovery, String> {
+        discover_local_translation_models(base_url)
     }
 
     pub fn provider_profiles(&self) -> Result<Vec<ProviderProfileSnapshot>, String> {
@@ -1007,14 +1023,18 @@ impl MvpService {
             .provider_profile_latest(&profile_id)?
             .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
         if profile.provider_class == "local" {
-            return Err("SUMMARY_LOCAL_PROVIDER_UNSUPPORTED".to_owned());
+            validate_local_translation_base_url(profile.base_url.as_deref().unwrap_or_default())?;
         }
         let config = SummaryConfig {
             enabled: true,
             provider: "openai-compatible".to_owned(),
             base_url: profile.base_url.unwrap_or_default(),
             model: profile.model,
-            api_key: self.provider_api_key(&profile_id)?,
+            api_key: if profile.provider_class == "local" {
+                None
+            } else {
+                self.provider_api_key(&profile_id)?
+            },
             allow_insecure_http: profile.provider_class == "lan",
             max_chunk_chars: None,
             max_retries: None,
@@ -1133,13 +1153,17 @@ impl MvpService {
             .provider_profile_latest(provider_profile_id)?
             .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
         if profile.provider_class == "local" {
-            return Err("TRANSLATION_LOCAL_PROVIDER_UNSUPPORTED".to_owned());
+            validate_local_translation_base_url(profile.base_url.as_deref().unwrap_or_default())?;
         }
         let config = TranslationConfig {
             enabled: true,
             base_url: profile.base_url.unwrap_or_default(),
             model: profile.model,
-            api_key: self.provider_api_key(provider_profile_id)?,
+            api_key: if profile.provider_class == "local" {
+                None
+            } else {
+                self.provider_api_key(provider_profile_id)?
+            },
             target_language: requested.target_language,
             allow_insecure_http: profile.provider_class == "lan",
         };
@@ -1216,6 +1240,7 @@ impl MvpService {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_devices_language_and_audio_mode(
         &self,
@@ -1227,10 +1252,35 @@ impl MvpService {
         audio_source_mode: AudioSourceMode,
         raw_audio_enabled: bool,
     ) -> Result<MvpSnapshot, String> {
+        self.start_with_devices_language_audio_mode_and_model(
+            consent_accepted,
+            selection,
+            language,
+            None,
+            translation,
+            translation_provider_profile_id,
+            audio_source_mode,
+            raw_audio_enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_devices_language_audio_mode_and_model(
+        &self,
+        consent_accepted: bool,
+        selection: AudioDeviceSelection,
+        language: &str,
+        asr_model_id: Option<&str>,
+        translation: Option<TranslationConfig>,
+        translation_provider_profile_id: Option<&str>,
+        audio_source_mode: AudioSourceMode,
+        raw_audio_enabled: bool,
+    ) -> Result<MvpSnapshot, String> {
         if !consent_accepted {
             return Err("CONSENT_REQUIRED".to_owned());
         }
         let language = RecognitionLanguage::parse(language)?;
+        let asr_model = resolve_asr_model(asr_model_id, language.code())?;
         let translation = self.resolve_translation_config(
             translation.unwrap_or_default(),
             translation_provider_profile_id,
@@ -1241,6 +1291,7 @@ impl MvpService {
             self.start_windows(
                 selection,
                 language,
+                asr_model,
                 translation,
                 audio_source_mode,
                 raw_audio_enabled,
@@ -1251,6 +1302,7 @@ impl MvpService {
             let _ = (
                 selection,
                 language,
+                asr_model,
                 translation,
                 audio_source_mode,
                 raw_audio_enabled,
@@ -1259,15 +1311,20 @@ impl MvpService {
         }
     }
 
-    pub fn prepare_language(&self, language: &str) -> Result<MvpSnapshot, String> {
+    pub fn prepare_language_model(
+        &self,
+        language: &str,
+        asr_model_id: Option<&str>,
+    ) -> Result<MvpSnapshot, String> {
         let language = RecognitionLanguage::parse(language)?;
+        let asr_model = resolve_asr_model(asr_model_id, language.code())?;
         #[cfg(windows)]
         {
-            self.prepare_language_windows(language)
+            self.prepare_language_windows(language, asr_model)
         }
         #[cfg(not(windows))]
         {
-            let _ = language;
+            let _ = (language, asr_model);
             Err("MVP_WINDOWS_ONLY".to_owned())
         }
     }
@@ -1807,12 +1864,9 @@ impl MvpService {
                     .as_ref()
                     .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
                     .meeting_model_label(meeting_id)?;
-                self.recover_raw_tail(
-                    meeting_id,
-                    manifest,
-                    last_sample,
-                    RecognitionLanguage::from_model_label(&model_label),
-                )?;
+                let language = RecognitionLanguage::from_model_label(&model_label);
+                let asr_model = resolve_asr_model_from_label(&model_label, language.code())?;
+                self.recover_raw_tail(meeting_id, manifest, last_sample, language, asr_model)?;
             }
         }
         writer.record_recovery_action(meeting_id, action)?;
@@ -1826,6 +1880,7 @@ impl MvpService {
         manifest: &RawAudioManifest,
         last_saved_sample: u64,
         language: RecognitionLanguage,
+        asr_model: AsrModelProfile,
     ) -> Result<(), String> {
         let tail_end = manifest
             .sources
@@ -1839,7 +1894,7 @@ impl MvpService {
 
         let submitter = {
             let mut inner = lock(&self.inner);
-            self.ensure_inference_worker(&mut inner, language)?;
+            self.ensure_inference_worker(&mut inner, language, &asr_model)?;
             let inference = inner
                 .inference
                 .as_ref()
@@ -2475,17 +2530,31 @@ impl MvpService {
     fn prepare_inference_worker(
         &self,
         language: RecognitionLanguage,
+        asr_model: &AsrModelProfile,
     ) -> Result<InferenceWorker, String> {
-        let paths = resolve_model_paths().inspect_err(|error| self.fail(error))?;
+        let profile = if asr_model.model_id == cohere_asr::MODEL_ID {
+            RecognizerProfile::Cohere {
+                config: CohereAsrConfig::resolve().map_err(|error| error.to_string())?,
+                language,
+            }
+        } else if asr_model.model_id == meetingrelay_model_worker_sherpa_native::MODEL_ID {
+            RecognizerProfile::Sherpa {
+                paths: resolve_model_paths().inspect_err(|error| self.fail(error))?,
+                language,
+            }
+        } else {
+            return Err("ASR_MODEL_NOT_FOUND".to_owned());
+        };
         let translation = lock(&self.translation)
             .as_ref()
             .map(TranslationWorker::submitter);
         InferenceWorker::prepare(
             Arc::clone(&self.snapshot),
-            paths,
+            profile,
             self.storage_writer.clone(),
             translation,
             language,
+            asr_model.model_id.clone(),
         )
         .inspect_err(|error| self.fail(error))
     }
@@ -2495,11 +2564,13 @@ impl MvpService {
         &self,
         inner: &mut ServiceInner,
         language: RecognitionLanguage,
+        asr_model: &AsrModelProfile,
     ) -> Result<(), String> {
-        let replace = inner
-            .inference
-            .as_ref()
-            .is_some_and(|worker| worker.is_finished() || worker.language != language);
+        let replace = inner.inference.as_ref().is_some_and(|worker| {
+            worker.is_finished()
+                || worker.language != language
+                || worker.model_id != asr_model.model_id
+        });
         if replace {
             if let Some(worker) = inner.inference.take() {
                 worker.shutdown_before(Instant::now() + MVP_SHUTDOWN_TIMEOUT)?;
@@ -2511,7 +2582,7 @@ impl MvpService {
             }
         }
         if inner.inference.is_none() {
-            inner.inference = Some(self.prepare_inference_worker(language)?);
+            inner.inference = Some(self.prepare_inference_worker(language, asr_model)?);
         }
         Ok(())
     }
@@ -2557,13 +2628,14 @@ impl MvpService {
         })?;
 
         let language = RecognitionLanguage::default();
-        self.ensure_inference_worker(&mut inner, language)?;
+        let asr_model = resolve_asr_model(None, language.code())?;
+        self.ensure_inference_worker(&mut inner, language, &asr_model)?;
 
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
         snapshot.durability_status = "ready".to_owned();
         snapshot.model_ready = true;
-        snapshot.model_label = language.model_label();
+        snapshot.model_label = language.model_label(&asr_model);
         snapshot.system = ready_source(SourceId::System, &devices.system_output);
         snapshot.microphone = ready_source(SourceId::Microphone, &devices.microphone);
         snapshot.error = None;
@@ -2577,6 +2649,7 @@ impl MvpService {
     fn prepare_language_windows(
         &self,
         language: RecognitionLanguage,
+        asr_model: AsrModelProfile,
     ) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
@@ -2588,13 +2661,13 @@ impl MvpService {
         {
             let mut snapshot = lock(&self.snapshot);
             snapshot.model_ready = false;
-            snapshot.model_label = format!("SenseVoice · {} · preparing", language.code());
+            snapshot.model_label = format!("{} · {} · preparing", asr_model.label, language.code());
             snapshot.error = None;
         }
-        self.ensure_inference_worker(&mut inner, language)?;
+        self.ensure_inference_worker(&mut inner, language, &asr_model)?;
         let mut snapshot = lock(&self.snapshot);
         snapshot.model_ready = true;
-        snapshot.model_label = language.model_label();
+        snapshot.model_label = language.model_label(&asr_model);
         snapshot.error = None;
         Ok(public_snapshot(
             &mut snapshot,
@@ -2607,6 +2680,7 @@ impl MvpService {
         &self,
         selection: AudioDeviceSelection,
         language: RecognitionLanguage,
+        asr_model: AsrModelProfile,
         translation_config: TranslationConfig,
         audio_source_mode: AudioSourceMode,
         raw_audio_enabled: bool,
@@ -2636,11 +2710,11 @@ impl MvpService {
             return Err(error);
         }
         lock(&self.snapshot).disk = disk;
-        self.ensure_inference_worker(&mut inner, language)?;
+        self.ensure_inference_worker(&mut inner, language, &asr_model)?;
         if translation_config.enabled && lock(&self.translation).is_none() {
             return Err("TRANSLATION_WORKER_UNAVAILABLE".to_owned());
         }
-        let model_label = language.model_label();
+        let model_label = language.model_label(&asr_model);
         let meeting = writer.start_meeting_with_metadata(
             true,
             &model_label,
@@ -3217,18 +3291,20 @@ fn resolve_search_identity(
 }
 
 fn default_provider_profiles() -> [ProviderProfileInput; 3] {
-    let local_url = "local://meetingrelay";
+    let local_url = "http://127.0.0.1:11434/v1";
     let lan_url = "http://127.0.0.1:11434/v1";
     let cloud_url = "https://api.openai.com/v1";
     [
         ProviderProfileInput {
             profile_id: Some("local-default".to_owned()),
-            label: "Local · On-device".to_owned(),
+            label: "Local · Ollama / LM Studio".to_owned(),
             provider_class: "local".to_owned(),
             base_url: Some(local_url.to_owned()),
-            model: "SenseVoice".to_owned(),
+            model: "qwen2.5:7b".to_owned(),
             endpoint_hash: sha256_hex(local_url.as_bytes()),
-            data_flow: "Audio and transcript remain on this device.".to_owned(),
+            data_flow:
+                "Final transcript text is sent only to the selected loopback service; raw audio is not sent."
+                    .to_owned(),
             policy_url: None,
             config_version: 1,
             secret_state: "not_required".to_owned(),
@@ -4367,9 +4443,103 @@ impl InferenceShared {
 
 #[cfg(windows)]
 #[derive(Clone)]
-struct RecognizerProfile {
-    paths: LockedSherpaRealtimePaths,
-    language: RecognitionLanguage,
+enum RecognizerProfile {
+    Sherpa {
+        paths: LockedSherpaRealtimePaths,
+        language: RecognitionLanguage,
+    },
+    Cohere {
+        config: CohereAsrConfig,
+        language: RecognitionLanguage,
+    },
+}
+
+#[cfg(windows)]
+impl RecognizerProfile {
+    const fn language(&self) -> RecognitionLanguage {
+        match self {
+            Self::Sherpa { language, .. } | Self::Cohere { language, .. } => *language,
+        }
+    }
+}
+
+#[cfg(windows)]
+enum PreparedRecognizer {
+    Sherpa(Box<LockedSherpaRealtime>),
+    Cohere(CohereAsrSidecar),
+}
+
+#[cfg(windows)]
+impl PreparedRecognizer {
+    fn prepare(profile: &RecognizerProfile) -> Result<Self, RecognizerError> {
+        match profile {
+            RecognizerProfile::Sherpa { paths, language } => {
+                LockedSherpaRealtime::prepare_local_mvp_with_language(
+                    paths.clone(),
+                    language.sherpa(),
+                )
+                .map(Box::new)
+                .map(Self::Sherpa)
+                .map_err(RecognizerError::Sherpa)
+            }
+            RecognizerProfile::Cohere { config, .. } => CohereAsrSidecar::prepare(config)
+                .map(Self::Cohere)
+                .map_err(RecognizerError::Cohere),
+        }
+    }
+
+    fn transcribe(
+        &mut self,
+        samples: Arc<[i16]>,
+        language: RecognitionLanguage,
+    ) -> Result<String, RecognizerError> {
+        match self {
+            Self::Sherpa(recognizer) => recognizer
+                .transcribe_mono_16khz_pcm16(samples)
+                .map(|result| result.original_transcript.as_str().trim().to_owned())
+                .map_err(RecognizerError::Sherpa),
+            Self::Cohere(recognizer) => recognizer
+                .transcribe_mono_16khz_pcm16(&samples, language.code())
+                .map_err(RecognizerError::Cohere),
+        }
+    }
+
+    fn release_runtime_before_restart(&mut self) {
+        if let Self::Cohere(recognizer) = self {
+            recognizer.shutdown();
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum RecognizerError {
+    Sherpa(LockedSherpaRealtimeError),
+    Cohere(CohereAsrError),
+}
+
+#[cfg(windows)]
+impl RecognizerError {
+    fn recoverable(&self) -> bool {
+        match self {
+            Self::Sherpa(error) => matches!(
+                error,
+                LockedSherpaRealtimeError::RecognitionUnavailable
+                    | LockedSherpaRealtimeError::NotPrepared
+            ),
+            Self::Cohere(error) => error.recoverable(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for RecognizerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sherpa(error) => error.fmt(formatter),
+            Self::Cohere(error) => error.fmt(formatter),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -4377,31 +4547,29 @@ struct InferenceWorker {
     submitter: InferenceSubmitter,
     join: Option<JoinHandle<()>>,
     language: RecognitionLanguage,
+    model_id: String,
 }
 
 #[cfg(windows)]
 impl InferenceWorker {
     fn prepare(
         snapshot: Arc<Mutex<MvpSnapshot>>,
-        paths: LockedSherpaRealtimePaths,
+        profile: RecognizerProfile,
         storage_writer: Option<Arc<MvpStorageWriter>>,
         translation: Option<TranslationSubmitter>,
         language: RecognitionLanguage,
+        model_id: String,
     ) -> Result<Self, String> {
         let (ready_sender, ready_receiver) = sync_channel(1);
         let (finals, final_receiver) = sync_channel(MAX_INFERENCE_QUEUE_DEPTH);
         let shared = Arc::new(InferenceShared::default());
         let worker_shared = Arc::clone(&shared);
-        let profile = RecognizerProfile { paths, language };
         let worker_profile = profile.clone();
         let join = thread::Builder::new()
             .name("meetingrelay-asr".to_owned())
             .spawn(move || {
-                let recognizer = LockedSherpaRealtime::prepare_local_mvp_with_language(
-                    profile.paths.clone(),
-                    profile.language.sherpa(),
-                )
-                .map_err(|error| error.to_string());
+                let recognizer =
+                    PreparedRecognizer::prepare(&profile).map_err(|error| error.to_string());
                 let ready = recognizer.as_ref().map(|_| ()).map_err(Clone::clone);
                 let _ = ready_sender.send(ready);
                 if let Ok(mut recognizer) = recognizer {
@@ -4430,6 +4598,7 @@ impl InferenceWorker {
             },
             join: Some(join),
             language,
+            model_id,
         })
     }
 
@@ -4480,7 +4649,7 @@ struct InferenceTask {
 
 #[cfg(windows)]
 fn inference_loop(
-    recognizer: &mut LockedSherpaRealtime,
+    recognizer: &mut PreparedRecognizer,
     profile: RecognizerProfile,
     finals: Receiver<InferenceTask>,
     shared: Arc<InferenceShared>,
@@ -4528,38 +4697,27 @@ struct InferenceSinks<'a> {
 
 #[cfg(windows)]
 fn transcribe_with_recovery(
-    recognizer: &mut LockedSherpaRealtime,
+    recognizer: &mut PreparedRecognizer,
     profile: &RecognizerProfile,
     task: &InferenceTask,
-) -> Result<String, LockedSherpaRealtimeError> {
-    let result = recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples));
-    let result = if result
+) -> Result<String, RecognizerError> {
+    let result = recognizer.transcribe(Arc::clone(&task.samples), profile.language());
+    if result
         .as_ref()
         .err()
-        .is_some_and(|error| should_retry_transcription(*error, task))
+        .is_some_and(|error| should_retry_transcription(error, task))
     {
-        *recognizer = LockedSherpaRealtime::prepare_local_mvp_with_language(
-            profile.paths.clone(),
-            profile.language.sherpa(),
-        )?;
-        recognizer.transcribe_mono_16khz_pcm16(Arc::clone(&task.samples))
+        recognizer.release_runtime_before_restart();
+        *recognizer = PreparedRecognizer::prepare(profile)?;
+        recognizer.transcribe(Arc::clone(&task.samples), profile.language())
     } else {
         result
-    };
-    result.map(|result| result.original_transcript.as_str().trim().to_owned())
+    }
 }
 
 #[cfg(windows)]
-fn should_retry_transcription(error: LockedSherpaRealtimeError, task: &InferenceTask) -> bool {
-    is_recoverable_transcription_error(error) && is_replayable_inference_task(task)
-}
-
-#[cfg(windows)]
-fn is_recoverable_transcription_error(error: LockedSherpaRealtimeError) -> bool {
-    matches!(
-        error,
-        LockedSherpaRealtimeError::RecognitionUnavailable | LockedSherpaRealtimeError::NotPrepared
-    )
+fn should_retry_transcription(error: &RecognizerError, task: &InferenceTask) -> bool {
+    error.recoverable() && is_replayable_inference_task(task)
 }
 
 #[cfg(windows)]
@@ -4577,7 +4735,7 @@ fn is_replayable_sample_count(sample_count: usize) -> bool {
 
 #[cfg(windows)]
 fn process_inference_task(
-    recognizer: &mut LockedSherpaRealtime,
+    recognizer: &mut PreparedRecognizer,
     profile: &RecognizerProfile,
     shared: &InferenceShared,
     snapshot: &Mutex<MvpSnapshot>,
@@ -5366,7 +5524,20 @@ fn f32_to_pcm16(sample: f32) -> i16 {
 }
 
 fn is_meaningful_transcript(text: &str) -> bool {
-    text.chars().any(char::is_alphanumeric)
+    let characters = text
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<Vec<_>>();
+    if characters.is_empty() {
+        return false;
+    }
+    let max_pattern_len = 4.min(characters.len() / 3);
+    !(1..=max_pattern_len).any(|pattern_len| {
+        characters
+            .iter()
+            .enumerate()
+            .all(|(index, character)| *character == characters[index % pattern_len])
+    })
 }
 
 #[cfg(test)]
@@ -5490,6 +5661,50 @@ mod tests {
         assert_eq!(local.provider_class, "local");
         assert_eq!(local.secret_state, "not_required");
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_translation_resolution_stays_on_the_selected_loopback_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-local-provider-resolution-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let service =
+            MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+        service
+            .save_provider_profile(ProviderProfileUpdate {
+                profile_id: "provider-local-default".to_owned(),
+                label: "Local".to_owned(),
+                provider_class: "local".to_owned(),
+                base_url: "http://127.0.0.1:11434/v1".to_owned(),
+                model: "qwen2.5:7b".to_owned(),
+                policy_url: None,
+                data_flow: "Loopback only.".to_owned(),
+            })
+            .unwrap();
+        let resolved = service
+            .resolve_translation_config(
+                TranslationConfig {
+                    enabled: true,
+                    base_url: "https://api.example.invalid/v1".to_owned(),
+                    model: "cloud-model-must-not-win".to_owned(),
+                    api_key: Some("caller-secret-must-not-win".to_owned()),
+                    target_language: "ja".to_owned(),
+                    allow_insecure_http: true,
+                },
+                Some("provider-local-default"),
+            )
+            .unwrap();
+        let validated = resolved.validate_enabled().unwrap();
+        assert_eq!(
+            validated.endpoint,
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert_eq!(validated.model, "qwen2.5:7b");
+        assert!(validated.api_key.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6779,23 +6994,23 @@ mod tests {
     fn transcription_retry_classifier_only_retries_recoverable_replayable_tasks() {
         let task = queued_task(1, false);
         assert!(should_retry_transcription(
-            LockedSherpaRealtimeError::RecognitionUnavailable,
+            &RecognizerError::Sherpa(LockedSherpaRealtimeError::RecognitionUnavailable),
             &task
         ));
         assert!(should_retry_transcription(
-            LockedSherpaRealtimeError::NotPrepared,
+            &RecognizerError::Sherpa(LockedSherpaRealtimeError::NotPrepared),
             &task
         ));
         assert!(!should_retry_transcription(
-            LockedSherpaRealtimeError::EmptySegment,
+            &RecognizerError::Sherpa(LockedSherpaRealtimeError::EmptySegment),
             &task
         ));
         assert!(!should_retry_transcription(
-            LockedSherpaRealtimeError::SegmentTooLarge,
+            &RecognizerError::Sherpa(LockedSherpaRealtimeError::SegmentTooLarge),
             &task
         ));
         assert!(!should_retry_transcription(
-            LockedSherpaRealtimeError::InvalidAudio,
+            &RecognizerError::Sherpa(LockedSherpaRealtimeError::InvalidAudio),
             &task
         ));
 
@@ -6804,7 +7019,7 @@ mod tests {
             ..queued_task(1, false)
         };
         assert!(!should_retry_transcription(
-            LockedSherpaRealtimeError::RecognitionUnavailable,
+            &RecognizerError::Sherpa(LockedSherpaRealtimeError::RecognitionUnavailable),
             &empty
         ));
         assert!(!is_replayable_sample_count(0));
@@ -7100,6 +7315,7 @@ mod tests {
             },
             join: Some(join),
             language: RecognitionLanguage::Chinese,
+            model_id: crate::mvp::asr_models::DEFAULT_ASR_MODEL_ID.to_owned(),
         };
 
         let started = Instant::now();
@@ -7113,8 +7329,13 @@ mod tests {
     #[test]
     fn low_information_noise_transcripts_are_suppressed() {
         assert!(!is_meaningful_transcript("。"));
+        assert!(!is_meaningful_transcript("等等等等等等"));
+        assert!(!is_meaningful_transcript("好好好"));
+        assert!(!is_meaningful_transcript("测试测试测试"));
         assert!(is_meaningful_transcript("嗯。"));
         assert!(is_meaningful_transcript("I."));
+        assert!(is_meaningful_transcript("哈哈"));
+        assert!(is_meaningful_transcript("等等，我马上回来"));
         assert!(is_meaningful_transcript("可以。"));
         assert!(is_meaningful_transcript("OK"));
     }
