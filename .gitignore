@@ -13,6 +13,9 @@ dist/
 **/.vite/
 coverage/
 **/coverage/
+__pycache__/
+**/__pycache__/
+*.py[cod]
 
 # Local environment and logs
 .env

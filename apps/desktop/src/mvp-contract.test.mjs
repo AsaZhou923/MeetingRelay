@@ -13,6 +13,7 @@ import {
   isMvpActiveSession,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
+  parseAsrModelProfiles,
   parseDeletePreview,
   parseDeleteResult,
   parseDiagnosticBundleResult,
@@ -20,6 +21,7 @@ import {
   parseInterruptedMeetings,
   parseMeetingDetail,
   parseMeetingListPage,
+  parseLocalTranslationDiscovery,
   parseMvpAudioSourceMode,
   parseMvpExportResult,
   parseMvpRecognitionLanguage,
@@ -52,6 +54,86 @@ test("accepts only the three R2 audio source modes", () => {
   assert.equal(parseMvpAudioSourceMode("microphone_only"), "microphone_only");
   assert.equal(parseMvpAudioSourceMode("both"), "both");
   assert.throws(() => parseMvpAudioSourceMode("none"), /audio source mode/);
+});
+
+test("parses the bounded R7 ASR model registry", () => {
+  const profiles = parseAsrModelProfiles([
+    {
+      modelId: "sensevoice-zh-en-ja-ko-yue-int8-2024-07-17",
+      label: "SenseVoice Small",
+      tier: "stable-default",
+      engine: "sherpa-onnx",
+      engineVersion: "1.13.4",
+      runtimeVersion: "1.27.0",
+      modelRevision: "2024-07-17",
+      modelSha256: "c".repeat(64),
+      quantization: "int8",
+      executionProvider: "CPU",
+      nativeStreaming: false,
+      supportedLanguages: ["zh", "ja", "en"],
+      modelSizeBytes: "239233841",
+      recommendedMemoryMb: 1024,
+      licenseId: "LicenseRef-Test",
+      installState: "verified",
+      benchmarkStatus: "baseline-locked",
+      selectable: true,
+    },
+    {
+      modelId: "cohere-transcribe-03-2026",
+      label: "Cohere Transcribe 2B",
+      tier: "high-quality-default",
+      engine: "transformers",
+      engineVersion: "5.4.0",
+      runtimeVersion: "torch-2.10.0+cu128",
+      modelRevision: "b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
+      modelSha256: "9".repeat(64),
+      quantization: "bf16",
+      executionProvider: "CUDA",
+      nativeStreaming: false,
+      supportedLanguages: ["zh", "ja", "en"],
+      modelSizeBytes: "4131862976",
+      recommendedMemoryMb: 8192,
+      licenseId: "Apache-2.0",
+      installState: "verified",
+      benchmarkStatus: "local-smoke-verified",
+      selectable: true,
+    },
+  ]);
+  assert.equal(profiles[0].tier, "stable-default");
+  assert.equal(profiles[0].executionProvider, "CPU");
+  assert.equal(profiles[0].nativeStreaming, false);
+  assert.equal(profiles[1].tier, "high-quality-default");
+  assert.equal(profiles[1].executionProvider, "CUDA");
+  assert.equal(profiles[0].supportedLanguages[1], "ja");
+  assert.throws(
+    () =>
+      parseAsrModelProfiles([
+        {
+          ...profiles[0],
+          modelSha256: "not-a-digest",
+        },
+      ]),
+    /modelSha256/,
+  );
+});
+
+test("parses R8 local model discovery without credentials", () => {
+  const discovery = parseLocalTranslationDiscovery({
+    baseUrl: "http://127.0.0.1:11434/v1",
+    endpoint: "http://127.0.0.1:11434/v1/models",
+    providerFlavor: "ollama",
+    models: [
+      { id: "qwen2.5:7b", ownedBy: "ollama" },
+      { id: "gemma3:4b", ownedBy: null },
+    ],
+    latencyMs: 12,
+  });
+  assert.equal(discovery.models[0].id, "qwen2.5:7b");
+  assert.equal("apiKey" in discovery, false);
+  assert.throws(
+    () => parseLocalTranslationDiscovery({ ...discovery, models: [] }),
+    /models/,
+  );
 });
 
 const source = (id) => ({
@@ -392,6 +474,12 @@ test("requires explicit acknowledgement only for non-loopback HTTP providers", (
 test("parses the strict durable ready snapshot and formats elapsed time", () => {
   assert.deepEqual(parseMvpSnapshot(snapshot), snapshot);
   assert.equal(formatElapsed("3723000"), "01:02:03");
+});
+
+test("accepts the full bounded Cohere meeting provenance label", () => {
+  const modelLabel =
+    "Cohere Transcribe 2B · zh · CUDA · local [engine=transformers@5.4.0;runtime=torch-2.10.0+cu128;model=cohere-transcribe-03-2026;revision=b1eacc2686a3d08ceaae5f24a88b1d519620bc09;sha256=987bd3e141c7bfdb5a78f5db11397ee7737308357e6cc0a3f36a4979b158137a;quantization=bf16;native_streaming=false]";
+  assert.equal(parseMvpSnapshot({ ...snapshot, modelLabel }).modelLabel, modelLabel);
 });
 
 test("rejects memory-only snapshots and unsupported durability state", () => {

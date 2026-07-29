@@ -536,9 +536,11 @@ h2 {
 }
 
 .model-line strong {
+  min-width: 0;
   color: var(--danger);
   font-size: 10px;
   font-weight: 550;
+  overflow-wrap: anywhere;
   text-align: right;
 }
 

@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  Local-first meeting transcription for Windows, powered by on-device SenseVoice ASR, durable SQLite storage, and optional OpenAI-compatible translation.
+  Local-first meeting transcription for Windows, powered by on-device Cohere Transcribe GPU or SenseVoice CPU ASR, durable SQLite storage, and optional OpenAI-compatible translation.
 </p>
 
 <p align="center">
@@ -27,11 +27,11 @@
 MeetingRelay captures system playback and microphone input, performs real-time speech recognition locally, and marks final transcript segments as saved only after a successful SQLite commit. When bilingual notes are needed, it can connect to Ollama, LM Studio, or a third-party OpenAI-compatible service. Translation failures never delete, overwrite, or delay the original transcript.
 
 > [!IMPORTANT]
-> The `MeetingRelay.exe` published in the current Release is unsigned and does not include the SenseVoice model or Sherpa native runtime. Follow the [Quick Start](#quick-start) instructions to create a complete same-machine package before first use.
+> The `MeetingRelay.exe` published in the current Release is unsigned and does not include the Cohere or SenseVoice model runtimes. Follow the [Quick Start](#quick-start) instructions to prepare the local assets before first use.
 
 ## Features
 
-- **Local real-time ASR** — uses a pinned Sherpa / SenseVoice int8 model; audio and speech recognition stay on the machine by default.
+- **Selectable local ASR** — uses Cohere Transcribe 2B with CUDA/BF16 for the high-quality GPU path, with pinned Sherpa / SenseVoice int8 available as the CPU path; audio and speech recognition stay on the machine.
 - **Dual-source capture** — select Windows system output and microphone devices.
 - **Chinese, Japanese, and English** — select one recognition language before each meeting; the choice is locked while recording.
 - **Stable live transcript** — final rows are reconciled by stable keys instead of rebuilding the entire list on every poll.
@@ -48,7 +48,7 @@ MeetingRelay captures system playback and microphone input, performs real-time s
 flowchart LR
     SYS["System output"] --> CAP["Windows audio capture"]
     MIC["Microphone"] --> CAP
-    CAP --> ASR["Local SenseVoice ASR"]
+    CAP --> ASR["Local Cohere GPU or SenseVoice CPU ASR"]
     ASR --> DB["SQLite / WAL<br/>durable final"]
     DB --> UI["Stable live transcript"]
     DB --> TQ["Independent translation queue"]
@@ -106,7 +106,56 @@ powershell -ExecutionPolicy Bypass -File tools/mvp/start.ps1 -DryRun
 
 ## Local ASR model
 
-Use the repository script to download the model. It validates the lock file, SHA-256 digest, and extracted output:
+### Cohere Transcribe 2B GPU path
+
+First accept the gated model terms and authenticate the Hugging Face CLI, then
+create the isolated CUDA runtime:
+
+```powershell
+hf auth login
+powershell -ExecutionPolicy Bypass -File tools/cohere-transcribe/setup.ps1
+```
+
+The setup script installs the pinned Python/CUDA dependencies under
+`%LOCALAPPDATA%\MeetingRelay\runtimes\cohere-transcribe-03-2026` and downloads
+the exact model revision into the Hugging Face cache. MeetingRelay verifies the
+expected model file size before offering it in the selector; the persistent
+worker verifies the full SHA-256 digest before loading it. Inference then runs
+offline over a local pipe.
+
+| Item | Value |
+| --- | --- |
+| Model | `CohereLabs/cohere-transcribe-03-2026` |
+| Revision | `b1eacc2686a3d08ceaae5f24a88b1d519620bc09` |
+| `model.safetensors` | 4,131,862,976 bytes |
+| Model SHA-256 | `987bd3e141c7bfdb5a78f5db11397ee7737308357e6cc0a3f36a4979b158137a` |
+| Runtime | PyTorch `2.10.0` + CUDA 12.8, Transformers `5.4.0`, BF16 |
+| Recommended GPU memory | 8 GB or more |
+| License | Apache-2.0; gated Hugging Face access is still required |
+
+On the current RTX 5070 Ti Laptop GPU, a four-sample Japanese smoke benchmark
+(three synthetic utterances and one FLEURS utterance) produced normalized CER
+`0`, average RTF `0.029` (about 35× real time), peak VRAM `3.894 GiB`, and a
+roughly `10.5 s` cold model load. This is integration evidence, not a
+representative long-meeting quality benchmark.
+
+Run the repeatable Windows Chinese/Japanese/English smoke through the same
+worker protocol:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/cohere-transcribe/smoke.ps1
+```
+
+The final local run produced normalized CER `0` in all three languages, with
+RTF `0.102`, `0.040`, and `0.029`. The report is written under
+`target/mvp/acceptance/cohere-smoke/`. A real personal-release speaker-loopback
+plus microphone test also committed four Chinese finals and completed without
+repeated-pattern noise segments.
+
+### SenseVoice CPU path
+
+Use the repository script to download the pinned CPU model. It validates the
+lock file, SHA-256 digest, and extracted output:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/sherpa-native/materialize.ps1 `
@@ -114,7 +163,7 @@ powershell -ExecutionPolicy Bypass -File tools/sherpa-native/materialize.ps1 `
   -AllowDownload
 ```
 
-Current model:
+Current CPU model:
 
 | Item | Value |
 | --- | --- |
@@ -151,13 +200,20 @@ Choose **Other compatible service** to enter a custom Base URL, model ID, and AP
 
 1. Enable OpenAI-compatible translation.
 2. Select a provider preset or enter a custom Base URL.
-3. Enter a model ID exposed by the selected service.
+3. For Ollama or LM Studio, use **Refresh local models** to read the loopback
+   `/v1/models` list and select an installed model. Manual model IDs remain
+   available for other compatible services.
 4. Enter the API token when the provider requires one. **Test connection** or starting a meeting stores it in Windows Credential Manager, not in ordinary preferences or SQLite.
 5. Select the translation language for the meeting: Chinese, Japanese, or English.
 6. Run **Test connection**. The probe sends only a fixed synthetic sentence, never meeting content.
 7. Confirm the recording and third-party data disclosure before starting the meeting.
 
 If the translation language is the same as the recognition language, MeetingRelay does not contact the provider and persists the segment as `skipped`.
+
+Local profiles are restricted to loopback addresses. Provider testing verifies
+that the selected model is present and then performs a real synthetic Chat
+Completions probe. A local failure is reported explicitly and never triggers an
+automatic cloud fallback.
 
 ### Remote HTTP
 
@@ -244,6 +300,7 @@ MeetingRelay/
 ├── apps/desktop/                         # Tauri 2 desktop application and frontend
 ├── crates/model-worker-sherpa-native/   # Product SenseVoice ASR backend
 ├── crates/model-worker-contract/        # Internal ASR interface types
+├── tools/cohere-transcribe/             # Cohere CUDA runtime and persistent worker
 ├── tools/sherpa-native/                 # Pinned assets, validation, and runtime staging
 ├── tools/mvp/                           # Windows launch and release tooling
 ├── tools/distribution/                  # NSIS staging, SBOM, signing, and release gates
@@ -254,7 +311,20 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 
 ## Current limitations
 
-- Sherpa / SenseVoice is the only product ASR backend; Whisper, FunASR, and automatic fallback are not included.
+- The fail-closed ASR registry now offers Cohere Transcribe 2B as the
+  high-quality GPU profile when its exact runtime and model are installed, plus
+  Sherpa / SenseVoice as the selectable CPU fallback. It does not silently
+  switch models after an inference failure.
+- Cohere Transcribe is not a native streaming decoder. MeetingRelay feeds
+  endpointed/partial PCM chunks to the persistent model worker, so the UI gets
+  chunked live updates rather than token-level true streaming. The model path
+  also does not provide word timestamps, diarization, or automatic language
+  detection; MeetingRelay fixes the meeting language and owns the segment
+  timeline.
+- Cohere has passed the local CUDA/integration smoke described above, but
+  representative same-material Chinese/Japanese/English, noisy-room, and
+  long-meeting comparisons are still required before quantifying its quality
+  advantage over SenseVoice.
 - Mixed-language recognition is not supported. Each meeting uses one selected recognition language.
 - OpenAI-compatible translation uses non-streaming requests per final segment. Manual segment/meeting retry and sanitized attempt provenance are included; token streaming, context windows, proxies, and custom headers/bodies are not.
 - The 60-minute microphone path and an audible system-loopback short meeting have passed real-device validation. Device hot-plug behavior still requires validation.
@@ -269,8 +339,12 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 - Evaluate streaming translation only if complete-result latency proves disruptive in real meetings.
 - Validate system-only, microphone-only, both-source, raw-audio recovery, and disk-pressure behavior on representative Windows hardware.
 - Approve the pinned model/runtime redistribution records, sign the NSIS installer and bundled Windows binaries, and complete the second clean-machine install/upgrade/uninstall test. Windows Credential Manager integration and a real credential round trip are complete.
-- Add a benchmark-gated ASR model registry and let users choose between the stable default and a demonstrably higher-quality model before starting a meeting.
-- Make local Ollama / LM Studio translation-model discovery and per-meeting selection first-class, with a fully offline path and no silent cloud fallback.
+- Complete same-material Chinese/Japanese/English and noisy long-meeting
+  comparisons for Cohere versus SenseVoice, then add controlled distribution
+  packaging and structured meeting/segment provenance.
+- Validate the implemented Ollama / LM Studio model discovery and per-meeting
+  selection on a real fully offline meeting, including network auditing and
+  long-meeting resource measurements.
 
 ## Contributing
 
@@ -292,12 +366,13 @@ Keep changes small and reviewable. Do not commit API tokens, real meeting conten
 
 This repository does not currently include a standalone `LICENSE` file. Until a code license is explicitly added, do not assume permission to copy, modify, or redistribute the repository's source code.
 
-The SenseVoice model, Sherpa native runtime, and other third-party components remain subject to their respective upstream licenses. `NOTICE.md`, `THIRD_PARTY_NOTICES.md`, SBOM generation, and a strict redistribution-approval gate are present, but the locked distribution statuses are still pending. The current formal GitHub Release therefore remains the unsigned EXE and does not bundle models or the native runtime.
+The Cohere Transcribe model, SenseVoice model, Sherpa native runtime, and other third-party components remain subject to their respective upstream licenses and access terms. Cohere Transcribe is Apache-2.0 but gated on Hugging Face; its weights and Python/CUDA runtime are not bundled. `NOTICE.md`, `THIRD_PARTY_NOTICES.md`, SBOM generation, and a strict redistribution-approval gate are present, but the locked distribution statuses are still pending. The current formal GitHub Release therefore remains the unsigned EXE and does not bundle models or native runtimes.
 
 ## Acknowledgements
 
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
 - [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)
+- [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
 - [Tauri](https://tauri.app/)
 - [Ollama](https://ollama.com/)
 - [LM Studio](https://lmstudio.ai/)

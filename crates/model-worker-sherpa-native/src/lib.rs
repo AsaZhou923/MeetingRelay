@@ -36,13 +36,13 @@ pub use realtime::{
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 16_000;
 const REQUIRED_CHANNELS: u16 = 1;
 const MAX_BACKEND_INPUT_BYTES: u64 = 268_435_456;
-const ENGINE_ID: &str = "sherpa-onnx";
-const ENGINE_VERSION: &str = "1.13.4";
-const RUNTIME_ID: &str = "sherpa-onnx-shared-cpu";
-const RUNTIME_VERSION: &str = "1.27.0";
-const MODEL_ID: &str = "sensevoice-zh-en-ja-ko-yue-int8-2024-07-17";
-const MODEL_LICENSE_ID: &str = "LicenseRef-FunASR-Model-1.1-Internal-Evaluation";
-const QUANTIZATION: &str = "int8";
+pub const ENGINE_ID: &str = "sherpa-onnx";
+pub const ENGINE_VERSION: &str = "1.13.4";
+pub const RUNTIME_ID: &str = "sherpa-onnx-shared-cpu";
+pub const RUNTIME_VERSION: &str = "1.27.0";
+pub const MODEL_ID: &str = "sensevoice-zh-en-ja-ko-yue-int8-2024-07-17";
+pub const MODEL_LICENSE_ID: &str = "LicenseRef-FunASR-Model-1.1-Internal-Evaluation";
+pub const QUANTIZATION: &str = "int8";
 
 pub const LOCKED_MODEL_SHA256_HEX: &str =
     "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51";

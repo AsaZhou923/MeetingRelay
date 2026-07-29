@@ -1,5 +1,8 @@
+pub mod asr_models;
 #[allow(dead_code)]
 pub mod audio;
+#[cfg(windows)]
+mod cohere_asr;
 pub mod contract;
 pub mod document_export;
 #[allow(dead_code)]
@@ -19,6 +22,7 @@ pub(crate) use overlay::CAPTION_OVERLAY_LABEL;
 pub(crate) use service::MVP_SHUTDOWN_TIMEOUT;
 pub use service::MvpService;
 
+use asr_models::AsrModelProfile;
 use audio::{AudioDeviceInventory, AudioDeviceSelection, AudioSourceMode};
 use contract::MvpSnapshot;
 use export::ExportResult;
@@ -26,7 +30,7 @@ use speaker::{
     SpeakerDiarizationResult, SpeakerMergeRequest, SpeakerRenameRequest, SpeakerUndoRequest,
     SpeakerVersionSnapshot,
 };
-use translation::{TranslationConfig, TranslationProbe};
+use translation::{LocalTranslationDiscovery, TranslationConfig, TranslationProbe};
 
 #[tauri::command(async)]
 pub fn mvp_preflight(service: tauri::State<'_, MvpService>) -> Result<MvpSnapshot, String> {
@@ -48,18 +52,20 @@ pub fn mvp_start(
     system_output_device_id: Option<String>,
     microphone_device_id: Option<String>,
     language: Option<String>,
+    asr_model_id: Option<String>,
     source_mode: Option<AudioSourceMode>,
     raw_audio_enabled: Option<bool>,
     translation: Option<TranslationConfig>,
     translation_provider_profile_id: Option<String>,
 ) -> Result<MvpSnapshot, String> {
-    service.start_with_devices_language_and_audio_mode(
+    service.start_with_devices_language_audio_mode_and_model(
         consent_accepted,
         AudioDeviceSelection {
             system_output_device_id,
             microphone_device_id,
         },
         language.as_deref().unwrap_or("zh"),
+        asr_model_id.as_deref(),
         translation,
         translation_provider_profile_id.as_deref(),
         source_mode.unwrap_or_default(),
@@ -67,17 +73,31 @@ pub fn mvp_start(
     )
 }
 
+#[tauri::command]
+pub fn mvp_asr_models() -> Vec<AsrModelProfile> {
+    asr_models::asr_model_profiles()
+}
+
 #[tauri::command(async)]
 pub fn mvp_prepare_language(
     service: tauri::State<'_, MvpService>,
     language: String,
+    asr_model_id: Option<String>,
 ) -> Result<MvpSnapshot, String> {
-    service.prepare_language(&language)
+    service.prepare_language_model(&language, asr_model_id.as_deref())
 }
 
 #[tauri::command(async)]
 pub fn mvp_test_translation(config: TranslationConfig) -> Result<TranslationProbe, String> {
     translation::test_translation(&config)
+}
+
+#[tauri::command(async)]
+pub fn mvp_discover_local_translation_models(
+    service: tauri::State<'_, MvpService>,
+    base_url: String,
+) -> Result<LocalTranslationDiscovery, String> {
+    service.discover_local_translation_models(&base_url)
 }
 
 #[tauri::command]
