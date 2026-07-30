@@ -44,7 +44,7 @@ function New-MeetingRelaySbom {
         name = "MeetingRelay"
         version = [string]$desktopPackage.version
         purl = "pkg:generic/meetingrelay@$($desktopPackage.version)"
-        licenses = @("UNLICENSED")
+        licenses = @("Apache-2.0")
     }) | Out-Null
 
     foreach ($dependencySetName in @("dependencies", "devDependencies")) {
@@ -103,6 +103,7 @@ function New-MeetingRelaySbom {
                 type = "application"
                 name = "MeetingRelay"
                 version = [string]$desktopPackage.version
+                licenses = @("Apache-2.0")
             }
             tools = @([PSCustomObject]@{
                 vendor = "MeetingRelay"

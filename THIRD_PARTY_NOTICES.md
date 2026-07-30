@@ -1,5 +1,10 @@
 # Third-party notices
 
+MeetingRelay-authored code is licensed under the Apache License, Version 2.0,
+as described in the repository's `LICENSE` and `NOTICE.md` files. The notices
+below apply to third-party components and model assets and are not replaced or
+modified by the MeetingRelay project license.
+
 This file summarizes the third-party components that are material to the
 Windows distribution. The generated SBOM is the machine-readable source for
 release artifact inventory.

@@ -2,8 +2,12 @@
 
 MeetingRelay is a local-first Windows meeting transcription application.
 
-This repository is currently marked `UNLICENSED` and `publish = false`.
-Distribution is limited to project-approved Windows release channels.
+Copyright 2026 MeetingRelay contributors
+
+MeetingRelay-authored portions of this repository are licensed under the
+Apache License, Version 2.0. See `LICENSE` for the complete license terms.
+This license does not replace or modify the licenses of third-party software,
+runtime components, or model assets.
 
 The Windows distribution includes project code plus bundled third-party runtime
 components and model assets described in `THIRD_PARTY_NOTICES.md` and the SBOM

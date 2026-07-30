@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/AsaZhou923/MeetingRelay/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/AsaZhou923/MeetingRelay?display_name=tag"></a>
   <a href="https://github.com/AsaZhou923/MeetingRelay/actions/workflows/mvp.yml"><img alt="Personal MVP CI" src="https://github.com/AsaZhou923/MeetingRelay/actions/workflows/mvp.yml/badge.svg?branch=main"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows">
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.95-000000?logo=rust">
@@ -339,7 +340,7 @@ cargo test --workspace --all-targets --all-features
 
 ## 许可与分发
 
-本仓库当前尚未包含独立的 `LICENSE` 文件。在明确代码许可证之前，请不要假定拥有复制、修改或再分发本仓库代码的授权。
+MeetingRelay 自有源代码采用 [Apache License 2.0](LICENSE) 许可。该项目许可证不会替代或修改第三方软件、原生运行库及模型资产各自的许可证。
 
 Cohere Transcribe、SenseVoice、Sherpa 原生运行库及其他第三方组件分别受其上游许可证和访问条款约束。Cohere Transcribe 使用 Apache-2.0，但 Hugging Face 权重仍是 gated，且当前不捆绑权重或 Python/CUDA runtime。仓库已经提供 `NOTICE.md`、`THIRD_PARTY_NOTICES.md`、SBOM 生成和严格的再分发审批门禁，但锁文件中的 distribution status 仍为 pending。因此当前正式 GitHub Release 仍只提供未签名 EXE，不捆绑模型和原生 runtime。
 

@@ -239,6 +239,8 @@ $sbomPath = Join-Path $testRoot "sbom.json"
 New-MeetingRelaySbom -RepositoryRoot $repoRoot -OutputPath $sbomPath
 $sbom = Get-Content -LiteralPath $sbomPath -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-Equal -Expected "MeetingRelay" -Actual $sbom.metadata.component.name -Label "sbom root component"
+Assert-Equal -Expected "Apache-2.0" -Actual $sbom.metadata.component.licenses[0] -Label "sbom metadata records project license"
+Assert-Equal -Expected "Apache-2.0" -Actual (@($sbom.components | Where-Object { $_.name -eq "MeetingRelay" })[0].licenses[0]) -Label "sbom application records project license"
 Assert-Equal -Expected $true -Actual ([bool](@($sbom.components | Where-Object { $_.name -eq "sherpa-onnx" }).Count -ge 1)) -Label "sbom includes sherpa"
 
 $retention = Test-MeetingRelayDistributionDataRetention -RepositoryRoot $repoRoot

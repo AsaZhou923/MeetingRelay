@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/AsaZhou923/MeetingRelay/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/AsaZhou923/MeetingRelay?display_name=tag"></a>
   <a href="https://github.com/AsaZhou923/MeetingRelay/actions/workflows/mvp.yml"><img alt="Personal MVP CI" src="https://github.com/AsaZhou923/MeetingRelay/actions/workflows/mvp.yml/badge.svg?branch=main"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows">
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.95-000000?logo=rust">
@@ -364,7 +365,7 @@ Keep changes small and reviewable. Do not commit API tokens, real meeting conten
 
 ## License and distribution
 
-This repository does not currently include a standalone `LICENSE` file. Until a code license is explicitly added, do not assume permission to copy, modify, or redistribute the repository's source code.
+MeetingRelay-authored source code is licensed under the [Apache License, Version 2.0](LICENSE). The project license does not replace or modify the licenses of third-party software, runtime components, or model assets.
 
 The Cohere Transcribe model, SenseVoice model, Sherpa native runtime, and other third-party components remain subject to their respective upstream licenses and access terms. Cohere Transcribe is Apache-2.0 but gated on Hugging Face; its weights and Python/CUDA runtime are not bundled. `NOTICE.md`, `THIRD_PARTY_NOTICES.md`, SBOM generation, and a strict redistribution-approval gate are present, but the locked distribution statuses are still pending. The current formal GitHub Release therefore remains the unsigned EXE and does not bundle models or native runtimes.
 
