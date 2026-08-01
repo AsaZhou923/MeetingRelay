@@ -882,6 +882,17 @@ test("parses R4 summary jobs, citation links, and selectable export options", ()
   );
 });
 
+test("requires an explicit summary provider and risk acknowledgement before transcript egress", () => {
+  const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+  assert.match(mainSource, /id="summary-provider"/);
+  assert.match(mainSource, /confirmSummaryProviderEgress/);
+  assert.match(mainSource, /summaryRiskAccepted:\s*true/);
+  assert.doesNotMatch(
+    mainSource,
+    /mvp_summary_start[\s\S]{0,300}providerProfileId:\s*selectedProviderId/,
+  );
+});
+
 test("parses R5 speaker versions and diarization results with strict bounds", () => {
   const speakerVersion = {
     meetingId: "meeting-20260725-001",
@@ -993,6 +1004,38 @@ test("pauses compact overlay snapshot polling while the native window is hidden"
   );
   assert.match(overlaySource, /refreshInFlight/);
   assert.match(overlaySource, /visibilitychange/);
+});
+
+test("restricts application IPC commands by window capability", () => {
+  const buildSource = readFileSync(new URL("../src-tauri/build.rs", import.meta.url), "utf8");
+  const libSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const modSource = readFileSync(new URL("../src-tauri/src/mvp/mod.rs", import.meta.url), "utf8");
+  const mainCapability = JSON.parse(
+    readFileSync(new URL("../src-tauri/capabilities/default.json", import.meta.url), "utf8"),
+  );
+  const overlayCapability = JSON.parse(
+    readFileSync(new URL("../src-tauri/capabilities/caption-overlay.json", import.meta.url), "utf8"),
+  );
+
+  assert.match(buildSource, /AppManifest::new\(\)\.commands/);
+  const registeredCommands = [...libSource.matchAll(/mvp::(mvp_[a-z_]+)/g)].map(
+    (match) => match[1],
+  );
+  const manifestCommands = [...buildSource.matchAll(/"(mvp_[a-z_]+)"/g)].map(
+    (match) => match[1],
+  );
+  const mainCommands = mainCapability.permissions
+    .filter((permission) => permission.startsWith("allow-mvp-"))
+    .map((permission) => permission.slice("allow-".length).replaceAll("-", "_"));
+  assert.deepEqual(new Set(manifestCommands), new Set(registeredCommands));
+  assert.deepEqual(new Set(mainCommands), new Set(registeredCommands));
+  assert.ok(overlayCapability.permissions.includes("allow-mvp-snapshot"));
+  assert.equal(
+    overlayCapability.permissions.filter((permission) => permission.startsWith("allow-mvp-")).length,
+    1,
+  );
+  assert.doesNotMatch(libSource, /mvp::mvp_test_translation/);
+  assert.doesNotMatch(modSource, /pub fn mvp_test_translation/);
 });
 
 test("parses paused snapshots and treats paused as an active session", () => {

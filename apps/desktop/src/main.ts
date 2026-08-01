@@ -446,6 +446,16 @@ element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
             <div><span>R4 / SUMMARY</span><h3>Chinese structured summary</h3></div>
             <button id="summary-start" class="secondary-button" type="button" disabled>Start</button>
           </div>
+          <label class="device-picker" for="summary-provider">
+            <span>Summary provider (explicit selection required)</span>
+            <select id="summary-provider">
+              <option value="">Select a provider for this summary...</option>
+            </select>
+          </label>
+          <p class="privacy-copy">
+            Local providers keep durable transcript text on this device. LAN and cloud providers
+            receive the full durable transcript, may charge for usage, and apply their own privacy policy.
+          </p>
           <div class="summary-actions">
             <button id="summary-cancel" class="secondary-button" type="button" disabled>Cancel</button>
             <button id="summary-retry" class="secondary-button" type="button" disabled>Retry new version</button>
@@ -599,6 +609,7 @@ const controls = {
   deleteExecute: element<HTMLButtonElement>("#delete-execute"),
   deleteRestore: element<HTMLButtonElement>("#delete-restore"),
   deleteStatus: element<HTMLParagraphElement>("#delete-status"),
+  summaryProvider: element<HTMLSelectElement>("#summary-provider"),
   summaryStart: element<HTMLButtonElement>("#summary-start"),
   summaryCancel: element<HTMLButtonElement>("#summary-cancel"),
   summaryRetry: element<HTMLButtonElement>("#summary-retry"),
@@ -1157,7 +1168,8 @@ function renderExports(snapshot: MvpSnapshot): void {
     ...(lastExport?.artifacts.map(renderExportArtifact) ?? []),
   );
   controls.deletePreview.disabled = snapshot.meetingId === null || isActive(snapshot);
-  controls.summaryStart.disabled = snapshot.meetingId === null || isActive(snapshot);
+  controls.summaryStart.disabled =
+    snapshot.meetingId === null || isActive(snapshot) || controls.summaryProvider.value === "";
   controls.exportSelected.disabled = !canExport(snapshot);
 }
 
@@ -1395,6 +1407,24 @@ function renderMeetingDetail(): void {
 }
 
 function renderProviderProfiles(): void {
+  const summaryProviderId = controls.summaryProvider.value;
+  const summaryPlaceholder = document.createElement("option");
+  summaryPlaceholder.value = "";
+  summaryPlaceholder.textContent = "Select a provider for this summary...";
+  controls.summaryProvider.replaceChildren(
+    summaryPlaceholder,
+    ...providerProfiles.map((profile) => {
+      const option = document.createElement("option");
+      option.value = profile.profileId;
+      option.textContent = `${profile.label} · ${profile.class} · ${profile.model}`;
+      return option;
+    }),
+  );
+  controls.summaryProvider.value = providerProfiles.some(
+    (profile) => profile.profileId === summaryProviderId,
+  )
+    ? summaryProviderId
+    : "";
   controls.providerList.replaceChildren(
     ...providerProfiles.map((profile) => {
       const button = document.createElement("button");
@@ -1462,7 +1492,8 @@ function renderDeletePreview(): void {
 function renderSummaryJob(): void {
   const job = summaryJob;
   controls.summaryCancel.disabled = job === null || !job.canCancel;
-  controls.summaryRetry.disabled = job === null || !job.canRetry;
+  controls.summaryRetry.disabled =
+    job === null || !job.canRetry || controls.summaryProvider.value === "";
   if (job === null) {
     controls.summaryOutput.textContent = "No summary job.";
     return;
@@ -2199,14 +2230,35 @@ async function restoreDeletedMeeting(): Promise<void> {
   await loadMeetingLibrary(null, false).catch(() => undefined);
 }
 
+function selectedSummaryProvider(): ProviderProfile {
+  const profile = providerProfiles.find(
+    (candidate) => candidate.profileId === controls.summaryProvider.value,
+  );
+  if (profile === undefined) throw new Error("SUMMARY_PROVIDER_REQUIRED");
+  return profile;
+}
+
+function confirmSummaryProviderEgress(profile: ProviderProfile): boolean {
+  if (profile.class === "local") return true;
+  const policy = profile.policyUrl ?? "No policy URL is configured";
+  return window.confirm(
+    `Send the full durable transcript to ${profile.label} (${profile.class.toUpperCase()})?\n\n` +
+      `Model: ${profile.model}\nData flow: ${profile.dataFlow}\nPolicy: ${policy}\n\n` +
+      "The transcript will leave this device. The provider may retain/process it and may charge for usage.",
+  );
+}
+
 async function startSummaryJob(): Promise<void> {
   const meetingId = selectedMeetingId();
   if (meetingId === null) return;
+  const profile = selectedSummaryProvider();
+  if (!confirmSummaryProviderEgress(profile)) return;
   summaryJob = parseSummaryJob(
     await invoke<unknown>("mvp_summary_start", {
       meetingId,
-      providerProfileId: selectedProviderId,
+      providerProfileId: profile.profileId,
       language: "zh",
+      summaryRiskAccepted: true,
     }),
   );
   renderSummaryJob();
@@ -2215,7 +2267,19 @@ async function startSummaryJob(): Promise<void> {
 
 async function updateSummaryJob(command: "mvp_summary_cancel" | "mvp_summary_retry"): Promise<void> {
   if (summaryJob === null) return;
-  summaryJob = parseSummaryJob(await invoke<unknown>(command, { jobId: summaryJob.jobId }));
+  if (command === "mvp_summary_retry") {
+    const profile = selectedSummaryProvider();
+    if (!confirmSummaryProviderEgress(profile)) return;
+    summaryJob = parseSummaryJob(
+      await invoke<unknown>(command, {
+        jobId: summaryJob.jobId,
+        providerProfileId: profile.profileId,
+        summaryRiskAccepted: true,
+      }),
+    );
+  } else {
+    summaryJob = parseSummaryJob(await invoke<unknown>(command, { jobId: summaryJob.jobId }));
+  }
   renderSummaryJob();
   scheduleSummaryPoll();
 }
@@ -2900,6 +2964,11 @@ controls.deleteRestore.addEventListener("click", async () => {
     controls.deleteStatus.dataset.status = "error";
     controls.deleteStatus.textContent = `Restore failed: ${message(error)}`;
   }
+});
+
+controls.summaryProvider.addEventListener("change", () => {
+  if (latest) render(latest);
+  renderSummaryJob();
 });
 
 controls.summaryStart.addEventListener("click", async () => {

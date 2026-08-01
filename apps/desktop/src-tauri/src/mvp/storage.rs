@@ -29,8 +29,10 @@ const MVP_SCHEMA_V3_CHECKSUM: &str =
     "meetingrelay.mvp.sqlite.v3:durable-same-language-translation-status";
 const MVP_SCHEMA_V4_CHECKSUM: &str =
     "meetingrelay.mvp.sqlite.v4:translation-attempt-provenance-diagnostics";
-pub const MVP_SCHEMA_VERSION: i64 = 7;
-pub const MVP_SCHEMA_CHECKSUM: &str = "meetingrelay.mvp.sqlite.v7:meeting-library-tags-provider-profiles-summary-delete-speakers-binary-exports";
+const MVP_SCHEMA_V7_CHECKSUM: &str = "meetingrelay.mvp.sqlite.v7:meeting-library-tags-provider-profiles-summary-delete-speakers-binary-exports";
+pub const MVP_SCHEMA_VERSION: i64 = 8;
+pub const MVP_SCHEMA_CHECKSUM: &str =
+    "meetingrelay.mvp.sqlite.v8:summary-provider-provenance-atomic-completion";
 pub const STORAGE_QUEUE_DEPTH: usize = 8;
 const STORAGE_PAGE_LIMIT_MAX: usize = 100;
 const STORAGE_SEARCH_LIMIT_MAX: usize = 100;
@@ -405,6 +407,19 @@ pub struct SummaryJobInput {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SummaryProviderProvenance {
+    pub profile_version: u32,
+    pub config_version: u32,
+    pub provider_class: String,
+    pub endpoint_origin: String,
+    pub endpoint_hash: String,
+    pub model: String,
+    pub risk_accepted: bool,
+    pub disclosure_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SummaryJobRecord {
     pub job_id: String,
     pub meeting_id: String,
@@ -412,6 +427,7 @@ pub struct SummaryJobRecord {
     pub attempt: u32,
     pub status: String,
     pub provider_profile_id: Option<String>,
+    pub provider_provenance: Option<SummaryProviderProvenance>,
     pub prompt_version: String,
     pub request_schema_version: String,
     pub error_code: Option<String>,
@@ -419,6 +435,14 @@ pub struct SummaryJobRecord {
     pub requested_at: String,
     pub completed_at: Option<String>,
     pub cancelled_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryCompletionInput {
+    pub job_id: String,
+    pub chunks: Vec<SummaryChunkInput>,
+    pub results: Vec<SummaryResultInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1238,15 +1262,33 @@ impl MvpStorageWriter {
         self.request(|reply| StorageRequest::SaveProviderProfile(input, reply))
     }
 
+    #[cfg(test)]
     pub fn start_summary_job(&self, input: SummaryJobInput) -> Result<SummaryJobRecord, String> {
         validate_summary_job_input(&input)?;
         self.request(|reply| StorageRequest::StartSummaryJob {
             input,
+            provenance: None,
             parent_job_id: None,
             reply,
         })
     }
 
+    pub fn start_summary_job_with_provenance(
+        &self,
+        input: SummaryJobInput,
+        provenance: SummaryProviderProvenance,
+    ) -> Result<SummaryJobRecord, String> {
+        validate_summary_job_input(&input)?;
+        validate_summary_provider_provenance(&provenance)?;
+        self.request(|reply| StorageRequest::StartSummaryJob {
+            input,
+            provenance: Some(provenance),
+            parent_job_id: None,
+            reply,
+        })
+    }
+
+    #[cfg(test)]
     pub fn retry_summary_job(
         &self,
         parent_job_id: &str,
@@ -1255,21 +1297,49 @@ impl MvpStorageWriter {
         validate_summary_job_input(&input)?;
         self.request(|reply| StorageRequest::StartSummaryJob {
             input,
+            provenance: None,
             parent_job_id: Some(parent_job_id.to_owned()),
             reply,
         })
     }
 
+    pub fn retry_summary_job_with_provenance(
+        &self,
+        parent_job_id: &str,
+        input: SummaryJobInput,
+        provenance: SummaryProviderProvenance,
+    ) -> Result<SummaryJobRecord, String> {
+        validate_summary_job_input(&input)?;
+        validate_summary_provider_provenance(&provenance)?;
+        self.request(|reply| StorageRequest::StartSummaryJob {
+            input,
+            provenance: Some(provenance),
+            parent_job_id: Some(parent_job_id.to_owned()),
+            reply,
+        })
+    }
+
+    #[cfg(test)]
     pub fn append_summary_chunk(&self, input: SummaryChunkInput) -> Result<(), String> {
         validate_summary_chunk(&input)?;
         self.request(|reply| StorageRequest::AppendSummaryChunk(input, reply))
     }
 
+    #[cfg(test)]
     pub fn append_summary_result(&self, input: SummaryResultInput) -> Result<(), String> {
         validate_summary_result(&input)?;
         self.request(|reply| StorageRequest::AppendSummaryResult(input, reply))
     }
 
+    pub fn complete_summary_job(
+        &self,
+        input: SummaryCompletionInput,
+    ) -> Result<SummaryJobRecord, String> {
+        validate_summary_completion(&input)?;
+        self.request(|reply| StorageRequest::CompleteSummaryJob(input, reply))
+    }
+
+    #[cfg(test)]
     pub fn finish_summary_job(&self, job_id: &str) -> Result<SummaryJobRecord, String> {
         self.request(|reply| StorageRequest::FinishSummaryJob {
             job_id: job_id.to_owned(),
@@ -1537,11 +1607,18 @@ enum StorageRequest {
     ),
     StartSummaryJob {
         input: SummaryJobInput,
+        provenance: Option<SummaryProviderProvenance>,
         parent_job_id: Option<String>,
         reply: SyncSender<Result<SummaryJobRecord, String>>,
     },
+    #[cfg(test)]
     AppendSummaryChunk(SummaryChunkInput, SyncSender<Result<(), String>>),
+    #[cfg(test)]
     AppendSummaryResult(SummaryResultInput, SyncSender<Result<(), String>>),
+    CompleteSummaryJob(
+        SummaryCompletionInput,
+        SyncSender<Result<SummaryJobRecord, String>>,
+    ),
     FinishSummaryJob {
         job_id: String,
         error_code: Option<String>,
@@ -1730,20 +1807,27 @@ fn storage_writer_loop(
             }
             StorageRequest::StartSummaryJob {
                 input,
+                provenance,
                 parent_job_id,
                 reply,
             } => {
                 let _ = reply.send(start_summary_job_on_writer(
                     &mut connection,
                     input,
+                    provenance,
                     parent_job_id.as_deref(),
                 ));
             }
+            #[cfg(test)]
             StorageRequest::AppendSummaryChunk(input, reply) => {
-                let _ = reply.send(append_summary_chunk_on_writer(&mut connection, input));
+                let _ = reply.send(append_summary_chunk_on_writer(&connection, input));
             }
+            #[cfg(test)]
             StorageRequest::AppendSummaryResult(input, reply) => {
-                let _ = reply.send(append_summary_result_on_writer(&mut connection, input));
+                let _ = reply.send(append_summary_result_on_writer(&connection, input));
+            }
+            StorageRequest::CompleteSummaryJob(input, reply) => {
+                let _ = reply.send(complete_summary_job_on_writer(&mut connection, input));
             }
             StorageRequest::FinishSummaryJob {
                 job_id,
@@ -1753,7 +1837,7 @@ fn storage_writer_loop(
                 reply,
             } => {
                 let _ = reply.send(finish_summary_job_on_writer(
-                    &mut connection,
+                    &connection,
                     &job_id,
                     error_code.as_deref(),
                     retryable,
@@ -1952,6 +2036,22 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
     if current == MVP_SCHEMA_VERSION {
         return validate_schema_checksum(connection);
     }
+    if current == 7 {
+        validate_schema_checksum_version(connection, 7, MVP_SCHEMA_V7_CHECKSUM)?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+        add_v8_schema(&tx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
+             VALUES (?1, ?2, ?3)",
+            params![MVP_SCHEMA_VERSION, MVP_SCHEMA_CHECKSUM, now_ms_string()],
+        )
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        tx.commit()
+            .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+        return validate_schema_checksum(connection);
+    }
     if current == 6 {
         validate_schema_checksum_version(
             connection,
@@ -1962,6 +2062,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
             .transaction()
             .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
         add_v7_schema(&tx)?;
+        add_v8_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -1983,6 +2084,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
             .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
         add_v6_schema(&tx)?;
         add_v7_schema(&tx)?;
+        add_v8_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2001,6 +2103,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         add_v5_schema(&tx)?;
         add_v6_schema(&tx)?;
         add_v7_schema(&tx)?;
+        add_v8_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2070,6 +2173,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         add_v5_schema(&tx)?;
         add_v6_schema(&tx)?;
         add_v7_schema(&tx)?;
+        add_v8_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2161,6 +2265,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         add_v5_schema(&tx)?;
         add_v6_schema(&tx)?;
         add_v7_schema(&tx)?;
+        add_v8_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2229,6 +2334,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         add_v5_schema(&tx)?;
         add_v6_schema(&tx)?;
         add_v7_schema(&tx)?;
+        add_v8_schema(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2372,6 +2478,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
     add_v5_schema(&tx)?;
     add_v6_schema(&tx)?;
     add_v7_schema(&tx)?;
+    add_v8_schema(&tx)?;
     tx.execute(
         "INSERT OR IGNORE INTO mvp_schema_migrations(version, checksum, applied_at)
              VALUES (?1, ?2, ?3)",
@@ -2669,6 +2776,31 @@ fn add_v7_schema(tx: &Transaction<'_>) -> Result<(), String> {
         ",
     )
     .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())
+}
+
+fn add_v8_schema(tx: &Transaction<'_>) -> Result<(), String> {
+    for (column, definition) in [
+        ("provider_profile_version", "INTEGER"),
+        ("provider_config_version", "INTEGER"),
+        ("provider_class", "TEXT"),
+        ("endpoint_origin", "TEXT"),
+        ("endpoint_hash", "TEXT"),
+        ("model", "TEXT"),
+        (
+            "risk_accepted",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (risk_accepted IN (0,1))",
+        ),
+        ("disclosure_version", "TEXT"),
+    ] {
+        if !table_has_column(tx, "mvp_summary_jobs", column)? {
+            tx.execute_batch(&format!(
+                "ALTER TABLE mvp_summary_jobs ADD COLUMN {column} {definition};"
+            ))
+            .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())?;
+        }
+    }
+    tx.execute_batch("PRAGMA user_version = 8;")
+        .map_err(|_| "MVP_STORAGE_MIGRATION_FAILED".to_owned())
 }
 
 fn seed_default_provider_profiles(tx: &Transaction<'_>) -> Result<(), String> {
@@ -4217,6 +4349,7 @@ fn save_provider_profile_on_writer(
 fn start_summary_job_on_writer(
     connection: &mut Connection,
     input: SummaryJobInput,
+    provenance: Option<SummaryProviderProvenance>,
     parent_job_id: Option<&str>,
 ) -> Result<SummaryJobRecord, String> {
     let meeting_exists = connection
@@ -4251,8 +4384,13 @@ fn start_summary_job_on_writer(
             "INSERT INTO mvp_summary_jobs (
                 job_id, meeting_id, parent_job_id, attempt, status, provider_profile_id,
                 prompt_version, request_schema_version, error_code, retryable,
-                requested_at, completed_at, cancelled_at
-             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, 0, ?8, NULL, NULL)",
+                requested_at, completed_at, cancelled_at, provider_profile_version,
+                provider_config_version, provider_class, endpoint_origin, endpoint_hash,
+                model, risk_accepted, disclosure_version
+             ) VALUES (
+                ?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, 0, ?8, NULL, NULL,
+                ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+             )",
             params![
                 job_id,
                 input.meeting_id,
@@ -4261,15 +4399,54 @@ fn start_summary_job_on_writer(
                 input.provider_profile_id,
                 input.prompt_version,
                 input.request_schema_version,
-                now
+                now,
+                provenance
+                    .as_ref()
+                    .map(|value| i64::from(value.profile_version)),
+                provenance
+                    .as_ref()
+                    .map(|value| i64::from(value.config_version)),
+                provenance
+                    .as_ref()
+                    .map(|value| value.provider_class.as_str()),
+                provenance
+                    .as_ref()
+                    .map(|value| value.endpoint_origin.as_str()),
+                provenance
+                    .as_ref()
+                    .map(|value| value.endpoint_hash.as_str()),
+                provenance.as_ref().map(|value| value.model.as_str()),
+                i64::from(provenance.as_ref().is_some_and(|value| value.risk_accepted)),
+                provenance
+                    .as_ref()
+                    .and_then(|value| value.disclosure_version.as_deref()),
             ],
         )
         .map_err(|_| "MVP_STORAGE_SUMMARY_START_FAILED".to_owned())?;
     summary_job_by_id(connection, &job_id)
 }
 
-fn append_summary_chunk_on_writer(
+fn complete_summary_job_on_writer(
     connection: &mut Connection,
+    input: SummaryCompletionInput,
+) -> Result<SummaryJobRecord, String> {
+    let tx = connection
+        .transaction()
+        .map_err(|_| "MVP_STORAGE_TX_BEGIN_FAILED".to_owned())?;
+    for chunk in input.chunks {
+        append_summary_chunk_on_writer(&tx, chunk)?;
+    }
+    for result in input.results {
+        append_summary_result_on_writer(&tx, result)?;
+    }
+    let completed = finish_summary_job_on_writer(&tx, &input.job_id, None, false, false)?;
+    tx.commit()
+        .map_err(|_| "MVP_STORAGE_COMMIT_FAILED".to_owned())?;
+    Ok(completed)
+}
+
+fn append_summary_chunk_on_writer(
+    connection: &Connection,
     input: SummaryChunkInput,
 ) -> Result<(), String> {
     ensure_summary_pending(connection, &input.job_id)?;
@@ -4290,7 +4467,7 @@ fn append_summary_chunk_on_writer(
 }
 
 fn append_summary_result_on_writer(
-    connection: &mut Connection,
+    connection: &Connection,
     input: SummaryResultInput,
 ) -> Result<(), String> {
     ensure_summary_pending(connection, &input.job_id)?;
@@ -4314,7 +4491,7 @@ fn append_summary_result_on_writer(
 }
 
 fn finish_summary_job_on_writer(
-    connection: &mut Connection,
+    connection: &Connection,
     job_id: &str,
     error_code: Option<&str>,
     retryable: bool,
@@ -4596,6 +4773,48 @@ fn validate_summary_job_input(input: &SummaryJobInput) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_summary_provider_provenance(input: &SummaryProviderProvenance) -> Result<(), String> {
+    let bounded = [
+        input.provider_class.as_str(),
+        input.endpoint_origin.as_str(),
+        input.endpoint_hash.as_str(),
+        input.model.as_str(),
+    ];
+    if !matches!(input.provider_class.as_str(), "local" | "lan" | "cloud")
+        || bounded.into_iter().any(|value| {
+            value.is_empty() || value.len() > 2_048 || value.chars().any(char::is_control)
+        })
+        || input.disclosure_version.as_deref().is_some_and(|value| {
+            value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+        })
+        || (input.provider_class != "local"
+            && (!input.risk_accepted || input.disclosure_version.is_none()))
+    {
+        return Err("MVP_STORAGE_SUMMARY_PROVENANCE_INVALID".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_summary_completion(input: &SummaryCompletionInput) -> Result<(), String> {
+    if input.job_id.is_empty()
+        || input.job_id.len() > 128
+        || input.job_id.chars().any(char::is_control)
+        || input.chunks.is_empty()
+        || input.results.is_empty()
+        || input
+            .chunks
+            .iter()
+            .any(|chunk| chunk.job_id != input.job_id || validate_summary_chunk(chunk).is_err())
+        || input
+            .results
+            .iter()
+            .any(|result| result.job_id != input.job_id || validate_summary_result(result).is_err())
+    {
+        return Err("MVP_STORAGE_SUMMARY_COMPLETION_INVALID".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_summary_chunk(input: &SummaryChunkInput) -> Result<(), String> {
     if input.job_id.is_empty()
         || input.job_id.len() > 128
@@ -4792,7 +5011,42 @@ fn provider_kind_from_class(class: &str) -> &'static str {
 
 fn summary_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryJobRecord> {
     let attempt: i64 = row.get(3)?;
-    let retryable: i64 = row.get(9)?;
+    let provider_profile_version: Option<i64> = row.get(6)?;
+    let provider_config_version: Option<i64> = row.get(7)?;
+    let provider_class: Option<String> = row.get(8)?;
+    let endpoint_origin: Option<String> = row.get(9)?;
+    let endpoint_hash: Option<String> = row.get(10)?;
+    let model: Option<String> = row.get(11)?;
+    let risk_accepted: i64 = row.get(12)?;
+    let disclosure_version: Option<String> = row.get(13)?;
+    let retryable: i64 = row.get(17)?;
+    let provider_provenance = match (
+        provider_profile_version,
+        provider_config_version,
+        provider_class,
+        endpoint_origin,
+        endpoint_hash,
+        model,
+    ) {
+        (
+            Some(profile_version),
+            Some(config_version),
+            Some(provider_class),
+            Some(endpoint_origin),
+            Some(endpoint_hash),
+            Some(model),
+        ) => Some(SummaryProviderProvenance {
+            profile_version: u32::try_from(profile_version).unwrap_or(0),
+            config_version: u32::try_from(config_version).unwrap_or(0),
+            provider_class,
+            endpoint_origin,
+            endpoint_hash,
+            model,
+            risk_accepted: risk_accepted != 0,
+            disclosure_version,
+        }),
+        _ => None,
+    };
     Ok(SummaryJobRecord {
         job_id: row.get(0)?,
         meeting_id: row.get(1)?,
@@ -4800,13 +5054,14 @@ fn summary_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryJobR
         attempt: u32::try_from(attempt).unwrap_or(0),
         status: row.get(4)?,
         provider_profile_id: row.get(5)?,
-        prompt_version: row.get(6)?,
-        request_schema_version: row.get(7)?,
-        error_code: row.get(8)?,
+        provider_provenance,
+        prompt_version: row.get(14)?,
+        request_schema_version: row.get(15)?,
+        error_code: row.get(16)?,
         retryable: retryable != 0,
-        requested_at: row.get(10)?,
-        completed_at: row.get(11)?,
-        cancelled_at: row.get(12)?,
+        requested_at: row.get(18)?,
+        completed_at: row.get(19)?,
+        cancelled_at: row.get(20)?,
     })
 }
 
@@ -4822,6 +5077,8 @@ fn summary_job_by_id_optional(
     connection
         .query_row(
             "SELECT job_id, meeting_id, parent_job_id, attempt, status, provider_profile_id,
+                    provider_profile_version, provider_config_version, provider_class,
+                    endpoint_origin, endpoint_hash, model, risk_accepted, disclosure_version,
                     prompt_version, request_schema_version, error_code, retryable,
                     requested_at, completed_at, cancelled_at
              FROM mvp_summary_jobs WHERE job_id=?1",
@@ -5049,6 +5306,8 @@ fn latest_summary_job_for_meeting(
     connection
         .query_row(
             "SELECT job_id, meeting_id, parent_job_id, attempt, status, provider_profile_id,
+                    provider_profile_version, provider_config_version, provider_class,
+                    endpoint_origin, endpoint_hash, model, risk_accepted, disclosure_version,
                     prompt_version, request_schema_version, error_code, retryable,
                     requested_at, completed_at, cancelled_at
              FROM mvp_summary_jobs
@@ -5072,6 +5331,8 @@ fn summary_job_for_meeting_version(
     connection
         .query_row(
             "SELECT job_id, meeting_id, parent_job_id, attempt, status, provider_profile_id,
+                    provider_profile_version, provider_config_version, provider_class,
+                    endpoint_origin, endpoint_hash, model, risk_accepted, disclosure_version,
                     prompt_version, request_schema_version, error_code, retryable,
                     requested_at, completed_at, cancelled_at
              FROM mvp_summary_jobs
@@ -6993,6 +7254,124 @@ mod tests {
         assert_eq!(
             storage.summary_results(&job.job_id).unwrap()[0].citation_segment_ids[0],
             "segment-1"
+        );
+    }
+
+    #[test]
+    fn summary_completion_is_atomic_and_failed_batches_publish_nothing() {
+        let (storage, writer) = storage_and_writer("summary-atomic-completion");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 1, "summary source"))
+            .unwrap();
+        let job = writer
+            .start_summary_job(SummaryJobInput {
+                meeting_id: meeting.id.clone(),
+                provider_profile_id: None,
+                prompt_version: "summary.prompt.v1".to_owned(),
+                request_schema_version: "summary.request.v1".to_owned(),
+            })
+            .unwrap();
+        let duplicate = SummaryResultInput {
+            job_id: job.job_id.clone(),
+            section_kind: "overview".to_owned(),
+            section_index: 0,
+            heading: "Overview".to_owned(),
+            text: "must never become visible".to_owned(),
+            citation_segment_ids: vec!["segment-1".to_owned()],
+        };
+
+        assert!(
+            writer
+                .complete_summary_job(SummaryCompletionInput {
+                    job_id: job.job_id.clone(),
+                    chunks: vec![SummaryChunkInput {
+                        job_id: job.job_id.clone(),
+                        chunk_index: 0,
+                        source_segment_ids: vec!["segment-1".to_owned()],
+                        text: "completed chunk 1 of 1".to_owned(),
+                    }],
+                    results: vec![duplicate.clone(), duplicate],
+                })
+                .is_err()
+        );
+        assert_eq!(
+            storage.summary_job(&job.job_id).unwrap().unwrap().status,
+            "pending"
+        );
+        assert!(storage.summary_results(&job.job_id).unwrap().is_empty());
+        assert_eq!(
+            storage
+                .summary_progress(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .chunk_count,
+            0
+        );
+
+        let completed = writer
+            .complete_summary_job(SummaryCompletionInput {
+                job_id: job.job_id.clone(),
+                chunks: vec![SummaryChunkInput {
+                    job_id: job.job_id.clone(),
+                    chunk_index: 0,
+                    source_segment_ids: vec!["segment-1".to_owned()],
+                    text: "completed chunk 1 of 1".to_owned(),
+                }],
+                results: vec![SummaryResultInput {
+                    job_id: job.job_id.clone(),
+                    section_kind: "overview".to_owned(),
+                    section_index: 0,
+                    heading: "Overview".to_owned(),
+                    text: "committed summary".to_owned(),
+                    citation_segment_ids: vec!["segment-1".to_owned()],
+                }],
+            })
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(
+            storage.summary_results(&job.job_id).unwrap()[0].text,
+            "committed summary"
+        );
+    }
+
+    #[test]
+    fn summary_job_persists_non_local_provider_provenance_and_disclosure() {
+        let (storage, writer) = storage_and_writer("summary-provider-provenance");
+        let meeting = writer.start_meeting(true, "test model").unwrap();
+        writer
+            .commit_final(candidate(&meeting.id, 1, "summary source"))
+            .unwrap();
+        let provenance = SummaryProviderProvenance {
+            profile_version: 4,
+            config_version: 7,
+            provider_class: "cloud".to_owned(),
+            endpoint_origin: "https://summary.example.test".to_owned(),
+            endpoint_hash: "a".repeat(64),
+            model: "summary-model".to_owned(),
+            risk_accepted: true,
+            disclosure_version: Some("meetingrelay.summary.provider-disclosure.v1".to_owned()),
+        };
+        let job = writer
+            .start_summary_job_with_provenance(
+                SummaryJobInput {
+                    meeting_id: meeting.id,
+                    provider_profile_id: Some("provider-cloud".to_owned()),
+                    prompt_version: "summary.prompt.v1".to_owned(),
+                    request_schema_version: "summary.request.v1".to_owned(),
+                },
+                provenance.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(job.provider_provenance, Some(provenance.clone()));
+        assert_eq!(
+            storage
+                .summary_job(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .provider_provenance,
+            Some(provenance)
         );
     }
 

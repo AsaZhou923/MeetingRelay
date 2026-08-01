@@ -26,9 +26,10 @@ use super::{
     storage::{
         DurableFinal, FinalCandidate, MeetingLibraryItem, MeetingLibraryQuery, MvpStorage,
         MvpStorageWriter, ProviderProfileInput, ProviderProfileRecord, RecoveryActionKind,
-        SegmentSearchQuery, SummaryChunkInput, SummaryJobInput, SummaryJobRecord,
-        SummaryResultInput, SummaryResultRecord, TranslationCandidate, TranslationCompletion,
-        now_ms_string, segment_from_durable, sha256_hex, visible_window_start_sequence,
+        SegmentSearchQuery, SummaryChunkInput, SummaryCompletionInput, SummaryJobInput,
+        SummaryJobRecord, SummaryProviderProvenance, SummaryResultInput, SummaryResultRecord,
+        TranslationCandidate, TranslationCompletion, now_ms_string, segment_from_durable,
+        sha256_hex, visible_window_start_sequence,
     },
     summary::{
         MeetingSummary, SummaryConfig, SummaryOutcome, SummaryProgressSnapshot, SummaryRunRequest,
@@ -46,6 +47,7 @@ pub(crate) const MVP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration
 const DISK_REQUIRED_BYTES: u64 = 512 * 1024 * 1024;
 const DISK_WARNING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const GOVERNANCE_RECOVERY_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const SUMMARY_DISCLOSURE_VERSION: &str = "meetingrelay.summary.provider-disclosure.v1";
 #[cfg(windows)]
 const RECOVERY_WINDOW_SAMPLES: u64 = 8 * 16_000;
 
@@ -907,11 +909,12 @@ impl MvpService {
         meeting_id: &str,
         provider_profile_id: Option<&str>,
         language: &str,
+        summary_risk_accepted: bool,
     ) -> Result<SummaryJobSnapshot, String> {
         if language != "zh" {
             return Err("SUMMARY_LANGUAGE_UNSUPPORTED".to_owned());
         }
-        self.start_summary_internal(meeting_id, provider_profile_id, None)
+        self.start_summary_internal(meeting_id, provider_profile_id, None, summary_risk_accepted)
     }
 
     pub fn summary_status(&self, job_id: &str) -> Result<SummaryJobSnapshot, String> {
@@ -970,7 +973,12 @@ impl MvpService {
         Ok(summary_job_from_storage(cancelled, 0, None))
     }
 
-    pub fn retry_summary(&self, job_id: &str) -> Result<SummaryJobSnapshot, String> {
+    pub fn retry_summary(
+        &self,
+        job_id: &str,
+        provider_profile_id: &str,
+        summary_risk_accepted: bool,
+    ) -> Result<SummaryJobSnapshot, String> {
         let storage = self
             .storage
             .as_ref()
@@ -981,10 +989,14 @@ impl MvpService {
         if parent.status == "pending" {
             return Err("SUMMARY_JOB_STILL_RUNNING".to_owned());
         }
+        if parent.provider_profile_id.as_deref() != Some(provider_profile_id) {
+            return Err("SUMMARY_RETRY_PROVIDER_MISMATCH".to_owned());
+        }
         self.start_summary_internal(
             &parent.meeting_id,
-            parent.provider_profile_id.as_deref(),
+            Some(provider_profile_id),
             Some(job_id),
+            summary_risk_accepted,
         )
     }
 
@@ -993,6 +1005,7 @@ impl MvpService {
         meeting_id: &str,
         provider_profile_id: Option<&str>,
         parent_job_id: Option<&str>,
+        summary_risk_accepted: bool,
     ) -> Result<SummaryJobSnapshot, String> {
         let storage = self
             .storage
@@ -1010,26 +1023,29 @@ impl MvpService {
         if meeting.finals.is_empty() {
             return Err("SUMMARY_EMPTY_MEETING".to_owned());
         }
-        let profile_id = match provider_profile_id {
-            Some(profile_id) => profile_id.to_owned(),
-            None => storage
-                .provider_profiles_latest()?
-                .into_iter()
-                .find(|profile| profile.provider_class != "local")
-                .map(|profile| profile.profile_id)
-                .ok_or_else(|| "SUMMARY_PROVIDER_REQUIRED".to_owned())?,
-        };
+        let profile_id = provider_profile_id
+            .filter(|profile_id| !profile_id.trim().is_empty())
+            .ok_or_else(|| "SUMMARY_PROVIDER_REQUIRED".to_owned())?
+            .to_owned();
         let profile = storage
             .provider_profile_latest(&profile_id)?
             .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
+        if profile.provider_class != "local" && !summary_risk_accepted {
+            return Err("SUMMARY_RISK_ACK_REQUIRED".to_owned());
+        }
         if profile.provider_class == "local" {
             validate_local_translation_base_url(profile.base_url.as_deref().unwrap_or_default())?;
         }
+        let provenance_profile_version = profile.version;
+        let provenance_config_version = profile.config_version;
+        let provenance_provider_class = profile.provider_class.clone();
+        let provenance_endpoint_hash = profile.endpoint_hash.clone();
+        let provenance_model = profile.model.clone();
         let config = SummaryConfig {
             enabled: true,
             provider: "openai-compatible".to_owned(),
-            base_url: profile.base_url.unwrap_or_default(),
-            model: profile.model,
+            base_url: profile.base_url.clone().unwrap_or_default(),
+            model: profile.model.clone(),
             api_key: if profile.provider_class == "local" {
                 None
             } else {
@@ -1040,6 +1056,17 @@ impl MvpService {
             max_retries: None,
         }
         .validate_enabled()?;
+        let provenance = SummaryProviderProvenance {
+            profile_version: provenance_profile_version,
+            config_version: provenance_config_version,
+            provider_class: provenance_provider_class.clone(),
+            endpoint_origin: config.endpoint_origin.clone(),
+            endpoint_hash: provenance_endpoint_hash,
+            model: provenance_model,
+            risk_accepted: summary_risk_accepted,
+            disclosure_version: (provenance_provider_class != "local")
+                .then(|| SUMMARY_DISCLOSURE_VERSION.to_owned()),
+        };
         let request = SummaryRunRequest {
             meeting_id: meeting_id.to_owned(),
             segments: meeting
@@ -1067,8 +1094,8 @@ impl MvpService {
             request_schema_version: "openai.chat.completions.v1".to_owned(),
         };
         let job = match parent_job_id {
-            Some(parent) => writer.retry_summary_job(parent, job_input),
-            None => writer.start_summary_job(job_input),
+            Some(parent) => writer.retry_summary_job_with_provenance(parent, job_input, provenance),
+            None => writer.start_summary_job_with_provenance(job_input, provenance),
         }
         .inspect_err(|_| self.summary_active.store(false, Ordering::Release))?;
         let queued = summary_job_from_storage(job.clone(), 0, None);
@@ -3416,15 +3443,20 @@ fn finish_summary_run(
 ) {
     match outcome {
         SummaryOutcome::Completed(completion) if !cancellation.load(Ordering::Acquire) => {
-            match persist_summary_chunks(
-                writer,
-                job,
-                completion.progress.total_chunks,
-                source_segment_ids,
-            )
-            .and_then(|()| persist_summary_result(writer, job, &completion.result))
-            .and_then(|result| writer.finish_summary_job(&job.job_id).map(|_| result))
-            {
+            match build_summary_chunks(job, completion.progress.total_chunks, source_segment_ids)
+                .map(|chunks| {
+                    let (results, snapshot) = build_summary_results(job, &completion.result);
+                    (chunks, results, snapshot)
+                })
+                .and_then(|(chunks, results, snapshot)| {
+                    writer
+                        .complete_summary_job(SummaryCompletionInput {
+                            job_id: job.job_id.clone(),
+                            chunks,
+                            results,
+                        })
+                        .map(|_| snapshot)
+                }) {
                 Ok(result) => {
                     let mut current = lock(state);
                     current.status = "completed".to_owned();
@@ -3458,16 +3490,16 @@ fn finish_summary_run(
     }
 }
 
-fn persist_summary_chunks(
-    writer: &MvpStorageWriter,
+fn build_summary_chunks(
     job: &SummaryJobRecord,
     total_chunks: usize,
     source_segment_ids: &[String],
-) -> Result<(), String> {
+) -> Result<Vec<SummaryChunkInput>, String> {
     if total_chunks == 0 {
         return Err("SUMMARY_CHUNK_COUNT_INVALID".to_owned());
     }
     let segment_count_per_chunk = source_segment_ids.len().div_ceil(total_chunks).max(1);
+    let mut chunks = Vec::with_capacity(total_chunks);
     for chunk_index in 0..total_chunks {
         let start = chunk_index.saturating_mul(segment_count_per_chunk);
         let end = start
@@ -3480,60 +3512,59 @@ fn persist_summary_chunks(
             .take(256)
             .cloned()
             .collect();
-        writer.append_summary_chunk(SummaryChunkInput {
+        chunks.push(SummaryChunkInput {
             job_id: job.job_id.clone(),
             chunk_index: u32::try_from(chunk_index).unwrap_or(u32::MAX),
             source_segment_ids: ids,
             text: format!("completed chunk {} of {total_chunks}", chunk_index + 1),
-        })?;
+        });
     }
-    Ok(())
+    Ok(chunks)
 }
 
-fn persist_summary_result(
-    writer: &MvpStorageWriter,
+fn build_summary_results(
     job: &SummaryJobRecord,
     summary: &MeetingSummary,
-) -> Result<SummaryResultSnapshot, String> {
-    writer.append_summary_result(SummaryResultInput {
+) -> (Vec<SummaryResultInput>, SummaryResultSnapshot) {
+    let mut results = vec![SummaryResultInput {
         job_id: job.job_id.clone(),
         section_kind: "overview".to_owned(),
         section_index: 0,
         heading: "概览".to_owned(),
         text: summary.overview.clone(),
         citation_segment_ids: Vec::new(),
-    })?;
+    }];
     for (index, action) in summary.action_items.iter().enumerate() {
-        writer.append_summary_result(SummaryResultInput {
+        results.push(SummaryResultInput {
             job_id: job.job_id.clone(),
             section_kind: "action".to_owned(),
             section_index: u32::try_from(index).unwrap_or(u32::MAX),
             heading: "行动项".to_owned(),
             text: format_summary_action(action),
             citation_segment_ids: summary_citation_ids(&action.citation),
-        })?;
+        });
     }
     for (index, decision) in summary.decisions.iter().enumerate() {
-        writer.append_summary_result(SummaryResultInput {
+        results.push(SummaryResultInput {
             job_id: job.job_id.clone(),
             section_kind: "decision".to_owned(),
             section_index: u32::try_from(index).unwrap_or(u32::MAX),
             heading: "决定".to_owned(),
             text: decision.text.clone(),
             citation_segment_ids: summary_citation_ids(&decision.citation),
-        })?;
+        });
     }
     for (index, question) in summary.open_questions.iter().enumerate() {
-        writer.append_summary_result(SummaryResultInput {
+        results.push(SummaryResultInput {
             job_id: job.job_id.clone(),
             section_kind: "open_question".to_owned(),
             section_index: u32::try_from(index).unwrap_or(u32::MAX),
             heading: "待确认".to_owned(),
             text: question.text.clone(),
             citation_segment_ids: summary_citation_ids(&question.citation),
-        })?;
+        });
     }
-    Ok(summary_result_from_summary(job, summary))
+    (results, summary_result_from_summary(job, summary))
 }
 
 fn summary_result_from_summary(
@@ -6122,6 +6153,51 @@ mod tests {
             let content = std::fs::read_to_string(&result.artifacts[0].path).unwrap();
             assert!(content.contains("VERSION_ONE_MARKER"));
             assert!(!content.contains("VERSION_TWO_MARKER"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summary_requires_explicit_provider_and_non_local_risk_acceptance() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-summary-consent-service-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+            let service =
+                MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+            let writer = service.storage_writer.as_ref().unwrap();
+            let meeting = writer.start_meeting(true, "test model").unwrap();
+            writer
+                .commit_final(FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: "segment-1".to_owned(),
+                    sequence: 1,
+                    revision: 1,
+                    text: "private transcript".to_owned(),
+                    started_at_ms: "0".to_owned(),
+                    ended_at_ms: "1000".to_owned(),
+                    meeting_sample_start: 0,
+                    meeting_sample_end: 16_000,
+                    timeline_revision: 1,
+                })
+                .unwrap();
+            writer.complete_meeting(&meeting.id).unwrap();
+
+            assert_eq!(
+                service
+                    .start_summary(&meeting.id, None, "zh", false)
+                    .unwrap_err(),
+                "SUMMARY_PROVIDER_REQUIRED"
+            );
+            assert_eq!(
+                service
+                    .start_summary(&meeting.id, Some("provider-cloud-default"), "zh", false)
+                    .unwrap_err(),
+                "SUMMARY_RISK_ACK_REQUIRED"
+            );
         }
         let _ = std::fs::remove_dir_all(root);
     }

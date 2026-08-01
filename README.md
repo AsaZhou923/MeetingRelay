@@ -216,6 +216,20 @@ that the selected model is present and then performs a real synthetic Chat
 Completions probe. A local failure is reported explicitly and never triggers an
 automatic cloud fallback.
 
+### Structured summaries and Provider disclosure
+
+Structured summaries use a separate Provider selector with no implicit
+default. Local summaries remain on the selected loopback service. Starting or
+retrying a LAN or Cloud summary displays the Provider, model, data flow, policy,
+and possible cost, and requires confirmation before the complete durable
+transcript is sent. The backend independently rejects missing Providers or
+missing non-local acknowledgement.
+
+Summary jobs persist the exact Profile/config versions, Provider class,
+endpoint origin/hash, model, prompt/request schema, and disclosure version.
+Chunks, results, search-index changes, and the final completed state publish in
+one SQLite transaction, so incomplete summaries do not become searchable.
+
 ### Remote HTTP
 
 HTTP is allowed directly for `localhost`, `127.0.0.1`, and `[::1]`. Non-loopback HTTP is rejected by default and is enabled only after the user explicitly selects **Allow insecure remote HTTP**.
@@ -258,6 +272,7 @@ This is a package-local personal Windows build, not an MSI or NSIS installer.
 
 - Audio capture, local ASR, the original SQLite transcript, and exports stay on the machine by default.
 - Durable final text is sent to the selected provider only when translation is enabled.
+- A summary sends the complete durable transcript only to an explicitly selected Provider; LAN and Cloud runs require a per-run privacy and cost acknowledgement.
 - Original text is committed before any network translation request; a provider failure cannot invalidate the local record.
 - API tokens are persisted only in Windows Credential Manager, can be removed from Provider management, and never appear in ordinary settings, SQLite, logs, copied transcripts, or exports.
 - Base URLs reject embedded credentials, query strings, and fragments. Remote HTTP requires explicit acknowledgement.
