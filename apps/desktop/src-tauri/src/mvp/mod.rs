@@ -88,11 +88,6 @@ pub fn mvp_prepare_language(
 }
 
 #[tauri::command(async)]
-pub fn mvp_test_translation(config: TranslationConfig) -> Result<TranslationProbe, String> {
-    translation::test_translation(&config)
-}
-
-#[tauri::command(async)]
 pub fn mvp_discover_local_translation_models(
     service: tauri::State<'_, MvpService>,
     base_url: String,
@@ -410,10 +405,16 @@ pub fn mvp_cancel_translation_batch(
 pub fn mvp_summary_start(
     service: tauri::State<'_, MvpService>,
     meeting_id: String,
-    provider_profile_id: Option<String>,
+    provider_profile_id: String,
     language: String,
+    summary_risk_accepted: bool,
 ) -> Result<service::SummaryJobSnapshot, String> {
-    service.start_summary(&meeting_id, provider_profile_id.as_deref(), &language)
+    service.start_summary(
+        &meeting_id,
+        Some(&provider_profile_id),
+        &language,
+        summary_risk_accepted,
+    )
 }
 
 #[tauri::command]
@@ -436,8 +437,10 @@ pub fn mvp_summary_cancel(
 pub fn mvp_summary_retry(
     service: tauri::State<'_, MvpService>,
     job_id: String,
+    provider_profile_id: String,
+    summary_risk_accepted: bool,
 ) -> Result<service::SummaryJobSnapshot, String> {
-    service.retry_summary(&job_id)
+    service.retry_summary(&job_id, &provider_profile_id, summary_risk_accepted)
 }
 
 #[tauri::command]

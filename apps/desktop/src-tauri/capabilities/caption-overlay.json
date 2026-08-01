@@ -4,5 +4,5 @@
   "description": "Read-only capability for the compact caption overlay.",
   "windows": ["caption-overlay"],
   "platforms": ["windows"],
-  "permissions": ["core:window:allow-is-visible"]
+  "permissions": ["core:window:allow-is-visible", "allow-mvp-snapshot"]
 }

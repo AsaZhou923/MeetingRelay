@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use super::{
     contract::MvpSnapshot,
     storage::{
-        DurableFinal, MvpStorageWriter, TranslationCandidate, TranslationCompletion, sha256_hex,
+        DurableFinal, MvpStorageWriter, TranslationAttemptRecord, TranslationCandidate,
+        TranslationCompletion, sha256_hex,
     },
 };
 
@@ -116,6 +117,7 @@ pub struct TranslationSubmitter {
     sessions: Arc<Mutex<HashMap<String, SessionTranslation>>>,
     pending: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
+    storage_writer: Arc<MvpStorageWriter>,
 }
 
 #[derive(Clone)]
@@ -131,8 +133,10 @@ struct TranslationJob {
     final_segment: DurableFinal,
     source_language: String,
     config: ValidatedTranslationConfig,
+    attempt: TranslationAttemptRecord,
 }
 
+#[derive(Clone)]
 enum TranslationOutcome {
     Completed(String),
     Failed(String),
@@ -188,6 +192,7 @@ impl TranslationWorker {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_pending = Arc::clone(&pending);
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_storage_writer = Arc::clone(&storage_writer);
         let join = thread::Builder::new()
             .name("meetingrelay-translation".to_owned())
             .spawn(move || {
@@ -196,7 +201,7 @@ impl TranslationWorker {
                     worker_pending,
                     worker_shutdown,
                     snapshot,
-                    storage_writer,
+                    worker_storage_writer,
                 );
             })
             .map_err(|_| "TRANSLATION_WORKER_START_FAILED".to_owned())?;
@@ -206,6 +211,7 @@ impl TranslationWorker {
                 sessions,
                 pending,
                 shutdown,
+                storage_writer,
             },
             join: Some(join),
         })
@@ -279,28 +285,66 @@ impl TranslationSubmitter {
                 source_language,
                 config,
             } => {
-                final_segment.translation_status = if source_language == config.target_language {
-                    "skipped".to_owned()
-                } else {
-                    "pending".to_owned()
-                };
+                final_segment.translation_status = "pending".to_owned();
                 final_segment.translation_target = Some(config.target_language.clone());
+                final_segment.translation_error = None;
+                let attempt = match self
+                    .storage_writer
+                    .begin_translation(translation_candidate(final_segment, &config))
+                {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        final_segment.translation_status = "failed".to_owned();
+                        final_segment.translation_error = Some(error);
+                        return;
+                    }
+                };
+                if source_language == config.target_language {
+                    let result = self
+                        .storage_writer
+                        .finish_translation(translation_completion(
+                            final_segment,
+                            &config.target_language,
+                            attempt.attempt,
+                            TranslationOutcome::Skipped,
+                        ));
+                    match result {
+                        Ok(()) => {
+                            final_segment.translation_status = "skipped".to_owned();
+                            final_segment.translation_text = None;
+                            final_segment.translation_error = None;
+                        }
+                        Err(error) => {
+                            final_segment.translation_status = "failed".to_owned();
+                            final_segment.translation_error = Some(error);
+                        }
+                    }
+                    return;
+                }
                 let job = TranslationJob {
                     final_segment: final_segment.clone(),
                     source_language,
                     config,
+                    attempt,
                 };
                 self.pending.fetch_add(1, Ordering::AcqRel);
                 if let Err(error) = self.sender.try_send(job) {
                     self.pending.fetch_sub(1, Ordering::AcqRel);
+                    let (job, error) = match error {
+                        TrySendError::Full(job) => (job, "TRANSLATION_QUEUE_FULL"),
+                        TrySendError::Disconnected(job) => (job, "TRANSLATION_WORKER_STOPPED"),
+                    };
+                    let _ = self
+                        .storage_writer
+                        .finish_translation(translation_completion(
+                            final_segment,
+                            &job.config.target_language,
+                            job.attempt.attempt,
+                            TranslationOutcome::Failed(error.to_owned()),
+                        ));
                     final_segment.translation_status = "failed".to_owned();
-                    final_segment.translation_error = Some(
-                        match error {
-                            TrySendError::Full(_) => "TRANSLATION_QUEUE_FULL",
-                            TrySendError::Disconnected(_) => "TRANSLATION_WORKER_STOPPED",
-                        }
-                        .to_owned(),
-                    );
+                    final_segment.translation_text = None;
+                    final_segment.translation_error = Some(error.to_owned());
                 }
             }
         }
@@ -336,45 +380,57 @@ fn process_translation_job(
     snapshot: &Mutex<MvpSnapshot>,
     storage_writer: &MvpStorageWriter,
 ) {
-    let candidate = TranslationCandidate {
-        meeting_id: job.final_segment.meeting_id.clone(),
-        segment_id: job.final_segment.segment_id.clone(),
-        source_revision: job.final_segment.revision,
-        target_language: job.config.target_language.clone(),
-        model: job.config.model.clone(),
+    let result = match translate_text(&job.config, &job.final_segment.text, &job.source_language) {
+        Ok(text) => TranslationOutcome::Completed(text),
+        Err(error) => TranslationOutcome::Failed(error),
+    };
+    let completion = translation_completion(
+        &job.final_segment,
+        &job.config.target_language,
+        job.attempt.attempt,
+        result.clone(),
+    );
+    let stored = storage_writer.finish_translation(completion);
+    let result = stored.map_or_else(TranslationOutcome::Failed, |_| result);
+    publish_translation(
+        snapshot,
+        &job.final_segment,
+        &job.config.target_language,
+        result,
+    );
+}
+
+fn translation_candidate(
+    final_segment: &DurableFinal,
+    config: &ValidatedTranslationConfig,
+) -> TranslationCandidate {
+    TranslationCandidate {
+        meeting_id: final_segment.meeting_id.clone(),
+        segment_id: final_segment.segment_id.clone(),
+        source_revision: final_segment.revision,
+        target_language: config.target_language.clone(),
+        model: config.model.clone(),
         provider: TRANSLATION_PROVIDER_OPENAI_COMPATIBLE.to_owned(),
         config_version: TRANSLATION_CONFIG_VERSION.to_owned(),
-        endpoint_origin: Some(job.config.endpoint_origin.clone()),
-        endpoint_hash: job.config.endpoint_hash.clone(),
+        endpoint_origin: Some(config.endpoint_origin.clone()),
+        endpoint_hash: config.endpoint_hash.clone(),
         prompt_version: TRANSLATION_PROMPT_VERSION.to_owned(),
         request_schema_version: TRANSLATION_REQUEST_SCHEMA_VERSION.to_owned(),
-    };
-    let attempt = match storage_writer.begin_translation(candidate) {
-        Ok(attempt) => attempt,
-        Err(error) => {
-            publish_translation(
-                snapshot,
-                &job.final_segment,
-                &job.config.target_language,
-                TranslationOutcome::Failed(error),
-            );
-            return;
-        }
-    };
-    let result = if job.source_language == job.config.target_language {
-        TranslationOutcome::Skipped
-    } else {
-        match translate_text(&job.config, &job.final_segment.text, &job.source_language) {
-            Ok(text) => TranslationOutcome::Completed(text),
-            Err(error) => TranslationOutcome::Failed(error),
-        }
-    };
-    let completion = TranslationCompletion {
-        meeting_id: job.final_segment.meeting_id.clone(),
-        segment_id: job.final_segment.segment_id.clone(),
-        source_revision: job.final_segment.revision,
-        target_language: job.config.target_language.clone(),
-        attempt: attempt.attempt,
+    }
+}
+
+fn translation_completion(
+    final_segment: &DurableFinal,
+    target_language: &str,
+    attempt: u32,
+    result: TranslationOutcome,
+) -> TranslationCompletion {
+    TranslationCompletion {
+        meeting_id: final_segment.meeting_id.clone(),
+        segment_id: final_segment.segment_id.clone(),
+        source_revision: final_segment.revision,
+        target_language: target_language.to_owned(),
+        attempt,
         translated_text: match &result {
             TranslationOutcome::Completed(text) => Some(text.clone()),
             TranslationOutcome::Failed(_) | TranslationOutcome::Skipped => None,
@@ -388,15 +444,7 @@ fn process_translation_job(
             TranslationOutcome::Completed(_) | TranslationOutcome::Skipped => false,
         },
         skipped_same_language: matches!(&result, TranslationOutcome::Skipped),
-    };
-    let stored = storage_writer.finish_translation(completion);
-    let result = stored.map_or_else(TranslationOutcome::Failed, |_| result);
-    publish_translation(
-        snapshot,
-        &job.final_segment,
-        &job.config.target_language,
-        result,
-    );
+    }
 }
 
 fn publish_translation(
@@ -811,7 +859,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc::TryRecvError},
         thread,
         time::{Duration, Instant},
     };
@@ -827,6 +875,46 @@ mod tests {
             api_key: None,
             target_language: "zh".to_owned(),
             allow_insecure_http: false,
+        }
+    }
+
+    fn storage_backed_final(label: &str) -> (MvpStorage, Arc<MvpStorageWriter>, DurableFinal) {
+        let root = std::env::temp_dir().join(format!(
+            "meetingrelay-translation-{label}-{}",
+            crate::mvp::storage::now_ms_string()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let writer = Arc::new(MvpStorageWriter::start(storage.clone()).unwrap());
+        let meeting = writer.start_meeting(true, "test ASR").unwrap();
+        let final_segment = writer
+            .commit_final(FinalCandidate {
+                meeting_id: meeting.id.clone(),
+                segment_id: "segment-1".to_owned(),
+                sequence: 1,
+                revision: 1,
+                text: "local original".to_owned(),
+                started_at_ms: "0".to_owned(),
+                ended_at_ms: "100".to_owned(),
+                meeting_sample_start: 0,
+                meeting_sample_end: 1_600,
+                timeline_revision: 1,
+            })
+            .unwrap()
+            .final_segment;
+        (storage, writer, final_segment)
+    }
+
+    fn submitter_with_writer(
+        sender: SyncSender<TranslationJob>,
+        storage_writer: Arc<MvpStorageWriter>,
+    ) -> TranslationSubmitter {
+        TranslationSubmitter {
+            sender,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(AtomicUsize::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            storage_writer,
         }
     }
 
@@ -1170,42 +1258,107 @@ mod tests {
     }
 
     #[test]
-    fn same_language_is_marked_skipped_and_never_connects_to_the_provider() {
+    fn same_language_is_persisted_skipped_without_provider_enqueue() {
         let config = enabled("http://127.0.0.1:9/v1").validate_enabled().unwrap();
         assert_eq!(translate_text(&config, "原文", "zh").unwrap(), "原文");
-        let (sender, _receiver) = sync_channel(TRANSLATION_QUEUE_DEPTH);
-        let submitter = TranslationSubmitter {
-            sender,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(AtomicUsize::new(0)),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        };
+        let (storage, writer, mut final_segment) = storage_backed_final("same-language");
+        let (sender, receiver) = sync_channel(TRANSLATION_QUEUE_DEPTH);
+        let submitter = submitter_with_writer(sender, writer);
         submitter
-            .configure_session("meeting-1", "zh", &enabled("http://127.0.0.1:11434/v1"))
+            .configure_session(
+                &final_segment.meeting_id,
+                "zh",
+                &enabled("http://127.0.0.1:11434/v1"),
+            )
             .unwrap();
-        let mut final_segment = DurableFinal {
-            meeting_id: "meeting-1".to_owned(),
-            segment_id: "segment-1".to_owned(),
-            sequence: 1,
-            revision: 1,
-            text: "原文".to_owned(),
-            started_at_ms: "0".to_owned(),
-            ended_at_ms: "1".to_owned(),
-            content_sha256: "a".repeat(64),
-            committed_at: "1".to_owned(),
-            commit_id: "b".repeat(64),
-            meeting_sample_start: 0,
-            meeting_sample_end: 16,
-            timeline_revision: 1,
-            translation_status: "disabled".to_owned(),
-            translation_target: None,
-            translation_text: None,
-            translation_error: None,
-        };
         submitter.decorate_and_submit(&mut final_segment);
         assert_eq!(final_segment.translation_status, "skipped");
         assert_eq!(final_segment.translation_target.as_deref(), Some("zh"));
-        assert_eq!(submitter.pending.load(Ordering::Acquire), 1);
+        assert_eq!(submitter.pending.load(Ordering::Acquire), 0);
+        match receiver.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => panic!("translation queue disconnected"),
+            Ok(_) => panic!("same-language final should not enqueue a translation job"),
+        }
+
+        let persisted = storage.snapshot(&final_segment.meeting_id).unwrap();
+        assert_eq!(persisted.finals[0].text, "local original");
+        assert_eq!(persisted.finals[0].translation_status, "skipped");
+        assert_eq!(
+            persisted.finals[0].translation_target.as_deref(),
+            Some("zh")
+        );
+        assert_eq!(persisted.finals[0].translation_text, None);
+        assert_eq!(persisted.finals[0].translation_error, None);
+    }
+
+    #[test]
+    fn queue_full_failure_is_persisted_before_reload() {
+        let (storage, writer, mut final_segment) = storage_backed_final("queue-full");
+        let (sender, _receiver) = sync_channel(0);
+        let submitter = submitter_with_writer(sender, writer);
+        submitter
+            .configure_session(
+                &final_segment.meeting_id,
+                "en",
+                &enabled("http://127.0.0.1:9/v1"),
+            )
+            .unwrap();
+
+        submitter.decorate_and_submit(&mut final_segment);
+
+        assert_eq!(final_segment.translation_status, "failed");
+        assert_eq!(
+            final_segment.translation_error.as_deref(),
+            Some("TRANSLATION_QUEUE_FULL")
+        );
+        assert_eq!(submitter.pending.load(Ordering::Acquire), 0);
+        let persisted = storage.snapshot(&final_segment.meeting_id).unwrap();
+        assert_eq!(persisted.finals[0].text, "local original");
+        assert_eq!(persisted.finals[0].translation_status, "failed");
+        assert_eq!(
+            persisted.finals[0].translation_error.as_deref(),
+            Some("TRANSLATION_QUEUE_FULL")
+        );
+        assert_eq!(
+            persisted.finals[0].translation_target.as_deref(),
+            Some("zh")
+        );
+    }
+
+    #[test]
+    fn disconnected_worker_failure_is_persisted_before_reload() {
+        let (storage, writer, mut final_segment) = storage_backed_final("disconnected");
+        let (sender, receiver) = sync_channel(TRANSLATION_QUEUE_DEPTH);
+        drop(receiver);
+        let submitter = submitter_with_writer(sender, writer);
+        submitter
+            .configure_session(
+                &final_segment.meeting_id,
+                "en",
+                &enabled("http://127.0.0.1:9/v1"),
+            )
+            .unwrap();
+
+        submitter.decorate_and_submit(&mut final_segment);
+
+        assert_eq!(final_segment.translation_status, "failed");
+        assert_eq!(
+            final_segment.translation_error.as_deref(),
+            Some("TRANSLATION_WORKER_STOPPED")
+        );
+        assert_eq!(submitter.pending.load(Ordering::Acquire), 0);
+        let persisted = storage.snapshot(&final_segment.meeting_id).unwrap();
+        assert_eq!(persisted.finals[0].text, "local original");
+        assert_eq!(persisted.finals[0].translation_status, "failed");
+        assert_eq!(
+            persisted.finals[0].translation_error.as_deref(),
+            Some("TRANSLATION_WORKER_STOPPED")
+        );
+        assert_eq!(
+            persisted.finals[0].translation_target.as_deref(),
+            Some("zh")
+        );
     }
 
     #[test]

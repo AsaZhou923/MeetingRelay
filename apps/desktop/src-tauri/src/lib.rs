@@ -61,7 +61,6 @@ fn with_mvp_handler<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bui
             mvp::mvp_audio_devices,
             mvp::mvp_asr_models,
             mvp::mvp_prepare_language,
-            mvp::mvp_test_translation,
             mvp::mvp_discover_local_translation_models,
             mvp::mvp_secret_store_status,
             mvp::mvp_provider_profiles,

@@ -3,6 +3,36 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-08-01 — Privacy and durability remediation
+
+- Made summary Provider selection explicit and independent from Provider
+  management state. LAN and Cloud summaries now require a per-run disclosure
+  that names the Provider, model, data flow, policy, and possible cost before
+  the full durable transcript can leave the device.
+- Enforced the same boundary in Rust IPC: missing Providers fail with
+  `SUMMARY_PROVIDER_REQUIRED`, non-local runs without acknowledgement fail with
+  `SUMMARY_RISK_ACK_REQUIRED`, and retries must use the original Provider.
+- Upgraded SQLite to schema v8 and persisted summary Profile/config versions,
+  Provider class, endpoint origin/hash, model, acknowledgement state, and
+  disclosure version.
+- Made summary completion atomic. Chunks, structured results, search-index
+  effects, and the final `completed` state now commit in one transaction; a
+  failed batch publishes nothing.
+- Made translation submission outcomes durable before queue publication.
+  Queue-full and stopped-worker failures survive reload, while same-language
+  segments are persisted as `skipped` without entering the Provider queue.
+- Removed the obsolete raw-config `mvp_test_translation` IPC path so provider
+  tests continue to resolve endpoints and credentials through versioned
+  Profiles and Windows Credential Manager.
+- Enforced the caption overlay's read-only boundary with Tauri application
+  command permissions. The overlay is allowed to call only `mvp_snapshot`.
+- Revalidated 41 frontend tests, TypeScript/Vite production build, 187 Rust
+  tests (5 explicitly ignored), strict locked/offline Clippy, launcher/release/
+  acceptance/distribution contracts, and the production dependency audit.
+- `cargo-audit`, live ignored CUDA/Provider tests, real-device long meetings,
+  real Ollama/LM Studio meetings, and signed clean-machine installer acceptance
+  remain explicit environment or release-evidence gaps.
+
 ## 2026-07-29 — Cohere Transcribe GPU ASR
 
 - Added Cohere Transcribe 2B as the high-quality Windows GPU profile, using a
