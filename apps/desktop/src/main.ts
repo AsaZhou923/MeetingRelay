@@ -2,6 +2,17 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { Window } from "@tauri-apps/api/window";
 
 import {
+  beginStartUiState,
+  canBeginStart,
+  finishStartUiState,
+  mergeProbeStates,
+  nextTranscriptFollowState,
+  returnToLatest,
+  type ProbeUiState,
+  type StartUiState,
+  type TranscriptFollowState,
+} from "./frontend-state";
+import {
   AUDIO_DEVICE_PREFERENCE_KEY,
   TRANSLATION_PREFERENCE_KEY,
   formatMvpErrorMessage,
@@ -71,23 +82,48 @@ const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("MeetingRelay app root is missing.");
 
 app.innerHTML = `
-  <a class="skip-link" href="#transcript-title">Skip to live transcript</a>
+  <a class="skip-link" href="#transcript-title">跳到实时文字</a>
   <main id="main-content" class="relay-shell">
     <header class="masthead">
       <div class="brand-lockup">
-        <p class="kicker">PRIVATE MEETING CAPTURE / WINDOWS</p>
+        <p class="kicker">本地会议转写 / Windows</p>
         <h1>Meeting<span>Relay</span></h1>
       </div>
-      <div class="privacy-stamp" aria-label="Privacy and storage mode">
+      <nav class="primary-nav" aria-label="主导航">
+        <button class="primary-nav-button" type="button" data-view="live" aria-pressed="true">实时会议</button>
+        <button class="primary-nav-button" type="button" data-view="records" aria-pressed="false">会议记录</button>
+        <button class="primary-nav-button" type="button" data-view="settings" aria-pressed="false">设置</button>
+      </nav>
+      <div class="privacy-stamp" aria-label="隐私与存储模式">
         <span class="privacy-dot"></span>
-        <span><strong>本地识别</strong>音频与记录留在此电脑；启用云端翻译时，仅 final 原文发往所选服务</span>
+        <span><strong>本地识别</strong>音频与记录留在此电脑；启用云端翻译时，仅确认后的原文发往所选服务</span>
       </div>
     </header>
 
+    <section id="live-view" class="app-view" data-view-panel="live">
     <section class="workspace">
-      <aside class="control-rail" aria-label="Session controls and input settings">
-        <div class="rail-index">01 / INPUT</div>
-        <h2>声音源</h2>
+      <aside class="control-rail" aria-label="会议控制与输入设置">
+        <div class="rail-index">01 / 会前检查</div>
+        <h2>开始会议</h2>
+
+        <label class="consent-row">
+          <input id="consent" type="checkbox" />
+          <span>我确认本次会议允许录音转写，并同意原文与可用译文保存在本机；启用翻译时，确认后的原文会发送给所选服务，其中第三方云端服务受其隐私与计费规则约束。</span>
+        </label>
+
+        <div class="session-control-dock">
+          <div class="session-actions">
+            <button id="start" class="start-button" type="button" disabled>
+              <span class="record-mark"></span>开始实时转写
+            </button>
+            <button id="pause-resume" class="pause-button" type="button" disabled>暂停转写</button>
+            <button id="stop" class="stop-button" type="button" disabled>结束会议</button>
+          </div>
+          <p id="start-status" class="start-status" aria-live="polite" aria-atomic="true"></p>
+          <p id="error" class="error-line" role="alert"></p>
+        </div>
+
+        <div class="rail-index input-section-index">02 / 声音源</div>
         <div class="device-pickers" aria-label="音频设备选择">
           <label class="device-picker">
             <span>系统输出</span>
@@ -127,7 +163,7 @@ app.innerHTML = `
           </label>
           <label class="raw-audio-toggle">
             <input id="raw-audio-enabled" type="checkbox" />
-            <span>保存 raw audio（默认关闭）</span>
+            <span>保存原始音频（默认关闭）</span>
           </label>
           <p id="device-status" class="device-status" aria-live="polite">正在读取 Windows 音频设备…</p>
         </div>
@@ -137,7 +173,7 @@ app.innerHTML = `
             <div><strong>电脑播放声音</strong><small id="system-label">正在检测默认输出</small></div>
           </div>
           <div class="level-track"><i id="system-level"></i></div>
-          <div class="source-meta"><span id="system-status">检测中</span><span id="system-frames">0 frames</span></div>
+          <div class="source-meta"><span id="system-status">检测中</span><span id="system-frames">0 帧</span></div>
         </div>
         <div id="source-microphone" class="source-card" data-status="booting">
           <div class="source-heading">
@@ -145,18 +181,18 @@ app.innerHTML = `
             <div><strong>麦克风</strong><small id="microphone-label">正在检测默认输入</small></div>
           </div>
           <div class="level-track"><i id="microphone-level"></i></div>
-          <div class="source-meta"><span id="microphone-status">检测中</span><span id="microphone-frames">0 frames</span></div>
+          <div class="source-meta"><span id="microphone-status">检测中</span><span id="microphone-frames">0 帧</span></div>
         </div>
 
         <div class="model-line">
-          <span>ASR ENGINE</span>
+          <span>识别模型</span>
           <strong id="model-status">正在校验本地模型…</strong>
         </div>
 
-        <section class="translation-panel" aria-label="OpenAI-compatible translation">
+        <section class="translation-panel" aria-label="OpenAI-compatible 翻译">
           <div class="translation-heading">
             <div>
-              <div class="rail-index">02 / TRANSLATION</div>
+              <div class="rail-index">02 / 翻译</div>
               <strong>OpenAI-compatible 翻译</strong>
             </div>
             <label class="translation-toggle">
@@ -205,7 +241,7 @@ app.innerHTML = `
             <input id="translation-allow-insecure-http" type="checkbox" />
             <span>
               <strong>允许不安全的远程 HTTP</strong>
-              <small>API Token 和 final 原文将以明文传输，可能被网络中的第三方读取或篡改。</small>
+              <small>API Token 和确认后的原文将以明文传输，可能被网络中的第三方读取或篡改。</small>
             </span>
           </label>
           <div class="translation-actions">
@@ -215,13 +251,13 @@ app.innerHTML = `
           <small class="translation-privacy">本机回环地址可直接使用 HTTP；远程 HTTP 必须显式确认风险，仍建议优先配置 HTTPS。API Token 不写入普通设置或 SQLite；测试/开始时保存到 Windows Credential Manager。</small>
         </section>
 
-        <section class="storage-panel" aria-label="Durable storage">
-          <div class="rail-index">03 / STORAGE</div>
+        <section class="storage-panel" aria-label="本地持久化存储">
+          <div class="rail-index">03 / 存储</div>
           <div class="storage-row">
             <span id="storage-indicator" class="storage-indicator" data-status="initializing"></span>
             <div>
               <strong id="storage-status">初始化本地持久化</strong>
-              <small id="storage-detail">final 片段只在 SQLite 提交成功后显示为已保存。</small>
+              <small id="storage-detail">确认后的文字只在 SQLite 提交成功后显示为已保存。</small>
             </div>
           </div>
           <dl class="storage-metrics">
@@ -235,35 +271,21 @@ app.innerHTML = `
           <p id="diagnostic-status" class="copy-status" aria-live="polite"></p>
         </section>
 
-        <section class="retry-panel" aria-label="Translation retry">
-          <div class="rail-index">04 / RETRY</div>
+        <section class="retry-panel" aria-label="译文重试">
+          <div class="rail-index">04 / 译文重试</div>
           <button id="retry-failed-translations" class="secondary-button" type="button" disabled>重试本场失败译文</button>
           <button id="cancel-translation-batch" class="secondary-button" type="button" disabled>取消批量重试</button>
           <p id="retry-progress" class="retry-progress" aria-live="polite">无批量重试任务。</p>
         </section>
 
-        <section class="recovery-panel" aria-label="Interrupted meeting recovery">
-          <div class="rail-index">05 / RECOVERY</div>
+        <section class="recovery-panel" aria-label="中断会议恢复">
+          <div class="rail-index">05 / 恢复</div>
           <button id="refresh-interrupted" class="secondary-button" type="button">刷新中断会议</button>
           <ul id="interrupted-meetings" class="interrupted-meetings" aria-live="polite"></ul>
         </section>
 
-        <label class="consent-row">
-          <input id="consent" type="checkbox" />
-          <span>我确认本次会议允许录音转写，并同意原文与可用译文保存在本机；启用翻译时，final 原文会发送给所选服务，其中第三方云端服务受其隐私与计费规则约束。</span>
-        </label>
-
-        <div class="session-actions">
-          <button id="start" class="start-button" type="button" disabled>
-            <span class="record-mark"></span>开始实时转写
-          </button>
-          <button id="pause-resume" class="pause-button" type="button" disabled>暂停转写</button>
-          <button id="stop" class="stop-button" type="button" disabled>停止并完成当前会议</button>
-        </div>
-        <p id="error" class="error-line" role="alert"></p>
-
-        <section class="history-panel" aria-label="Recent meetings">
-          <div class="rail-index">06 / RECENT</div>
+        <section class="history-panel" aria-label="最近会议">
+          <div class="rail-index">06 / 最近会议</div>
           <button id="open-recent" class="secondary-button" type="button" disabled>重新打开最近会议</button>
           <p id="recent-summary" class="recent-summary">暂无已打开会议。</p>
         </section>
@@ -272,30 +294,38 @@ app.innerHTML = `
       <section class="transcript-stage" aria-labelledby="transcript-title">
         <div class="stage-heading">
           <div class="stage-copy">
-            <div class="rail-index">05 / LIVE TRANSCRIPT</div>
+            <div class="rail-index">05 / 实时文字</div>
             <h2 id="transcript-title">实时文字</h2>
             <p>原文先持久保存；若启用翻译，译文随后对齐显示，失败不会影响原文。</p>
           </div>
           <div class="session-clock">
-            <span id="lifecycle">BOOTING</span>
+            <span id="lifecycle">启动中</span>
             <strong id="elapsed">00:00:00</strong>
-            <button id="overlay-toggle" class="secondary-button overlay-toggle" type="button" aria-pressed="false" disabled>Show overlay</button>
+            <button id="overlay-toggle" class="secondary-button overlay-toggle" type="button" aria-pressed="false" disabled>显示悬浮字幕</button>
           </div>
         </div>
         <div class="transcript-viewport">
           <div id="empty-state" class="empty-state">
             <div class="signal-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
             <strong>等待会议声音</strong>
-            <p>确认设备和识别语言后开始。只有成功写入本地 SQLite 的 final 内容才会进入记录。</p>
+            <p>确认设备和识别语言后开始。只有成功写入本地 SQLite 的确认文字才会进入记录。</p>
           </div>
           <ol id="transcript" class="transcript-list" aria-label="已保存的实时转写"></ol>
           <p id="transcript-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+          <button id="follow-latest" class="follow-latest-button" type="button" hidden>
+            回到最新
+            <span id="new-content-count">0 条新内容</span>
+          </button>
+          <div id="latest-dock" class="latest-dock" aria-live="polite">
+            <span id="follow-state">正在跟随最新内容</span>
+            <p id="latest-line">等待实时文字。</p>
+          </div>
           <div id="interim" class="interim-line" hidden>
             <span>正在识别</span>
             <p></p>
           </div>
         </div>
-        <section class="export-panel" aria-label="Exports">
+        <section class="export-panel" aria-label="导出">
           <div class="export-actions">
             <span>会议完成后可用</span>
             <button id="copy-transcript" class="secondary-button" type="button" disabled>复制全部转写</button>
@@ -306,170 +336,172 @@ app.innerHTML = `
           <ul id="export-results" class="export-results" aria-live="polite"></ul>
         </section>
         <footer class="stage-footer">
-          <span>队列 <strong id="queue-depth">0 / 8</strong></span>
+          <span>待处理 <strong id="queue-depth">0 / 8</strong></span>
           <span>翻译 <strong id="translation-queue-depth">关闭</strong></span>
           <span>识别语言 <strong id="footer-language">中文 · ZH</strong></span>
           <span>存储 <strong id="footer-storage">初始化</strong></span>
         </footer>
       </section>
     </section>
+    </section>
+    <section id="records-view" class="app-view secondary-workspace" data-view-panel="records" hidden aria-label="会议记录"></section>
+    <section id="settings-view" class="app-view secondary-workspace" data-view-panel="settings" hidden aria-label="设置"></section>
   </main>
 `;
 
 element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
   "beforeend",
   `
-    <section class="r3r4-console" aria-label="R3 R4 evidence console">
+    <section class="r3r4-console" aria-label="高级工作区">
       <div class="console-grid">
         <section class="console-card library-card">
           <div class="console-heading">
-            <div><span>R3 / LIBRARY</span><h3>Meeting library</h3></div>
-            <button id="library-refresh" class="secondary-button" type="button">Refresh</button>
+            <div><span>会议记录</span><h3>会议列表</h3></div>
+            <button id="library-refresh" class="secondary-button" type="button">刷新</button>
           </div>
           <div class="library-filters">
-            <input id="library-search" type="search" placeholder="Search transcript, translation, summary, speaker" spellcheck="false" />
-            <input id="library-tags" type="text" placeholder="tag1, tag2" spellcheck="false" />
+            <input id="library-search" type="search" placeholder="搜索原文、译文、摘要或说话人" spellcheck="false" />
+            <input id="library-tags" type="text" placeholder="标签 1, 标签 2" spellcheck="false" />
           </div>
           <ol id="search-results" class="search-results" aria-live="polite"></ol>
           <ol id="library-list" class="library-list" aria-live="polite"></ol>
-          <button id="library-more" class="secondary-button" type="button" disabled>Load next page</button>
+          <button id="library-more" class="secondary-button" type="button" disabled>加载下一页</button>
           <p id="library-status" class="copy-status" aria-live="polite"></p>
         </section>
 
         <section class="console-card detail-card">
           <div class="console-heading">
-            <div><span>R3 / DETAIL</span><h3>Meeting detail</h3></div>
-            <input id="detail-sequence" type="number" min="1" step="1" placeholder="segment #" />
+            <div><span>会议记录</span><h3>会议详情</h3></div>
+            <input id="detail-sequence" type="number" min="1" step="1" placeholder="段落编号" />
           </div>
-          <div id="detail-summary" class="detail-summary">No meeting selected.</div>
+          <div id="detail-summary" class="detail-summary">尚未选择会议。</div>
           <div class="tag-editor">
-            <input id="detail-tags" type="text" placeholder="Edit tags, comma separated" spellcheck="false" />
-            <button id="detail-save-tags" class="secondary-button" type="button" disabled>Save tags</button>
+            <input id="detail-tags" type="text" placeholder="编辑标签，用逗号分隔" spellcheck="false" />
+            <button id="detail-save-tags" class="secondary-button" type="button" disabled>保存标签</button>
           </div>
           <section class="speaker-workspace" aria-labelledby="speaker-title">
             <div class="speaker-heading">
               <div>
-                <span>R5 / SPEAKERS</span>
-                <h4 id="speaker-title">Speaker workspace</h4>
+                <span>说话人</span>
+                <h4 id="speaker-title">说话人工作区</h4>
               </div>
               <div class="speaker-actions">
-                <button id="speaker-run" class="secondary-button" type="button" disabled>Run diarization</button>
-                <button id="speaker-refresh" class="secondary-button" type="button" disabled>Refresh</button>
+                <button id="speaker-run" class="secondary-button" type="button" disabled>分析说话人</button>
+                <button id="speaker-refresh" class="secondary-button" type="button" disabled>刷新</button>
               </div>
             </div>
             <dl class="speaker-version">
-              <div><dt>Selected version</dt><dd id="speaker-version">none</dd></div>
-              <div><dt>Latest version</dt><dd id="speaker-latest-version">none</dd></div>
-              <div><dt>Algorithm</dt><dd id="speaker-algorithm">not run</dd></div>
-              <div><dt>Status</dt><dd id="speaker-status">Select a meeting.</dd></div>
+              <div><dt>当前版本</dt><dd id="speaker-version">无</dd></div>
+              <div><dt>最新版本</dt><dd id="speaker-latest-version">无</dd></div>
+              <div><dt>算法</dt><dd id="speaker-algorithm">未运行</dd></div>
+              <div><dt>状态</dt><dd id="speaker-status">请选择会议。</dd></div>
             </dl>
             <div class="speaker-version-picker">
               <label>
-                <span>Load speaker version</span>
+                <span>读取说话人版本</span>
                 <input id="speaker-version-input" type="number" min="1" step="1" inputmode="numeric" disabled />
               </label>
-              <button id="speaker-load-version" class="secondary-button" type="button" disabled>Load version</button>
-              <p id="speaker-edit-note">Edits use the latest version only.</p>
+              <button id="speaker-load-version" class="secondary-button" type="button" disabled>读取版本</button>
+              <p id="speaker-edit-note">只允许编辑最新版本。</p>
             </div>
             <ol id="speaker-identities" class="speaker-identities" aria-live="polite"></ol>
-            <form id="speaker-rename-form" class="speaker-form" aria-label="Rename speaker">
+            <form id="speaker-rename-form" class="speaker-form" aria-label="重命名说话人">
               <label>
-                <span>Speaker</span>
+                <span>说话人</span>
                 <select id="speaker-rename-id" disabled></select>
               </label>
               <label>
-                <span>New name</span>
+                <span>新名称</span>
                 <input id="speaker-rename-name" type="text" maxlength="80" spellcheck="false" disabled />
               </label>
-              <button id="speaker-rename" class="secondary-button" type="submit" disabled>Rename</button>
+              <button id="speaker-rename" class="secondary-button" type="submit" disabled>重命名</button>
             </form>
-            <form id="speaker-merge-form" class="speaker-form" aria-label="Merge speakers">
+            <form id="speaker-merge-form" class="speaker-form" aria-label="合并说话人">
               <label>
-                <span>From</span>
+                <span>从</span>
                 <select id="speaker-merge-from" disabled></select>
               </label>
               <label>
-                <span>Into</span>
+                <span>合并到</span>
                 <select id="speaker-merge-into" disabled></select>
               </label>
               <label>
-                <span>Merged name</span>
+                <span>合并后名称</span>
                 <input id="speaker-merge-name" type="text" maxlength="80" spellcheck="false" disabled />
               </label>
-              <button id="speaker-merge" class="secondary-button" type="submit" disabled>Merge</button>
+              <button id="speaker-merge" class="secondary-button" type="submit" disabled>合并</button>
             </form>
-            <button id="speaker-undo" class="secondary-button" type="button" disabled>Undo last speaker edit</button>
+            <button id="speaker-undo" class="secondary-button" type="button" disabled>撤销上次编辑</button>
           </section>
           <ol id="detail-segments" class="detail-segments"></ol>
         </section>
 
         <section class="console-card provider-card">
           <div class="console-heading">
-            <div><span>R3 / PROVIDER</span><h3>Provider identity</h3></div>
-            <button id="provider-refresh" class="secondary-button" type="button">Refresh</button>
+            <div><span>服务设置</span><h3>翻译服务身份</h3></div>
+            <button id="provider-refresh" class="secondary-button" type="button">刷新</button>
           </div>
           <div id="provider-list" class="provider-list" aria-live="polite"></div>
           <div class="provider-editor">
             <label><span>Base URL</span><input id="provider-base-url" type="url" spellcheck="false" /></label>
-            <label><span>Model</span><input id="provider-model" type="text" spellcheck="false" /></label>
-            <label><span>Policy URL</span><input id="provider-policy-url" type="url" spellcheck="false" /></label>
-            <label><span>Data flow</span><textarea id="provider-data-flow" rows="3" spellcheck="false"></textarea></label>
+            <label><span>模型</span><input id="provider-model" type="text" spellcheck="false" /></label>
+            <label><span>隐私政策 URL</span><input id="provider-policy-url" type="url" spellcheck="false" /></label>
+            <label><span>数据流向</span><textarea id="provider-data-flow" rows="3" spellcheck="false"></textarea></label>
           </div>
-          <button id="provider-save-profile" class="secondary-button" type="button" disabled>Save provider profile</button>
+          <button id="provider-save-profile" class="secondary-button" type="button" disabled>保存服务配置</button>
           <label class="secret-row">
-            <span>Selected provider secret</span>
+            <span>当前服务密钥</span>
             <input id="provider-secret" type="password" autocomplete="off" spellcheck="false" />
           </label>
           <div class="provider-actions">
-            <button id="provider-save-secret" class="secondary-button" type="button" disabled>Save to OS vault</button>
-            <button id="provider-remove-secret" class="secondary-button danger" type="button" disabled>Remove from OS vault</button>
-            <button id="provider-test" class="secondary-button" type="button" disabled>Test provider</button>
+            <button id="provider-save-secret" class="secondary-button" type="button" disabled>保存到系统凭据</button>
+            <button id="provider-remove-secret" class="secondary-button danger" type="button" disabled>移除系统凭据</button>
+            <button id="provider-test" class="secondary-button" type="button" disabled>测试连接</button>
           </div>
           <p id="provider-status" class="copy-status" aria-live="polite"></p>
         </section>
 
         <section class="console-card governance-card">
           <div class="console-heading">
-            <div><span>R3 / GOVERNANCE</span><h3>Retention and deletion</h3></div>
-            <button id="delete-preview" class="secondary-button" type="button" disabled>Preview delete</button>
+            <div><span>数据治理</span><h3>保留与删除</h3></div>
+            <button id="delete-preview" class="secondary-button" type="button" disabled>预览删除</button>
           </div>
           <ul id="delete-preview-list" class="delete-preview-list"></ul>
           <div class="governance-actions">
-            <button id="delete-execute" class="secondary-button danger" type="button" disabled>Execute delete</button>
-            <button id="delete-restore" class="secondary-button" type="button" disabled>Restore</button>
+            <button id="delete-execute" class="secondary-button danger" type="button" disabled>执行删除</button>
+            <button id="delete-restore" class="secondary-button" type="button" disabled>恢复</button>
           </div>
           <p id="delete-status" class="copy-status" aria-live="polite"></p>
         </section>
 
         <section class="console-card summary-card">
           <div class="console-heading">
-            <div><span>R4 / SUMMARY</span><h3>Chinese structured summary</h3></div>
-            <button id="summary-start" class="secondary-button" type="button" disabled>Start</button>
+            <div><span>摘要</span><h3>中文结构化摘要</h3></div>
+            <button id="summary-start" class="secondary-button" type="button" disabled>开始</button>
           </div>
           <label class="device-picker" for="summary-provider">
-            <span>Summary provider (explicit selection required)</span>
+            <span>摘要服务（必须明确选择）</span>
             <select id="summary-provider">
-              <option value="">Select a provider for this summary...</option>
+              <option value="">选择本次摘要服务...</option>
             </select>
           </label>
           <p class="privacy-copy">
-            Local providers keep durable transcript text on this device. LAN and cloud providers
-            receive the full durable transcript, may charge for usage, and apply their own privacy policy.
+            本地服务会把完整会议文字留在此电脑。LAN 和云端服务会接收完整会议文字，可能产生费用，并适用其隐私政策。
           </p>
           <div class="summary-actions">
-            <button id="summary-cancel" class="secondary-button" type="button" disabled>Cancel</button>
-            <button id="summary-retry" class="secondary-button" type="button" disabled>Retry new version</button>
+            <button id="summary-cancel" class="secondary-button" type="button" disabled>取消</button>
+            <button id="summary-retry" class="secondary-button" type="button" disabled>重试新版本</button>
           </div>
-          <div id="summary-output" class="summary-output">No summary job.</div>
+          <div id="summary-output" class="summary-output">暂无摘要任务。</div>
         </section>
 
         <section class="console-card export-studio-card">
           <div class="console-heading">
-            <div><span>R4 / EXPORT</span><h3>Export studio</h3></div>
-            <button id="export-selected" class="secondary-button" type="button" disabled>Export selected</button>
+            <div><span>导出</span><h3>导出工作区</h3></div>
+            <button id="export-selected" class="secondary-button" type="button" disabled>导出所选内容</button>
           </div>
           <fieldset class="format-grid">
-            <legend>Export formats</legend>
+            <legend>导出格式</legend>
             <label><input type="checkbox" name="export-format" value="json" checked /> JSON</label>
             <label><input type="checkbox" name="export-format" value="markdown" checked /> Markdown</label>
             <label><input type="checkbox" name="export-format" value="txt" checked /> TXT</label>
@@ -477,13 +509,13 @@ element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
             <label><input type="checkbox" name="export-format" value="pdf" /> PDF</label>
           </fieldset>
           <fieldset class="format-grid">
-            <legend>Export content options</legend>
-            <label><input id="export-original" type="checkbox" checked /> original</label>
-            <label><input id="export-translation" type="checkbox" checked /> translation</label>
-            <label><input id="export-bilingual" type="checkbox" checked /> bilingual</label>
-            <label><input id="export-speaker" type="checkbox" checked aria-describedby="export-speaker-note" /> speaker <small id="export-speaker-note">Run speaker diarization before exporting speaker labels.</small></label>
-            <label><input id="export-summary" type="checkbox" checked /> summary</label>
-            <label><input id="export-timestamp" type="checkbox" checked /> timestamp</label>
+            <legend>导出内容</legend>
+            <label><input id="export-original" type="checkbox" checked /> 原文</label>
+            <label><input id="export-translation" type="checkbox" checked /> 译文</label>
+            <label><input id="export-bilingual" type="checkbox" checked /> 双语</label>
+            <label><input id="export-speaker" type="checkbox" checked aria-describedby="export-speaker-note" /> 说话人 <small id="export-speaker-note">导出说话人标签前，请先分析说话人。</small></label>
+            <label><input id="export-summary" type="checkbox" checked /> 摘要</label>
+            <label><input id="export-timestamp" type="checkbox" checked /> 时间戳</label>
           </fieldset>
           <p id="export-studio-status" class="copy-status" aria-live="polite"></p>
         </section>
@@ -499,6 +531,10 @@ function element<T extends Element>(selector: string): T {
 }
 
 const controls = {
+  navButtons: Array.from(document.querySelectorAll<HTMLButtonElement>(".primary-nav-button")),
+  liveView: element<HTMLElement>("#live-view"),
+  recordsView: element<HTMLElement>("#records-view"),
+  settingsView: element<HTMLElement>("#settings-view"),
   systemDevice: element<HTMLSelectElement>("#system-device"),
   microphoneDevice: element<HTMLSelectElement>("#microphone-device"),
   recognitionLanguage: element<HTMLSelectElement>("#recognition-language"),
@@ -522,6 +558,7 @@ const controls = {
   deviceStatus: element<HTMLParagraphElement>("#device-status"),
   consent: element<HTMLInputElement>("#consent"),
   start: element<HTMLButtonElement>("#start"),
+  startStatus: element<HTMLParagraphElement>("#start-status"),
   pauseResume: element<HTMLButtonElement>("#pause-resume"),
   stop: element<HTMLButtonElement>("#stop"),
   error: element<HTMLParagraphElement>("#error"),
@@ -532,6 +569,10 @@ const controls = {
   empty: element<HTMLElement>("#empty-state"),
   transcript: element<HTMLOListElement>("#transcript"),
   transcriptAnnouncer: element<HTMLParagraphElement>("#transcript-announcer"),
+  followLatest: element<HTMLButtonElement>("#follow-latest"),
+  newContentCount: element<HTMLSpanElement>("#new-content-count"),
+  followState: element<HTMLSpanElement>("#follow-state"),
+  latestLine: element<HTMLParagraphElement>("#latest-line"),
   interim: element<HTMLElement>("#interim"),
   interimText: element<HTMLParagraphElement>("#interim p"),
   queue: element<HTMLElement>("#queue-depth"),
@@ -625,25 +666,65 @@ const controls = {
 };
 
 for (const [control, label] of [
-  [controls.systemDevice, "Windows system output device"],
-  [controls.microphoneDevice, "Windows microphone device"],
-  [controls.recognitionLanguage, "Meeting recognition language"],
-  [controls.asrModel, "Local ASR model"],
-  [controls.sourceMode, "Meeting audio source mode"],
-  [controls.translationProvider, "Translation provider preset"],
-  [controls.translationLanguage, "Translation target language"],
-  [controls.librarySearch, "Search meeting library"],
-  [controls.libraryTags, "Filter meeting library by tags"],
-  [controls.detailSequence, "Jump to detail segment number"],
-  [controls.speakerVersionInput, "Speaker version number to load"],
-  [controls.speakerRenameId, "Speaker to rename"],
-  [controls.speakerRenameName, "New speaker display name"],
-  [controls.speakerMergeFrom, "Speaker to merge from"],
-  [controls.speakerMergeInto, "Speaker to merge into"],
-  [controls.speakerMergeName, "Optional merged speaker display name"],
+  [controls.systemDevice, "Windows 系统输出设备"],
+  [controls.microphoneDevice, "Windows 麦克风设备"],
+  [controls.recognitionLanguage, "本次会议识别语言"],
+  [controls.asrModel, "本地识别模型"],
+  [controls.sourceMode, "会议音源模式"],
+  [controls.translationProvider, "翻译服务预设"],
+  [controls.translationLanguage, "译文目标语言"],
+  [controls.librarySearch, "搜索会议记录"],
+  [controls.libraryTags, "按标签筛选会议记录"],
+  [controls.detailSequence, "跳转到段落编号"],
+  [controls.speakerVersionInput, "要读取的说话人版本号"],
+  [controls.speakerRenameId, "要重命名的说话人"],
+  [controls.speakerRenameName, "新的说话人显示名称"],
+  [controls.speakerMergeFrom, "要合并的来源说话人"],
+  [controls.speakerMergeInto, "要合并到的目标说话人"],
+  [controls.speakerMergeName, "可选的合并后说话人名称"],
 ] as const) {
   control.setAttribute("aria-label", label);
 }
+
+type AppView = "live" | "records" | "settings";
+
+function appendPanel(parent: HTMLElement, selector: string): void {
+  const panel = document.querySelector<HTMLElement>(selector);
+  if (panel !== null) parent.append(panel);
+}
+
+function organizePrimaryViews(): void {
+  appendPanel(controls.recordsView, ".history-panel");
+  appendPanel(controls.recordsView, ".retry-panel");
+  appendPanel(controls.recordsView, ".recovery-panel");
+  appendPanel(controls.recordsView, ".library-card");
+  appendPanel(controls.recordsView, ".detail-card");
+  appendPanel(controls.recordsView, ".summary-card");
+  appendPanel(controls.recordsView, ".export-studio-card");
+  appendPanel(controls.recordsView, ".governance-card");
+  appendPanel(controls.settingsView, ".translation-panel");
+  appendPanel(controls.settingsView, ".storage-panel");
+  appendPanel(controls.settingsView, ".provider-card");
+  const console = document.querySelector<HTMLElement>(".r3r4-console");
+  console?.remove();
+}
+
+function setActiveView(view: AppView): void {
+  for (const button of controls.navButtons) {
+    const active = button.dataset.view === view;
+    button.setAttribute("aria-pressed", String(active));
+  }
+  for (const [panel, panelView] of [
+    [controls.liveView, "live"],
+    [controls.recordsView, "records"],
+    [controls.settingsView, "settings"],
+  ] as const) {
+    panel.hidden = panelView !== view;
+  }
+}
+
+organizePrimaryViews();
+setActiveView("live");
 
 let latest: MvpSnapshot | null = null;
 let lastExport: MvpExportResult | null = null;
@@ -674,6 +755,9 @@ let selectedProviderId: string | null = null;
 let deletePreviewState: DeletePreview | null = null;
 let summaryJob: SummaryJob | null = null;
 let summaryPollTimer: number | null = null;
+let startUiState: StartUiState = { phase: "idle", message: "" };
+let transcriptFollowState: TranscriptFollowState = returnToLatest();
+let providerProbeStates = new Map<string, ProbeUiState>();
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 const ASR_MODEL_PREFERENCE_KEY = "meetingrelay.asr-model.v1";
 const R3_PAGE_SIZE = 50;
@@ -694,8 +778,68 @@ const LANGUAGE_LABELS: Record<MvpRecognitionLanguage, string> = {
 };
 const MEETING_LANGUAGE_LABELS: Record<MeetingListPage["items"][number]["language"], string> = {
   ...LANGUAGE_LABELS,
-  unknown: "未知 · UNKNOWN",
+  unknown: "未知",
 };
+const LIFECYCLE_LABELS: Record<MvpSnapshot["lifecycle"], string> = {
+  booting: "启动中",
+  ready: "就绪",
+  starting: "启动中",
+  recording: "录制中",
+  paused: "已暂停",
+  stopping: "停止中",
+  error: "异常",
+};
+const MEETING_STATUS_LABELS: Record<string, string> = {
+  ready: "就绪",
+  recording: "录制中",
+  paused: "已暂停",
+  completed: "已完成",
+  interrupted: "已中断",
+  error: "异常",
+};
+const SUMMARY_STATUS_LABELS: Record<string, string> = {
+  idle: "无摘要",
+  queued: "排队中",
+  chunking: "分段中",
+  combining: "合并中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+const TRANSLATION_STATUS_LABELS: Record<string, string> = {
+  disabled: "关闭",
+  pending: "待处理",
+  completed: "已完成",
+  failed: "失败",
+  skipped: "已跳过",
+};
+const SEARCH_SCOPE_LABELS: Record<string, string> = {
+  original: "原文",
+  translation: "译文",
+  summary: "摘要",
+  speaker: "说话人",
+};
+const PROVIDER_CLASS_LABELS: Record<string, string> = {
+  local: "本地",
+  lan: "局域网",
+  cloud: "云端",
+};
+const SECRET_STATE_LABELS: Record<string, string> = {
+  missing: "缺失",
+  present: "已保存",
+  not_required: "不需要",
+  unsupported: "不支持",
+};
+const PROVIDER_TEST_STATUS_LABELS: Record<string, string> = {
+  untested: "未测试",
+  passed: "成功",
+  failed: "失败",
+};
+
+function labelFor(labels: Record<string, string>, value: string | null | undefined): string {
+  if (value === null || value === undefined || value.length === 0) return "未知";
+  return labels[value] ?? value;
+}
 
 const TRANSLATION_PROVIDER_URLS = {
   ollama: "http://127.0.0.1:11434/v1",
@@ -709,6 +853,28 @@ const TRANSLATION_PROVIDER_URLS = {
 
 function currentRecognitionLanguage(): MvpRecognitionLanguage {
   return parseMvpRecognitionLanguage(controls.recognitionLanguage.value);
+}
+
+function renderStartUiState(): void {
+  controls.start.dataset.phase = startUiState.phase;
+  controls.start.setAttribute("aria-busy", String(startUiState.phase === "running"));
+  controls.startStatus.dataset.status = startUiState.phase;
+  controls.startStatus.textContent = startUiState.message;
+  if (startUiState.phase === "running") {
+    controls.start.textContent = "正在启动...";
+  } else {
+    controls.start.replaceChildren();
+    const mark = document.createElement("span");
+    mark.className = "record-mark";
+    controls.start.append(mark, "开始实时转写");
+  }
+}
+
+function updateTranscriptFollowControls(): void {
+  controls.followLatest.hidden = !transcriptFollowState.showJumpButton;
+  controls.newContentCount.textContent = `${transcriptFollowState.unseenCount} 条新内容`;
+  controls.followState.textContent = transcriptFollowState.announcement;
+  controls.followState.dataset.following = String(transcriptFollowState.followLatest);
 }
 
 function currentAsrModelId(): string | null {
@@ -935,7 +1101,7 @@ function renderTranslationControls(active: boolean): void {
   } else if (active) {
     controls.translationStatus.dataset.status = requiresInsecureHttp ? "warning" : "ready";
     controls.translationStatus.textContent = requiresInsecureHttp
-      ? "会议进行中，已允许远程明文 HTTP；Token 和 final 原文可能被读取或篡改。"
+      ? "会议进行中，已允许远程明文 HTTP；Token 和确认后的原文可能被读取或篡改。"
       : "会议进行中，翻译配置已锁定。";
   } else if (
     !translationTesting &&
@@ -943,7 +1109,7 @@ function renderTranslationControls(active: boolean): void {
   ) {
     controls.translationStatus.dataset.status = requiresInsecureHttp ? "warning" : "ready";
     controls.translationStatus.textContent = requiresInsecureHttp
-      ? "已允许远程明文 HTTP；Token 和 final 原文可能被读取或篡改。"
+      ? "已允许远程明文 HTTP；Token 和确认后的原文可能被读取或篡改。"
       : "配置已就绪；建议开始前测试连接。";
   }
 }
@@ -1129,7 +1295,7 @@ function renderSource(source: AudioSourceSnapshot, paused: boolean): void {
           : source.status === "disabled"
             ? "未启用"
             : "异常";
-  element<HTMLElement>(`#${source.id}-frames`).textContent = `${source.frames} frames`;
+  element<HTMLElement>(`#${source.id}-frames`).textContent = `${source.frames} 帧`;
   element<HTMLElement>(`#${source.id}-level`).style.transform = `scaleX(${source.peak})`;
   card.setAttribute(
     "aria-label",
@@ -1175,7 +1341,7 @@ function renderExports(snapshot: MvpSnapshot): void {
 
 function renderOverlayToggle(snapshot: MvpSnapshot): void {
   controls.overlayToggle.disabled = snapshot.meetingId === null && snapshot.interim === null && snapshot.finals.length === 0;
-  controls.overlayToggle.textContent = overlayVisible ? "Hide overlay" : "Show overlay";
+  controls.overlayToggle.textContent = overlayVisible ? "隐藏悬浮字幕" : "显示悬浮字幕";
   controls.overlayToggle.setAttribute("aria-pressed", String(overlayVisible));
 }
 
@@ -1245,10 +1411,10 @@ function renderSpeakerWorkspace(): void {
   const canMerge = version !== null && viewingLatest && version.identities.length > 1;
   controls.speakerRun.disabled = !hasMeeting;
   controls.speakerRefresh.disabled = !hasMeeting;
-  controls.speakerVersion.textContent = version === null ? "none" : String(version.version);
+  controls.speakerVersion.textContent = version === null ? "无" : String(version.version);
   controls.speakerLatestVersion.textContent =
-    latestVersion === null ? "none" : String(latestVersion.version);
-  controls.speakerAlgorithm.textContent = version?.algorithm ?? "not run";
+    latestVersion === null ? "无" : String(latestVersion.version);
+  controls.speakerAlgorithm.textContent = version?.algorithm ?? "未运行";
   controls.speakerVersionInput.disabled = latestVersion === null;
   controls.speakerVersionInput.min = "1";
   controls.speakerVersionInput.max = latestVersion === null ? "1" : String(latestVersion.version);
@@ -1257,18 +1423,18 @@ function renderSpeakerWorkspace(): void {
   controls.speakerEditNote.dataset.status = viewingLatest ? "editable" : "readonly";
   controls.speakerEditNote.textContent =
     version === null
-      ? "Run speaker diarization before editing or exporting speaker labels."
+      ? "请先分析说话人，再编辑或导出说话人标签。"
       : viewingLatest
-        ? "Editing is enabled for the latest speaker version."
-        : `Viewing historical speaker version ${version.version}; rename, merge, and undo are disabled until you return to latest ${latestVersion?.version ?? "version"}.`;
+        ? "当前为最新说话人版本，可以编辑。"
+        : `正在查看历史说话人版本 ${version.version}；返回最新版本 ${latestVersion?.version ?? ""} 后才能重命名、合并或撤销。`;
   const preservedStatus = controls.speakerStatus.dataset.status ?? "";
   if (!["loading", "failed", "unavailable", "skipped"].includes(preservedStatus)) {
     controls.speakerStatus.textContent =
       version === null
         ? hasMeeting
-          ? "No completed speaker version yet."
-          : "Select a meeting."
-        : `${version.operation} completed · ${version.identities.length} speakers · ${version.assignments.length} assignments`;
+          ? "尚无已完成的说话人版本。"
+          : "请选择会议。"
+        : `${version.operation} 已完成 · ${version.identities.length} 位说话人 · ${version.assignments.length} 条分配`;
     controls.speakerStatus.dataset.status = version === null ? "empty" : "completed";
   }
   controls.speakerIdentities.replaceChildren(
@@ -1277,7 +1443,7 @@ function renderSpeakerWorkspace(): void {
       const name = document.createElement("strong");
       const detail = document.createElement("span");
       name.textContent = identity.displayName;
-      detail.textContent = `${identity.speakerId} · ${counts.get(identity.speakerId) ?? 0} assigned segment(s)`;
+      detail.textContent = `${identity.speakerId} · 已分配 ${counts.get(identity.speakerId) ?? 0} 段`;
       item.append(name, detail);
       return item;
     }) ?? []),
@@ -1298,15 +1464,15 @@ function renderSpeakerWorkspace(): void {
   controls.exportSpeaker.closest("label")?.setAttribute(
     "title",
     version === null
-      ? "Run speaker diarization before including speaker labels in export."
-      : `Speaker version ${version.version} will be included.`,
+      ? "导出说话人标签前，请先分析说话人。"
+      : `将包含说话人版本 ${version.version}。`,
   );
   const speakerExportNote = document.querySelector<HTMLElement>("#export-speaker-note");
   if (speakerExportNote !== null) {
     speakerExportNote.textContent =
       version === null
-        ? "Run speaker diarization before exporting speaker labels."
-        : `Speaker version ${version.version} ready.`;
+        ? "导出说话人标签前，请先分析说话人。"
+        : `说话人版本 ${version.version} 已就绪。`;
   }
 }
 
@@ -1316,7 +1482,7 @@ function renderMeetingLibrary(): void {
   if (page === null) {
     controls.libraryList.replaceChildren();
     controls.libraryMore.disabled = true;
-    controls.libraryStatus.textContent = "Library not loaded.";
+    controls.libraryStatus.textContent = "会议列表尚未加载。";
     return;
   }
   controls.libraryList.replaceChildren(
@@ -1329,13 +1495,13 @@ function renderMeetingLibrary(): void {
       button.addEventListener("click", async () => {
         await loadMeetingDetail(meeting.meetingId);
       });
-      meta.textContent = `${meeting.status} · ${formatElapsed(meeting.durationMs)} · ${MEETING_LANGUAGE_LABELS[meeting.language]} · summary ${meeting.summaryStatus} · ${meeting.tags.join(", ") || "no tags"}`;
+      meta.textContent = `${labelFor(MEETING_STATUS_LABELS, meeting.status)} · ${formatElapsed(meeting.durationMs)} · ${MEETING_LANGUAGE_LABELS[meeting.language]} · 摘要 ${labelFor(SUMMARY_STATUS_LABELS, meeting.summaryStatus)} · ${meeting.tags.join(", ") || "无标签"}`;
       item.append(button, meta);
       return item;
     }),
   );
   controls.libraryMore.disabled = page.nextCursor === null;
-  controls.libraryStatus.textContent = `${page.items.length}/${page.total} meetings · query ${page.elapsedMs} ms`;
+  controls.libraryStatus.textContent = `${page.items.length}/${page.total} 场会议 · 查询 ${page.elapsedMs} ms`;
 }
 
 function renderSearchResults(): void {
@@ -1350,11 +1516,11 @@ function renderSearchResults(): void {
       const button = document.createElement("button");
       const meta = document.createElement("span");
       button.type = "button";
-      button.textContent = `${hit.scope} · ${hit.snippet}`;
+      button.textContent = `${labelFor(SEARCH_SCOPE_LABELS, hit.scope)} · ${hit.snippet}`;
       button.addEventListener("click", async () => {
         await loadMeetingDetail(hit.meetingId, hit.segmentId, hit.sequence);
       });
-      meta.textContent = `${hit.meetingTitle} · ${hit.sequence === null ? "summary" : `#${hit.sequence}`} · score ${hit.score.toFixed(2)}`;
+      meta.textContent = `${hit.meetingTitle} · ${hit.sequence === null ? "摘要" : `#${hit.sequence}`} · 匹配 ${hit.score.toFixed(2)}`;
       item.append(button, meta);
       return item;
     }),
@@ -1364,7 +1530,7 @@ function renderSearchResults(): void {
 function renderMeetingDetail(): void {
   const detail = meetingDetail;
   if (detail === null) {
-    controls.detailSummary.textContent = "No meeting selected.";
+    controls.detailSummary.textContent = "尚未选择会议。";
     controls.detailTags.value = "";
     controls.detailSaveTags.disabled = true;
     controls.detailSegments.replaceChildren();
@@ -1373,7 +1539,7 @@ function renderMeetingDetail(): void {
   }
   const assignments = speakerAssignmentMap(speakerVersion);
   const names = speakerNameMap(speakerVersion);
-  controls.detailSummary.textContent = `${detail.meeting.title} · ${detail.meeting.status} · ${formatElapsed(detail.meeting.durationMs)} · ${detail.meeting.savedFinalCount} finals`;
+  controls.detailSummary.textContent = `${detail.meeting.title} · ${labelFor(MEETING_STATUS_LABELS, detail.meeting.status)} · ${formatElapsed(detail.meeting.durationMs)} · ${detail.meeting.savedFinalCount} 条确认文字`;
   controls.detailTags.value = detail.meeting.tags.join(", ");
   controls.detailSaveTags.disabled = false;
   renderSpeakerWorkspace();
@@ -1393,13 +1559,13 @@ function renderMeetingDetail(): void {
       speaker.className = "speaker-label";
       speaker.textContent =
         assignment === undefined
-          ? "Speaker: unassigned"
-          : `Speaker: ${names.get(assignment.speakerId) ?? assignment.speakerId} · confidence ${Math.round(assignment.confidence * 100)}%`;
+          ? "说话人：未分配"
+          : `说话人：${names.get(assignment.speakerId) ?? assignment.speakerId} · 置信度 ${Math.round(assignment.confidence * 100)}%`;
       text.textContent = segment.text;
       translation.textContent =
         segment.translationStatus === "completed"
           ? segment.translationText ?? ""
-          : `translation ${segment.translationStatus}`;
+          : `译文状态 ${labelFor(TRANSLATION_STATUS_LABELS, segment.translationStatus)}`;
       item.append(header, speaker, text, translation);
       return item;
     }),
@@ -1410,13 +1576,13 @@ function renderProviderProfiles(): void {
   const summaryProviderId = controls.summaryProvider.value;
   const summaryPlaceholder = document.createElement("option");
   summaryPlaceholder.value = "";
-  summaryPlaceholder.textContent = "Select a provider for this summary...";
+  summaryPlaceholder.textContent = "选择本次摘要服务...";
   controls.summaryProvider.replaceChildren(
     summaryPlaceholder,
     ...providerProfiles.map((profile) => {
       const option = document.createElement("option");
       option.value = profile.profileId;
-      option.textContent = `${profile.label} · ${profile.class} · ${profile.model}`;
+      option.textContent = `${profile.label} · ${labelFor(PROVIDER_CLASS_LABELS, profile.class)} · ${profile.model}`;
       return option;
     }),
   );
@@ -1432,8 +1598,8 @@ function renderProviderProfiles(): void {
       button.className = "provider-profile";
       button.dataset.selected = String(profile.profileId === selectedProviderId);
       button.setAttribute("aria-pressed", String(profile.profileId === selectedProviderId));
-      button.textContent = `${profile.label} · ${profile.class} · v${profile.configVersion} · secret ${profile.secretState} · test ${profile.lastTestStatus}`;
-      button.title = `${profile.baseUrl}\n${profile.model}\n${profile.dataFlow}${profile.policyUrl ? `\nPolicy: ${profile.policyUrl}` : ""}${profile.lastError ? `\nError: ${profile.lastError}` : ""}`;
+      button.textContent = `${profile.label} · ${labelFor(PROVIDER_CLASS_LABELS, profile.class)} · v${profile.configVersion} · 密钥 ${labelFor(SECRET_STATE_LABELS, profile.secretState)} · 测试 ${labelFor(PROVIDER_TEST_STATUS_LABELS, profile.lastTestStatus)}`;
+      button.title = `${profile.baseUrl}\n${profile.model}\n${profile.dataFlow}${profile.policyUrl ? `\n隐私政策：${profile.policyUrl}` : ""}${profile.lastError ? `\n错误：${profile.lastError}` : ""}`;
       button.addEventListener("click", () => {
         selectedProviderId = profile.profileId;
         controls.providerSecret.value = "";
@@ -1443,6 +1609,8 @@ function renderProviderProfiles(): void {
     }),
   );
   const selected = providerProfiles.find((profile) => profile.profileId === selectedProviderId);
+  const selectedProbe =
+    selected === undefined ? undefined : providerProbeStates.get(selected.profileId);
   controls.providerBaseUrl.value = selected?.baseUrl ?? "";
   controls.providerModel.value = selected?.model ?? "";
   controls.providerPolicyUrl.value = selected?.policyUrl ?? "";
@@ -1460,10 +1628,16 @@ function renderProviderProfiles(): void {
     selected === undefined || selected.class === "local" || selected.secretState === "unsupported";
   controls.providerRemoveSecret.disabled = !providerSecretCanBeRemoved(selected);
   controls.providerTest.disabled = selected === undefined;
-  controls.providerStatus.textContent =
-    selected === undefined
-      ? "Select a provider."
-      : `${selected.label}: ${selected.baseUrl} · ${selected.model} · ${selected.dataFlow}`;
+  if (selected === undefined) {
+    controls.providerStatus.textContent = "请选择服务。";
+    controls.providerStatus.dataset.status = "idle";
+  } else if (selectedProbe !== undefined) {
+    controls.providerStatus.dataset.status = selectedProbe.phase;
+    controls.providerStatus.textContent = selectedProbe.message;
+  } else {
+    controls.providerStatus.dataset.status = "idle";
+    controls.providerStatus.textContent = `${selected.label}: ${selected.baseUrl} · ${selected.model} · ${selected.dataFlow}`;
+  }
 }
 
 function providerSecretCanBeRemoved(profile: ProviderProfile | undefined): boolean {
@@ -1485,8 +1659,8 @@ function renderDeletePreview(): void {
   controls.deleteRestore.disabled = preview === null || !preview.canRestore;
   controls.deleteStatus.textContent =
     preview === null
-      ? "No delete preview."
-      : `Preview ${preview.entries.length} entries · ${formatBytes(preview.willDeleteBytes)} · recovery ${preview.recoveryWindowSeconds}s`;
+      ? "暂无删除预览。"
+      : `预览 ${preview.entries.length} 项 · ${formatBytes(preview.willDeleteBytes)} · 可恢复 ${preview.recoveryWindowSeconds}s`;
 }
 
 function renderSummaryJob(): void {
@@ -1495,25 +1669,25 @@ function renderSummaryJob(): void {
   controls.summaryRetry.disabled =
     job === null || !job.canRetry || controls.summaryProvider.value === "";
   if (job === null) {
-    controls.summaryOutput.textContent = "No summary job.";
+    controls.summaryOutput.textContent = "暂无摘要任务。";
     return;
   }
   const progress = `${job.completedChunks}/${job.totalChunks}`;
   if (job.result === null) {
-    controls.summaryOutput.textContent = `${job.status} · version ${job.version} · chunks ${progress}${job.message ? ` · ${job.message}` : ""}`;
+    controls.summaryOutput.textContent = `${labelFor(SUMMARY_STATUS_LABELS, job.status)} · 版本 ${job.version} · 分段 ${progress}${job.message ? ` · ${job.message}` : ""}`;
     return;
   }
   controls.summaryOutput.replaceChildren(
-    sectionBlock("Overview", [job.result.overview]),
-    sectionBlock("Actions", job.result.actions),
-    sectionBlock("Decisions", job.result.decisions),
-    sectionBlock("Open questions", job.result.openQuestions),
+    sectionBlock("概览", [job.result.overview]),
+    sectionBlock("行动项", job.result.actions),
+    sectionBlock("决定", job.result.decisions),
+    sectionBlock("待确认问题", job.result.openQuestions),
     sectionBlock(
-      "Citations",
+      "引用",
       job.result.citations.map((citation) =>
         citation.sequence === null
-          ? `${citation.label} (unlinked)`
-          : `${citation.label} → segment ${citation.sequence}`,
+          ? `${citation.label}（未关联）`
+          : `${citation.label} -> 段落 ${citation.sequence}`,
       ),
     ),
   );
@@ -1524,7 +1698,7 @@ function sectionBlock(title: string, lines: readonly string[]): HTMLElement {
   const heading = document.createElement("strong");
   const list = document.createElement("ul");
   heading.textContent = title;
-  for (const line of lines.length > 0 ? lines : ["None"]) {
+  for (const line of lines.length > 0 ? lines : ["无"]) {
     const item = document.createElement("li");
     item.textContent = line;
     list.append(item);
@@ -1633,7 +1807,7 @@ function updateTranscriptRow(item: HTMLLIElement, segment: TranscriptSegment): v
     try {
       const location = await locateSegmentAudio(segment);
       if (!location.available || location.path === null) {
-        controls.error.textContent = `第 ${segment.sequence} 段暂无可回听音频：${location.reason ?? "raw audio 未保存"}`;
+        controls.error.textContent = `第 ${segment.sequence} 段暂无可回听音频：${location.reason ?? "原始音频未保存"}`;
         audio.hidden = true;
         audio.removeAttribute("src");
         return;
@@ -1664,7 +1838,7 @@ function renderTranscript(finals: readonly TranscriptSegment[]): void {
   const desiredKeys = finals.map((segment) => segment.sequence);
   const plan = planTranscriptReconciliation(currentKeys, desiredKeys);
   const rowByKey = new Map(currentRows.map((row) => [row.dataset.sequence as string, row]));
-  const followLatest =
+  const wasAtBottom =
     controls.transcript.scrollHeight -
       controls.transcript.scrollTop -
       controls.transcript.clientHeight <
@@ -1701,12 +1875,19 @@ function renderTranscript(finals: readonly TranscriptSegment[]): void {
     if (latestInserted) {
       controls.transcriptAnnouncer.textContent = `已保存第 ${latestInserted.sequence} 条：${latestInserted.text}`;
     }
-    if (followLatest) {
+    transcriptFollowState = nextTranscriptFollowState({
+      followLatest: transcriptFollowState.followLatest,
+      wasAtBottom,
+      insertedCount: plan.insertions.length,
+      previousUnseenCount: transcriptFollowState.unseenCount,
+    });
+    if (transcriptFollowState.followLatest) {
       controls.transcript.scrollTop = controls.transcript.scrollHeight;
     } else {
       controls.transcript.scrollTop +=
         controls.transcript.scrollHeight - previousScrollHeight;
     }
+    updateTranscriptFollowControls();
   }
 }
 
@@ -1730,7 +1911,7 @@ function render(snapshot: MvpSnapshot): void {
     snapshot.modelReady &&
     sourceReady &&
     ["ready", "completed", "interrupted"].includes(snapshot.durabilityStatus);
-  controls.lifecycle.textContent = snapshot.lifecycle.toUpperCase();
+  controls.lifecycle.textContent = LIFECYCLE_LABELS[snapshot.lifecycle];
   controls.lifecycle.dataset.state = snapshot.lifecycle;
   controls.elapsed.textContent = formatElapsed(snapshot.elapsedMs);
   controls.model.textContent = snapshot.modelReady
@@ -1738,6 +1919,7 @@ function render(snapshot: MvpSnapshot): void {
     : `不可用 · ${snapshot.modelLabel}`;
   controls.model.dataset.ready = String(snapshot.modelReady);
   controls.start.disabled =
+    startUiState.phase === "running" ||
     !ready ||
     languagePreparing ||
     translationTesting ||
@@ -1746,6 +1928,7 @@ function render(snapshot: MvpSnapshot): void {
     preparedAsrModelId !== currentAsrModelId() ||
     !controls.consent.checked ||
     currentAudioDeviceSelection() === null;
+  renderStartUiState();
   controls.pauseResume.disabled = !["recording", "paused"].includes(snapshot.lifecycle);
   controls.pauseResume.textContent = paused ? "继续转写" : "暂停转写";
   controls.pauseResume.dataset.state =
@@ -1796,8 +1979,8 @@ function render(snapshot: MvpSnapshot): void {
                 : "本地持久化正常";
   controls.storageDetail.textContent =
     snapshot.durabilityStatus === "paused"
-      ? "SQLite/WAL · 暂停期间音频不进入转写，已提交 final 保持可恢复"
-      : "SQLite/WAL · final 仅在 commit ACK 或 DB reopen 后标为已保存";
+      ? "SQLite/WAL · 暂停期间音频不进入转写，已提交的确认文字保持可恢复"
+      : "SQLite/WAL · 确认文字仅在数据库提交成功或重新打开后标为已保存";
   controls.savedCount.textContent = snapshot.savedFinalCount;
   controls.visibleWindow.textContent = `${snapshot.finals.length} / ${snapshot.totalFinalCount}`;
   controls.meetingId.textContent = snapshot.meetingId ?? "未打开";
@@ -1821,8 +2004,13 @@ function render(snapshot: MvpSnapshot): void {
 
   renderTranscript(snapshot.finals);
   controls.empty.hidden = snapshot.finals.length > 0 || snapshot.interim !== null || active;
-  controls.interim.hidden = snapshot.interim === null;
+  controls.interim.hidden = true;
   controls.interimText.textContent = snapshot.interim?.text ?? "";
+  const latestFinal = snapshot.finals.at(-1);
+  controls.latestLine.textContent =
+    snapshot.interim?.text ?? latestFinal?.text ?? "等待实时文字。";
+  controls.latestLine.dataset.kind = snapshot.interim === null ? "final" : "interim";
+  updateTranscriptFollowControls();
   renderRecent(snapshot);
   renderExports(snapshot);
 }
@@ -1902,7 +2090,7 @@ async function exportMeetingWithOptions(): Promise<void> {
     }),
   );
   controls.exportStudioStatus.dataset.status = "success";
-  controls.exportStudioStatus.textContent = `Exported ${lastExport.artifacts.length} artifact(s).`;
+  controls.exportStudioStatus.textContent = `已导出 ${lastExport.artifacts.length} 个文件。`;
   if (latest) render(latest);
 }
 
@@ -1927,7 +2115,7 @@ async function loadMeetingLibrary(cursor: string | null = null, append = false):
           : page;
       meetingPage = null;
       renderMeetingLibrary();
-      controls.libraryStatus.textContent = `${searchPage.hits.length}/${searchPage.total} hits · query ${searchPage.elapsedMs} ms`;
+      controls.libraryStatus.textContent = `${searchPage.hits.length}/${searchPage.total} 条结果 · 查询 ${searchPage.elapsedMs} ms`;
       return;
     }
     searchPage = null;
@@ -1999,7 +2187,7 @@ async function runSpeakerDiarization(): Promise<void> {
   const meetingId = selectedMeetingId();
   if (meetingId === null) return;
   controls.speakerStatus.dataset.status = "loading";
-  controls.speakerStatus.textContent = "Running speaker diarization...";
+  controls.speakerStatus.textContent = "正在分析说话人...";
   renderSpeakerWorkspace();
   const result = parseSpeakerDiarizationResult(
     await invoke<unknown>("mvp_speaker_diarize", { meetingId }),
@@ -2008,15 +2196,15 @@ async function runSpeakerDiarization(): Promise<void> {
     latestSpeakerVersion = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
     speakerVersion = latestSpeakerVersion;
     controls.speakerStatus.dataset.status = "completed";
-    controls.speakerStatus.textContent = `Speaker diarization completed at version ${result.version}.`;
+    controls.speakerStatus.textContent = `说话人分析已完成，版本 ${result.version}。`;
   } else {
     controls.speakerStatus.dataset.status = result.status;
     controls.speakerStatus.textContent =
       result.status === "unavailable"
-        ? `Speaker diarization unavailable: ${result.reason ?? "raw audio is required"}`
+        ? `说话人分析不可用：${result.reason ?? "需要原始音频"}`
         : result.status === "failed"
-          ? `Speaker diarization failed: ${result.reason ?? "unknown failure"}`
-          : `Speaker diarization skipped: ${result.reason ?? "no eligible transcript finals"}`;
+          ? `说话人分析失败：${result.reason ?? "未知失败"}`
+          : `已跳过说话人分析：${result.reason ?? "没有可分析的确认文字"}`;
   }
   renderMeetingDetail();
 }
@@ -2122,6 +2310,7 @@ async function saveMeetingTags(): Promise<void> {
 
 async function loadProviderProfiles(): Promise<void> {
   providerProfiles = parseProviderProfiles(await invoke<unknown>("mvp_provider_profiles"));
+  providerProbeStates = mergeProbeStates(providerProbeStates, providerProfiles);
   if (
     selectedProviderId === null ||
     !providerProfiles.some((profile) => profile.profileId === selectedProviderId)
@@ -2152,41 +2341,64 @@ async function saveProviderProfile(): Promise<void> {
     await invoke<unknown>("mvp_save_provider_profile", { profile }),
   );
   selectedProviderId = profile.profileId;
-  controls.providerStatus.dataset.status = "success";
-  controls.providerStatus.textContent = "Provider profile saved; config version refreshed.";
+  providerProbeStates.set(profile.profileId, {
+    profileId: profile.profileId,
+    phase: "success",
+    message: "服务配置已保存，配置版本已刷新；建议重新测试连接。",
+    latencyMs: null,
+    updatedAtMs: Date.now(),
+  });
   renderProviderProfiles();
 }
 
 async function saveProviderSecret(): Promise<void> {
   if (selectedProviderId === null) return;
+  const profileId = selectedProviderId;
   await invoke<unknown>("mvp_set_provider_secret", {
-    profileId: selectedProviderId,
+    profileId,
     secret: controls.providerSecret.value,
   });
   controls.providerSecret.value = "";
-  controls.providerStatus.dataset.status = "success";
-  controls.providerStatus.textContent = "Secret stored in the OS credential vault.";
+  providerProbeStates.set(profileId, {
+    profileId,
+    phase: "success",
+    message: "密钥已保存到系统凭据；建议重新测试连接。",
+    latencyMs: null,
+    updatedAtMs: Date.now(),
+  });
   await loadProviderProfiles();
 }
 
 async function deleteProviderSecret(): Promise<void> {
   if (selectedProviderId === null) return;
+  const profileId = selectedProviderId;
   await invoke<unknown>("mvp_delete_provider_secret", {
-    profileId: selectedProviderId,
+    profileId,
   });
   controls.providerSecret.value = "";
+  providerProbeStates.set(profileId, {
+    profileId,
+    phase: "success",
+    message: "密钥已从系统凭据移除；需要密钥的服务将无法连接。",
+    latencyMs: null,
+    updatedAtMs: Date.now(),
+  });
   await loadProviderProfiles();
-  controls.providerStatus.dataset.status = "success";
-  controls.providerStatus.textContent = "Secret removed from the OS credential vault.";
 }
 
 async function testSelectedProvider(): Promise<void> {
   if (selectedProviderId === null) return;
+  const profileId = selectedProviderId;
   const probe = parseTranslationProbe(
-    await invoke<unknown>("mvp_test_provider", { profileId: selectedProviderId }),
+    await invoke<unknown>("mvp_test_provider", { profileId }),
   );
-  controls.providerStatus.dataset.status = "success";
-  controls.providerStatus.textContent = `Provider OK · ${probe.model} · ${probe.latencyMs} ms · ${probe.preview}`;
+  providerProbeStates.set(profileId, {
+    profileId,
+    phase: "success",
+    message: `连接成功 · ${probe.model} · ${probe.latencyMs} ms · ${probe.preview}`,
+    latencyMs: probe.latencyMs,
+    updatedAtMs: Date.now(),
+  });
   await loadProviderProfiles();
 }
 
@@ -2215,7 +2427,7 @@ async function executeDelete(): Promise<void> {
     }),
   );
   controls.deleteStatus.dataset.status = "success";
-  controls.deleteStatus.textContent = `Deleted ${result.entriesDeleted} entries · ${formatBytes(result.bytesDeleted)}${result.restoredUntil ? ` · restorable until ${result.restoredUntil}` : ""}`;
+  controls.deleteStatus.textContent = `已删除 ${result.entriesDeleted} 项 · ${formatBytes(result.bytesDeleted)}${result.restoredUntil ? ` · 可恢复至 ${result.restoredUntil}` : ""}`;
   await loadMeetingLibrary(null, false).catch(() => undefined);
 }
 
@@ -2224,7 +2436,7 @@ async function restoreDeletedMeeting(): Promise<void> {
   if (meetingId === null) return;
   const result = parseDeleteResult(await invoke<unknown>("mvp_delete_restore", { meetingId }));
   controls.deleteStatus.dataset.status = "success";
-  controls.deleteStatus.textContent = result.deleted ? "Restore did not complete." : "Meeting restored.";
+  controls.deleteStatus.textContent = result.deleted ? "恢复未完成。" : "会议已恢复。";
   deletePreviewState = null;
   renderDeletePreview();
   await loadMeetingLibrary(null, false).catch(() => undefined);
@@ -2240,11 +2452,11 @@ function selectedSummaryProvider(): ProviderProfile {
 
 function confirmSummaryProviderEgress(profile: ProviderProfile): boolean {
   if (profile.class === "local") return true;
-  const policy = profile.policyUrl ?? "No policy URL is configured";
+  const policy = profile.policyUrl ?? "未配置隐私政策 URL";
   return window.confirm(
-    `Send the full durable transcript to ${profile.label} (${profile.class.toUpperCase()})?\n\n` +
-      `Model: ${profile.model}\nData flow: ${profile.dataFlow}\nPolicy: ${policy}\n\n` +
-      "The transcript will leave this device. The provider may retain/process it and may charge for usage.",
+    `将完整会议文字发送到 ${profile.label}（${labelFor(PROVIDER_CLASS_LABELS, profile.class)}）？\n\n` +
+      `模型：${profile.model}\n数据流向：${profile.dataFlow}\n隐私政策：${policy}\n\n` +
+      "会议文字将离开此电脑。服务提供方可能保留或处理内容，并可能产生费用。",
   );
 }
 
@@ -2300,7 +2512,7 @@ function scheduleSummaryPoll(): void {
       renderSummaryJob();
       scheduleSummaryPoll();
     } catch (error) {
-      controls.summaryOutput.textContent = `Summary status failed: ${message(error)}`;
+      controls.summaryOutput.textContent = `读取摘要状态失败：${message(error)}`;
     }
   }, 750);
 }
@@ -2479,6 +2691,39 @@ function schedulePoll(): void {
   }, 150);
 }
 
+for (const button of controls.navButtons) {
+  button.addEventListener("click", () => {
+    const view = button.dataset.view;
+    if (view === "live" || view === "records" || view === "settings") {
+      setActiveView(view);
+    }
+  });
+}
+
+controls.transcript.addEventListener("scroll", () => {
+  const atBottom =
+    controls.transcript.scrollHeight -
+      controls.transcript.scrollTop -
+      controls.transcript.clientHeight <
+    72;
+  if (atBottom) {
+    transcriptFollowState = returnToLatest();
+  } else if (transcriptFollowState.followLatest) {
+    transcriptFollowState = {
+      ...transcriptFollowState,
+      followLatest: false,
+      announcement: "已暂停跟随，保留当前位置。",
+    };
+  }
+  updateTranscriptFollowControls();
+});
+
+controls.followLatest.addEventListener("click", () => {
+  transcriptFollowState = returnToLatest();
+  controls.transcript.scrollTop = controls.transcript.scrollHeight;
+  updateTranscriptFollowControls();
+});
+
 controls.consent.addEventListener("change", () => {
   if (latest) render(latest);
 });
@@ -2590,25 +2835,47 @@ controls.translationApiKey.addEventListener("input", () => {
 });
 
 controls.testTranslation.addEventListener("click", async () => {
+  if (translationTesting) return;
+  let profileId: string | null = null;
   translationTesting = true;
+  controls.testTranslation.disabled = true;
+  controls.testTranslation.setAttribute("aria-busy", "true");
   controls.translationStatus.dataset.status = "testing";
   controls.translationStatus.textContent = "正在连接所选服务并请求一条测试译文…";
   if (latest) render(latest);
   try {
-    const profileId = await persistTranslationProviderProfile();
+    profileId = await persistTranslationProviderProfile();
     if (profileId === null) throw new Error("TRANSLATION_PROVIDER_PROFILE_REQUIRED");
     const probe = parseTranslationProbe(
       await invoke<unknown>("mvp_test_provider", { profileId }),
     );
     controls.translationStatus.dataset.status = "success";
     controls.translationStatus.textContent = `连接成功 · ${probe.model} · ${probe.latencyMs} ms · ${probe.preview}`;
+    providerProbeStates.set(profileId, {
+      profileId,
+      phase: "success",
+      message: controls.translationStatus.textContent,
+      latencyMs: probe.latencyMs,
+      updatedAtMs: Date.now(),
+    });
     persistTranslationPreference();
   } catch (error) {
     controls.translationStatus.dataset.status = "error";
     controls.translationStatus.textContent = `连接失败：${message(error)}`;
+    if (profileId !== null) {
+      providerProbeStates.set(profileId, {
+        profileId,
+        phase: "error",
+        message: controls.translationStatus.textContent,
+        latencyMs: null,
+        updatedAtMs: Date.now(),
+      });
+    }
   } finally {
     translationTesting = false;
+    controls.testTranslation.setAttribute("aria-busy", "false");
     if (latest) render(latest);
+    else renderTranslationControls(false);
   }
 });
 
@@ -2655,7 +2922,10 @@ controls.asrModel.addEventListener("change", async () => {
 });
 
 controls.start.addEventListener("click", async () => {
+  if (!canBeginStart(startUiState)) return;
+  startUiState = beginStartUiState();
   controls.start.disabled = true;
+  renderStartUiState();
   controls.error.textContent = "";
   lastExport = null;
   lastClipboardText = null;
@@ -2679,10 +2949,14 @@ controls.start.addEventListener("click", async () => {
         ...selection,
       }),
     );
+    startUiState = finishStartUiState(true);
+    renderStartUiState();
     schedulePoll();
   } catch (error) {
+    startUiState = finishStartUiState(false, `无法开始：${message(error)}`);
     if (latest) render(latest);
     controls.error.textContent = `无法开始：${message(error)}`;
+    renderStartUiState();
   }
 });
 
@@ -2717,9 +2991,9 @@ controls.overlayToggle.addEventListener("click", async () => {
   try {
     await setOverlayVisible(!overlayVisible);
   } catch (error) {
-    controls.error.textContent = `Overlay control failed: ${message(error)}`;
+    controls.error.textContent = `悬浮字幕控制失败：${message(error)}`;
     await syncOverlayState().catch((syncError) => {
-      controls.error.textContent = `Overlay control failed: ${message(error)}; state refresh failed: ${message(syncError)}`;
+      controls.error.textContent = `悬浮字幕控制失败：${message(error)}；状态刷新失败：${message(syncError)}`;
     });
   }
 });
@@ -2755,7 +3029,7 @@ controls.libraryRefresh.addEventListener("click", async () => {
     await loadMeetingLibrary(null, false);
   } catch (error) {
     controls.libraryStatus.dataset.status = "error";
-    controls.libraryStatus.textContent = `Library refresh failed: ${message(error)}`;
+    controls.libraryStatus.textContent = `刷新会议列表失败：${message(error)}`;
   }
 });
 
@@ -2766,7 +3040,7 @@ controls.libraryMore.addEventListener("click", async () => {
     await loadMeetingLibrary(cursor, true);
   } catch (error) {
     controls.libraryStatus.dataset.status = "error";
-    controls.libraryStatus.textContent = `Next page failed: ${message(error)}`;
+    controls.libraryStatus.textContent = `加载下一页失败：${message(error)}`;
   }
 });
 
@@ -2776,7 +3050,7 @@ for (const input of [controls.librarySearch, controls.libraryTags]) {
       await loadMeetingLibrary(null, false);
     } catch (error) {
       controls.libraryStatus.dataset.status = "error";
-      controls.libraryStatus.textContent = `Filter failed: ${message(error)}`;
+      controls.libraryStatus.textContent = `筛选失败：${message(error)}`;
     }
   });
 }
@@ -2787,7 +3061,7 @@ controls.detailSaveTags.addEventListener("click", async () => {
     await saveMeetingTags();
   } catch (error) {
     controls.libraryStatus.dataset.status = "error";
-    controls.libraryStatus.textContent = `Save tags failed: ${message(error)}`;
+    controls.libraryStatus.textContent = `保存标签失败：${message(error)}`;
   } finally {
     controls.detailSaveTags.disabled = meetingDetail === null;
   }
@@ -2805,7 +3079,7 @@ controls.speakerRun.addEventListener("click", async () => {
     await runSpeakerDiarization();
   } catch (error) {
     controls.speakerStatus.dataset.status = "failed";
-    controls.speakerStatus.textContent = `Speaker diarization failed: ${message(error)}`;
+    controls.speakerStatus.textContent = `分析说话人失败：${message(error)}`;
   } finally {
     renderSpeakerWorkspace();
   }
@@ -2817,7 +3091,7 @@ controls.speakerRefresh.addEventListener("click", async () => {
     await refreshSpeakerVersion();
   } catch (error) {
     controls.speakerStatus.dataset.status = "failed";
-    controls.speakerStatus.textContent = `Speaker refresh failed: ${message(error)}`;
+    controls.speakerStatus.textContent = `刷新说话人版本失败：${message(error)}`;
   } finally {
     renderSpeakerWorkspace();
   }
@@ -2829,7 +3103,7 @@ controls.speakerLoadVersion.addEventListener("click", async () => {
     await loadSpeakerVersion();
   } catch (error) {
     controls.speakerStatus.dataset.status = "failed";
-    controls.speakerStatus.textContent = `Speaker version load failed: ${message(error)}`;
+    controls.speakerStatus.textContent = `读取说话人版本失败：${message(error)}`;
   } finally {
     renderSpeakerWorkspace();
   }
@@ -2842,7 +3116,7 @@ controls.speakerRenameForm.addEventListener("submit", async (event) => {
     await renameSpeaker();
   } catch (error) {
     controls.speakerStatus.dataset.status = "failed";
-    controls.speakerStatus.textContent = `Speaker rename failed: ${message(error)}`;
+    controls.speakerStatus.textContent = `重命名说话人失败：${message(error)}`;
   } finally {
     renderSpeakerWorkspace();
   }
@@ -2855,7 +3129,7 @@ controls.speakerMergeForm.addEventListener("submit", async (event) => {
     await mergeSpeakers();
   } catch (error) {
     controls.speakerStatus.dataset.status = "failed";
-    controls.speakerStatus.textContent = `Speaker merge failed: ${message(error)}`;
+    controls.speakerStatus.textContent = `合并说话人失败：${message(error)}`;
   } finally {
     renderSpeakerWorkspace();
   }
@@ -2867,7 +3141,7 @@ controls.speakerUndo.addEventListener("click", async () => {
     await undoSpeakerEdit();
   } catch (error) {
     controls.speakerStatus.dataset.status = "failed";
-    controls.speakerStatus.textContent = `Speaker undo failed: ${message(error)}`;
+    controls.speakerStatus.textContent = `撤销说话人编辑失败：${message(error)}`;
   } finally {
     renderSpeakerWorkspace();
   }
@@ -2878,7 +3152,7 @@ controls.providerRefresh.addEventListener("click", async () => {
     await loadProviderProfiles();
   } catch (error) {
     controls.providerStatus.dataset.status = "error";
-    controls.providerStatus.textContent = `Provider refresh failed: ${message(error)}`;
+    controls.providerStatus.textContent = `刷新服务配置失败：${message(error)}`;
   }
 });
 
@@ -2888,7 +3162,7 @@ controls.providerSaveSecret.addEventListener("click", async () => {
     await saveProviderSecret();
   } catch (error) {
     controls.providerStatus.dataset.status = "error";
-    controls.providerStatus.textContent = `Secret save failed: ${message(error)}`;
+    controls.providerStatus.textContent = `保存密钥失败：${message(error)}`;
   } finally {
     renderProviderProfiles();
   }
@@ -2897,14 +3171,14 @@ controls.providerSaveSecret.addEventListener("click", async () => {
 controls.providerRemoveSecret.addEventListener("click", async () => {
   controls.providerRemoveSecret.disabled = true;
   controls.providerStatus.dataset.status = "testing";
-  controls.providerStatus.textContent = "Removing selected provider secret...";
+  controls.providerStatus.textContent = "正在移除当前服务密钥...";
   let removed = false;
   try {
     await deleteProviderSecret();
     removed = true;
   } catch (error) {
     controls.providerStatus.dataset.status = "error";
-    controls.providerStatus.textContent = `Secret removal failed: ${message(error)}`;
+    controls.providerStatus.textContent = `移除密钥失败：${message(error)}`;
   } finally {
     if (!removed) renderProviderProfiles();
   }
@@ -2916,21 +3190,37 @@ controls.providerSaveProfile.addEventListener("click", async () => {
     await saveProviderProfile();
   } catch (error) {
     controls.providerStatus.dataset.status = "error";
-    controls.providerStatus.textContent = `Profile save failed: ${message(error)}`;
+    controls.providerStatus.textContent = `保存服务配置失败：${message(error)}`;
   } finally {
     renderProviderProfiles();
   }
 });
 
 controls.providerTest.addEventListener("click", async () => {
+  if (selectedProviderId === null) return;
+  const profileId = selectedProviderId;
   controls.providerTest.disabled = true;
+  providerProbeStates.set(profileId, {
+    profileId,
+    phase: "running",
+    message: "正在测试所选翻译服务...",
+    latencyMs: null,
+    updatedAtMs: Date.now(),
+  });
   controls.providerStatus.dataset.status = "testing";
-  controls.providerStatus.textContent = "Testing selected provider...";
+  controls.providerStatus.textContent = "正在测试所选翻译服务...";
   try {
     await testSelectedProvider();
   } catch (error) {
+    providerProbeStates.set(profileId, {
+      profileId,
+      phase: "error",
+      message: `连接失败：${message(error)}`,
+      latencyMs: null,
+      updatedAtMs: Date.now(),
+    });
     controls.providerStatus.dataset.status = "error";
-    controls.providerStatus.textContent = `Provider test failed: ${message(error)}`;
+    controls.providerStatus.textContent = `连接失败：${message(error)}`;
   } finally {
     renderProviderProfiles();
   }
@@ -2941,7 +3231,7 @@ controls.deletePreview.addEventListener("click", async () => {
     await previewDelete();
   } catch (error) {
     controls.deleteStatus.dataset.status = "error";
-    controls.deleteStatus.textContent = `Delete preview failed: ${message(error)}`;
+    controls.deleteStatus.textContent = `删除预览失败：${message(error)}`;
   }
 });
 
@@ -2951,7 +3241,7 @@ controls.deleteExecute.addEventListener("click", async () => {
     await executeDelete();
   } catch (error) {
     controls.deleteStatus.dataset.status = "error";
-    controls.deleteStatus.textContent = `Delete failed: ${message(error)}`;
+    controls.deleteStatus.textContent = `删除失败：${message(error)}`;
   } finally {
     renderDeletePreview();
   }
@@ -2962,7 +3252,7 @@ controls.deleteRestore.addEventListener("click", async () => {
     await restoreDeletedMeeting();
   } catch (error) {
     controls.deleteStatus.dataset.status = "error";
-    controls.deleteStatus.textContent = `Restore failed: ${message(error)}`;
+    controls.deleteStatus.textContent = `恢复失败：${message(error)}`;
   }
 });
 
@@ -2976,7 +3266,7 @@ controls.summaryStart.addEventListener("click", async () => {
   try {
     await startSummaryJob();
   } catch (error) {
-    controls.summaryOutput.textContent = `Summary start failed: ${message(error)}`;
+    controls.summaryOutput.textContent = `启动摘要失败：${message(error)}`;
   } finally {
     if (latest) render(latest);
   }
@@ -2986,7 +3276,7 @@ controls.summaryCancel.addEventListener("click", async () => {
   try {
     await updateSummaryJob("mvp_summary_cancel");
   } catch (error) {
-    controls.summaryOutput.textContent = `Summary cancel failed: ${message(error)}`;
+    controls.summaryOutput.textContent = `取消摘要失败：${message(error)}`;
   }
 });
 
@@ -2994,19 +3284,19 @@ controls.summaryRetry.addEventListener("click", async () => {
   try {
     await updateSummaryJob("mvp_summary_retry");
   } catch (error) {
-    controls.summaryOutput.textContent = `Summary retry failed: ${message(error)}`;
+    controls.summaryOutput.textContent = `重试摘要失败：${message(error)}`;
   }
 });
 
 controls.exportSelected.addEventListener("click", async () => {
   controls.exportSelected.disabled = true;
   controls.exportStudioStatus.dataset.status = "loading";
-  controls.exportStudioStatus.textContent = "Exporting selected artifacts...";
+  controls.exportStudioStatus.textContent = "正在导出所选内容...";
   try {
     await exportMeetingWithOptions();
   } catch (error) {
     controls.exportStudioStatus.dataset.status = "error";
-    controls.exportStudioStatus.textContent = `Selected export failed: ${message(error)}`;
+    controls.exportStudioStatus.textContent = `导出所选内容失败：${message(error)}`;
   } finally {
     if (latest) render(latest);
   }
@@ -3074,7 +3364,7 @@ controls.retryFailedTranslations.addEventListener("click", async () => {
   const failedCount = snapshot.finals.filter((segment) => segment.translationStatus === "failed").length;
   if (failedCount === 0) return;
   const accepted = window.confirm(
-    `将重新发送本场 ${failedCount} 条失败 final 原文到所选翻译服务，可能产生额外费用。确认继续？`,
+    `将重新发送本场 ${failedCount} 条失败原文到所选翻译服务，可能产生额外费用。确认继续？`,
   );
   if (!accepted) return;
   controls.retryFailedTranslations.disabled = true;
@@ -3133,14 +3423,14 @@ renderRecoveryCenter();
 
 void (async () => {
   await syncOverlayState().catch((error) => {
-    controls.error.textContent = `Overlay window unavailable: ${message(error)}`;
+    controls.error.textContent = `悬浮字幕窗口不可用：${message(error)}`;
   });
   await loadAsrModels()
     .then(() => {
       preparedAsrModelId = null;
     })
     .catch((error) => {
-      controls.error.textContent = `ASR model registry unavailable: ${message(error)}`;
+      controls.error.textContent = `识别模型注册表不可用：${message(error)}`;
     });
   try {
     await loadAudioDevices();
@@ -3154,7 +3444,7 @@ void (async () => {
       await prepareSelectedAsr();
     }
   } catch (error) {
-    controls.lifecycle.textContent = "ERROR";
+    controls.lifecycle.textContent = "异常";
     controls.lifecycle.dataset.state = "error";
     controls.model.textContent = "本地服务未就绪";
     controls.error.textContent = `预检失败：${message(error)}`;
@@ -3166,10 +3456,10 @@ void (async () => {
   }
   await loadMeetingLibrary(null, false).catch((error) => {
     controls.libraryStatus.dataset.status = "error";
-    controls.libraryStatus.textContent = `Library unavailable: ${message(error)}`;
+    controls.libraryStatus.textContent = `会议记录不可用：${message(error)}`;
   });
   await loadProviderProfiles().catch((error) => {
     controls.providerStatus.dataset.status = "error";
-    controls.providerStatus.textContent = `Provider registry unavailable: ${message(error)}`;
+    controls.providerStatus.textContent = `服务配置不可用：${message(error)}`;
   });
 })();

@@ -35,7 +35,9 @@ MeetingRelay captures system playback and microphone input, performs real-time s
 - **Selectable local ASR** — uses Cohere Transcribe 2B with CUDA/BF16 for the high-quality GPU path, with pinned Sherpa / SenseVoice int8 available as the CPU path; audio and speech recognition stay on the machine.
 - **Dual-source capture** — select Windows system output and microphone devices.
 - **Chinese, Japanese, and English** — select one recognition language before each meeting; the choice is locked while recording.
-- **Stable live transcript** — final rows are reconciled by stable keys instead of rebuilding the entire list on every poll.
+- **Focused meeting workflow** — separate Live Meeting, Meeting Records, and Settings views keep session controls and the transcript visible without mixing in administration tools.
+- **Stable live transcript** — final rows are reconciled by stable keys, scroll independently, follow the latest line by default, and preserve the reading position when the user reviews earlier content.
+- **Predictable Provider checks** — connection feedback remains visible in place, uses a bounded 15-second probe, and does not flash PowerShell console windows.
 - **Persistence first** — the original transcript is committed to SQLite/WAL before it is shown as saved or submitted for translation.
 - **Optional AI translation** — supports local and third-party OpenAI-compatible Chat Completions services.
 - **Failure isolation** — translation, network, or model failures do not affect committed originals.

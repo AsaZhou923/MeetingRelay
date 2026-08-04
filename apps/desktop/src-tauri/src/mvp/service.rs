@@ -38,8 +38,8 @@ use super::{
     translation::{
         LocalTranslationDiscovery, TranslationConfig, TranslationProbe, TranslationSubmitter,
         TranslationWorker, ValidatedTranslationConfig, discover_local_translation_models,
-        test_translation, translate_text, translation_error_retryable,
-        validate_local_translation_base_url,
+        discover_local_translation_models_before, test_translation, test_translation_before,
+        translate_text, translation_error_retryable, validate_local_translation_base_url,
     },
 };
 
@@ -48,6 +48,9 @@ const DISK_REQUIRED_BYTES: u64 = 512 * 1024 * 1024;
 const DISK_WARNING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const GOVERNANCE_RECOVERY_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const SUMMARY_DISCLOSURE_VERSION: &str = "meetingrelay.summary.provider-disclosure.v1";
+const PROVIDER_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const RECOVERY_WINDOW_SAMPLES: u64 = 8 * 16_000;
 
@@ -518,11 +521,14 @@ impl MvpService {
         let profile = storage
             .provider_profile_latest(provider_profile_id)?
             .ok_or_else(|| "PROVIDER_PROFILE_NOT_FOUND".to_owned())?;
+        let provider_test_deadline = std::time::Instant::now() + PROVIDER_TEST_TIMEOUT;
         if profile.provider_class == "local" {
             let base_url = profile.base_url.clone().unwrap_or_default();
-            let discovery = discover_local_translation_models(&base_url).inspect_err(|error| {
-                let _ = self.record_provider_test(&profile, "failed", Some(error));
-            })?;
+            let discovery =
+                discover_local_translation_models_before(&base_url, provider_test_deadline)
+                    .inspect_err(|error| {
+                        let _ = self.record_provider_test(&profile, "failed", Some(error));
+                    })?;
             if !discovery
                 .models
                 .iter()
@@ -545,7 +551,12 @@ impl MvpService {
             target_language: "zh".to_owned(),
             allow_insecure_http: profile.provider_class == "lan",
         };
-        match test_translation(&config) {
+        let result = if profile.provider_class == "local" {
+            test_translation_before(&config, provider_test_deadline)
+        } else {
+            test_translation(&config)
+        };
+        match result {
             Ok(probe) => {
                 self.record_provider_test(&profile, "passed", None)?;
                 Ok(probe)
@@ -3821,7 +3832,8 @@ fn writable_disk_probe(data_dir: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn available_disk_bytes(data_dir: &Path) -> Option<u64> {
     let script = "& { param([string]$dataDir) $root=[IO.Path]::GetPathRoot($dataDir); if ([string]::IsNullOrWhiteSpace($root)) { exit 2 }; ([IO.DriveInfo]::new($root)).AvailableFreeSpace }";
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -3829,13 +3841,21 @@ fn available_disk_bytes(data_dir: &Path) -> Option<u64> {
             "-Command",
             script,
         ])
-        .arg(data_dir)
-        .output()
-        .ok()?;
+        .arg(data_dir);
+    suppress_child_window(&mut command);
+
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(windows)]
+fn suppress_child_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(windows)]
@@ -6264,6 +6284,12 @@ mod tests {
         };
         assert!(std::path::Path::new(&path).is_file());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disk_space_probe_uses_no_window_flag() {
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
     }
 
     #[cfg(windows)]

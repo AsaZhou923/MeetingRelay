@@ -522,6 +522,18 @@ export function formatMvpErrorMessage(value: unknown): string {
       "无法连接翻译服务。请检查服务状态、Base URL、网络连接和模型 ID。",
     ],
     [
+      "TRANSLATION_TIMEOUT",
+      "翻译服务响应超时。原文已保存在本机，可检查服务与网络后重试失败译文。",
+    ],
+    [
+      "TRANSLATION_PROBE_TIMEOUT",
+      "连接测试 15 秒内未响应。请检查服务是否已启动、网络是否可达，然后重试。",
+    ],
+    [
+      "LOCAL_TRANSLATION_SERVICE_TIMEOUT",
+      "本地翻译服务连接测试超时。请确认 Ollama 或 LM Studio 已启动并加载所选模型。",
+    ],
+    [
       "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE",
       "无法连接本地翻译服务。请先启动 Ollama 或 LM Studio 的本地服务器。",
     ],
