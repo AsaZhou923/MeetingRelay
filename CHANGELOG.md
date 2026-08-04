@@ -3,6 +3,39 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-08-04 — Meeting workflow usability remediation
+
+- Reorganized the desktop UI into three task-focused views: Live Meeting,
+  Meeting Records, and Settings. The live view now keeps consent and session
+  controls in the first screen while moving provider, storage, history,
+  summary, export, and governance tools out of the transcript workspace.
+- Standardized the main Windows UI on a Chinese-first vocabulary and one visual
+  system, with larger supporting text, clearer disabled/focus states, responsive
+  desktop layouts, and internal stage/queue terminology removed from normal use.
+- Made Start respond immediately with a stable pending state and `aria-busy`,
+  while rejecting duplicate clicks until the first start attempt completes.
+- Added an independent transcript scroller, explicit follow-latest state, an
+  unseen-item counter with a Return to Latest action, and a fixed latest/current
+  line area that does not disturb a user reading earlier transcript rows.
+- Kept Provider test results in dedicated state so profile refreshes no longer
+  erase success or failure feedback. Profile and secret mutations now invalidate
+  stale results explicitly instead of presenting an old probe as current.
+- Gave Provider probes a shared 15-second budget and distinct timeout errors,
+  while preserving the longer production translation timeout. Local discovery
+  and completion probes now consume the same deadline.
+- Suppressed non-interactive Windows PowerShell windows for Credential Manager
+  and disk-space checks, removing the known source of repeated console flashes.
+- Added pure frontend state coverage for start guards, Provider result
+  persistence, and transcript following. Validation passed with 50 frontend
+  tests, TypeScript/Vite production build, 214 Rust tests (5 ignored by design),
+  and all 10 personal-release contract assertions.
+- Generated and window-smoke-tested a package-local personal build at
+  14,605,312 bytes with SHA-256
+  `736DA15BDDB553FAE0984E23C80C81B1B696E5AAAD4619733EA74CC57997B5FB`.
+- Cold/warm start p50/p95, real local/LAN/cloud Provider matrices, high-DPI
+  coverage, and long-meeting transcript pressure remain explicit environment
+  acceptance work.
+
 ## 2026-08-01 — Privacy and durability remediation
 
 - Made summary Provider selection explicit and independent from Provider

@@ -35,6 +35,15 @@ const TRANSLATION_CONFIG_VERSION: &str = "meetingrelay.translation.config.v1";
 const TRANSLATION_PROMPT_VERSION: &str = "meetingrelay.translation.prompt.v1";
 const TRANSLATION_REQUEST_SCHEMA_VERSION: &str = "openai.chat.completions.v1";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TranslationHttpTimeouts {
+    connect: Duration,
+    read: Duration,
+    write: Duration,
+    overall: Option<Duration>,
+    timeout_error: &'static str,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TranslationConfig {
@@ -489,6 +498,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub fn test_translation(config: &TranslationConfig) -> Result<TranslationProbe, String> {
+    test_translation_with_timeouts(config, probe_translation_timeouts())
+}
+
+pub(crate) fn test_translation_before(
+    config: &TranslationConfig,
+    deadline: Instant,
+) -> Result<TranslationProbe, String> {
+    test_translation_with_timeouts(config, probe_translation_timeouts_before(deadline)?)
+}
+
+fn test_translation_with_timeouts(
+    config: &TranslationConfig,
+    timeouts: TranslationHttpTimeouts,
+) -> Result<TranslationProbe, String> {
     let config = config.validate_enabled()?;
     let started = Instant::now();
     let (probe_text, source_language) = if config.target_language == "en" {
@@ -496,7 +519,7 @@ pub fn test_translation(config: &TranslationConfig) -> Result<TranslationProbe, 
     } else {
         ("MeetingRelay connection test.", "en")
     };
-    let preview = translate_text(&config, probe_text, source_language)?;
+    let preview = translate_text_with_timeouts(&config, probe_text, source_language, timeouts)?;
     Ok(TranslationProbe {
         endpoint: config.endpoint,
         model: config.model,
@@ -509,13 +532,42 @@ pub fn test_translation(config: &TranslationConfig) -> Result<TranslationProbe, 
 pub fn discover_local_translation_models(
     base_url: &str,
 ) -> Result<LocalTranslationDiscovery, String> {
+    discover_local_translation_models_with_timeouts(
+        base_url,
+        TranslationHttpTimeouts {
+            connect: Duration::from_secs(2),
+            read: LOCAL_MODEL_DISCOVERY_TIMEOUT,
+            write: Duration::from_secs(2),
+            overall: None,
+            timeout_error: "LOCAL_TRANSLATION_SERVICE_TIMEOUT",
+        },
+    )
+}
+
+pub(crate) fn discover_local_translation_models_before(
+    base_url: &str,
+    deadline: Instant,
+) -> Result<LocalTranslationDiscovery, String> {
+    discover_local_translation_models_with_timeouts(
+        base_url,
+        local_model_discovery_timeouts_before(deadline)?,
+    )
+}
+
+fn discover_local_translation_models_with_timeouts(
+    base_url: &str,
+    timeouts: TranslationHttpTimeouts,
+) -> Result<LocalTranslationDiscovery, String> {
     let endpoint = local_models_endpoint(base_url)?;
     let started = Instant::now();
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(2))
-        .timeout_read(LOCAL_MODEL_DISCOVERY_TIMEOUT)
-        .timeout_write(Duration::from_secs(2))
-        .build();
+    let mut agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .timeout_write(timeouts.write);
+    if let Some(overall) = timeouts.overall {
+        agent = agent.timeout(overall);
+    }
+    let agent = agent.build();
     let response = agent
         .get(&endpoint)
         .call()
@@ -578,6 +630,15 @@ pub fn translate_text(
     text: &str,
     source_language: &str,
 ) -> Result<String, String> {
+    translate_text_with_timeouts(config, text, source_language, normal_translation_timeouts())
+}
+
+fn translate_text_with_timeouts(
+    config: &ValidatedTranslationConfig,
+    text: &str,
+    source_language: &str,
+    timeouts: TranslationHttpTimeouts,
+) -> Result<String, String> {
     let source_language = language_code(source_language)?;
     if text.is_empty() || text.len() > MAX_TRANSLATION_INPUT_LENGTH || text.contains('\0') {
         return Err("TRANSLATION_INPUT_INVALID".to_owned());
@@ -606,11 +667,14 @@ pub fn translate_text(
         "temperature": 0,
         "stream": false
     });
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(3))
-        .timeout_read(TRANSLATION_TIMEOUT)
-        .timeout_write(Duration::from_secs(10))
-        .build();
+    let mut agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .timeout_write(timeouts.write);
+    if let Some(overall) = timeouts.overall {
+        agent = agent.timeout(overall);
+    }
+    let agent = agent.build();
     let mut request = agent
         .post(&config.endpoint)
         .set("Content-Type", "application/json");
@@ -619,7 +683,7 @@ pub fn translate_text(
     }
     let response = request
         .send_string(&body.to_string())
-        .map_err(map_http_error)?;
+        .map_err(|error| map_http_error(error, timeouts.timeout_error))?;
     let mut response_text = String::new();
     response
         .into_reader()
@@ -640,17 +704,83 @@ pub fn translate_text(
     Ok(translation.to_owned())
 }
 
-fn map_http_error(error: ureq::Error) -> String {
+fn normal_translation_timeouts() -> TranslationHttpTimeouts {
+    TranslationHttpTimeouts {
+        connect: Duration::from_secs(3),
+        read: TRANSLATION_TIMEOUT,
+        write: Duration::from_secs(10),
+        overall: None,
+        timeout_error: "TRANSLATION_TIMEOUT",
+    }
+}
+
+fn probe_translation_timeouts() -> TranslationHttpTimeouts {
+    TranslationHttpTimeouts {
+        connect: Duration::from_secs(3),
+        read: Duration::from_secs(15),
+        write: Duration::from_secs(3),
+        overall: Some(Duration::from_secs(15)),
+        timeout_error: "TRANSLATION_PROBE_TIMEOUT",
+    }
+}
+
+fn local_model_discovery_timeouts_before(
+    deadline: Instant,
+) -> Result<TranslationHttpTimeouts, String> {
+    let remaining = remaining_probe_budget(deadline, "LOCAL_TRANSLATION_SERVICE_TIMEOUT")?;
+    Ok(TranslationHttpTimeouts {
+        connect: remaining.min(Duration::from_secs(2)),
+        read: remaining,
+        write: remaining.min(Duration::from_secs(2)),
+        overall: Some(remaining),
+        timeout_error: "LOCAL_TRANSLATION_SERVICE_TIMEOUT",
+    })
+}
+
+fn probe_translation_timeouts_before(deadline: Instant) -> Result<TranslationHttpTimeouts, String> {
+    let remaining = remaining_probe_budget(deadline, "TRANSLATION_PROBE_TIMEOUT")?;
+    Ok(TranslationHttpTimeouts {
+        connect: remaining.min(Duration::from_secs(3)),
+        read: remaining,
+        write: remaining.min(Duration::from_secs(3)),
+        overall: Some(remaining),
+        timeout_error: "TRANSLATION_PROBE_TIMEOUT",
+    })
+}
+
+fn remaining_probe_budget(deadline: Instant, timeout_error: &str) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| timeout_error.to_owned())
+}
+
+fn map_http_error(error: ureq::Error, timeout_error: &str) -> String {
     match error {
         ureq::Error::Status(status, _) => format!("TRANSLATION_HTTP_STATUS_{status}"),
+        ureq::Error::Transport(transport) if transport_error_timed_out(&transport) => {
+            timeout_error.to_owned()
+        }
         ureq::Error::Transport(_) => "TRANSLATION_CONNECTION_FAILED".to_owned(),
     }
+}
+
+fn transport_error_timed_out(error: &ureq::Transport) -> bool {
+    use std::error::Error;
+
+    error
+        .source()
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .is_some_and(|source| source.kind() == std::io::ErrorKind::TimedOut)
 }
 
 fn map_local_discovery_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(status, _) => {
             format!("LOCAL_TRANSLATION_MODELS_HTTP_STATUS_{status}")
+        }
+        ureq::Error::Transport(transport) if transport_error_timed_out(&transport) => {
+            "LOCAL_TRANSLATION_SERVICE_TIMEOUT".to_owned()
         }
         ureq::Error::Transport(_) => "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE".to_owned(),
     }
@@ -1172,6 +1302,120 @@ mod tests {
     }
 
     #[test]
+    fn probe_translation_uses_short_total_budget_without_changing_normal_translation_timeout() {
+        assert_eq!(normal_translation_timeouts().read, Duration::from_secs(120));
+        assert_eq!(normal_translation_timeouts().overall, None);
+        assert_eq!(probe_translation_timeouts().read, Duration::from_secs(15));
+        assert_eq!(
+            probe_translation_timeouts().overall,
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn probe_translation_timeout_is_actionable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4 * 1024];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+        let config = enabled(format!("http://{address}/v1"))
+            .validate_enabled()
+            .unwrap();
+        let started = Instant::now();
+        let error = translate_text_with_timeouts(
+            &config,
+            "hello",
+            "en",
+            TranslationHttpTimeouts {
+                connect: Duration::from_millis(100),
+                read: Duration::from_millis(100),
+                write: Duration::from_millis(100),
+                overall: Some(Duration::from_millis(100)),
+                timeout_error: "TRANSLATION_PROBE_TIMEOUT",
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "TRANSLATION_PROBE_TIMEOUT");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "probe timeout should not wait for the server sleep"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_translation_timeout_code_remains_distinct_from_probe_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4 * 1024];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+        let config = enabled(format!("http://{address}/v1"))
+            .validate_enabled()
+            .unwrap();
+        let error = translate_text_with_timeouts(
+            &config,
+            "hello",
+            "en",
+            TranslationHttpTimeouts {
+                connect: Duration::from_millis(100),
+                read: Duration::from_millis(100),
+                write: Duration::from_millis(100),
+                overall: Some(Duration::from_millis(100)),
+                timeout_error: "TRANSLATION_TIMEOUT",
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "TRANSLATION_TIMEOUT");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn local_model_discovery_timeout_is_actionable_under_shared_probe_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4 * 1024];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+        let started = Instant::now();
+        let error = discover_local_translation_models_before(
+            &format!("http://{address}/v1"),
+            started + Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "LOCAL_TRANSLATION_SERVICE_TIMEOUT");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shared probe deadline should bound local discovery"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn expired_shared_probe_deadline_skips_completion_probe() {
+        let error = test_translation_before(
+            &enabled("http://127.0.0.1:9/v1"),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "TRANSLATION_PROBE_TIMEOUT");
+    }
+
+    #[test]
     fn discovers_and_sorts_openai_compatible_local_models() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1204,9 +1448,14 @@ mod tests {
             discover_local_translation_models("http://192.168.1.3:11434/v1").unwrap_err(),
             "LOCAL_TRANSLATION_LOOPBACK_REQUIRED"
         );
-        assert_eq!(
-            discover_local_translation_models("http://127.0.0.1:9/v1").unwrap_err(),
-            "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE"
+        let loopback_error = discover_local_translation_models("http://127.0.0.1:9/v1")
+            .expect_err("closed loopback service should fail discovery");
+        assert!(
+            matches!(
+                loopback_error.as_str(),
+                "LOCAL_TRANSLATION_SERVICE_UNAVAILABLE" | "LOCAL_TRANSLATION_SERVICE_TIMEOUT"
+            ),
+            "{loopback_error}"
         );
     }
 

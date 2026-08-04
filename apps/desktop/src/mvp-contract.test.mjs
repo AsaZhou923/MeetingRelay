@@ -1096,6 +1096,9 @@ test("turns recoverable runtime error codes into actionable product messages", (
     /显式确认风险/,
   );
   assert.match(formatMvpErrorMessage("TRANSLATION_BASE_URL_INVALID"), /Base URL 无效/);
+  assert.match(formatMvpErrorMessage("TRANSLATION_TIMEOUT"), /原文已保存在本机/);
+  assert.match(formatMvpErrorMessage("TRANSLATION_PROBE_TIMEOUT"), /15 秒内未响应/);
+  assert.match(formatMvpErrorMessage("LOCAL_TRANSLATION_SERVICE_TIMEOUT"), /本地翻译服务/);
   assert.equal(formatMvpErrorMessage("CUSTOM_FAILURE"), "CUSTOM_FAILURE");
   assert.match(
     formatMvpSnapshotError({

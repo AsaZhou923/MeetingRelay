@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test src/mvp-contract.test.mjs src/transcript-render.test.mjs",
+    "test": "node --test src/mvp-contract.test.mjs src/transcript-render.test.mjs src/frontend-state.test.mjs",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",
     "tauri:build:ci": "tauri build --no-bundle -- --offline --locked",

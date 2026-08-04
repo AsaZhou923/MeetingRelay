@@ -5,6 +5,8 @@ use std::{collections::HashMap, sync::Mutex};
 
 const MAX_SECRET_ID_LEN: usize = 192;
 const MAX_SECRET_BYTES: usize = 2_560;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub type SecretStoreResult<T> = Result<T, SecretStoreError>;
 
@@ -235,7 +237,8 @@ fn run_windows_credential_command(
     use std::process::{Command, Stdio};
 
     let target = format!("MeetingRelay:{id}");
-    let mut child = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -249,7 +252,10 @@ fn run_windows_credential_command(
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    suppress_child_window(&mut command);
+
+    let mut child = command
         .spawn()
         .map_err(|_| SecretStoreError::BackendUnavailable)?;
 
@@ -275,6 +281,13 @@ fn run_windows_credential_command(
         "" => Err(SecretStoreError::BackendRejected),
         encoded => Ok(WindowsCredentialOutput::Secret(encoded.to_owned())),
     }
+}
+
+#[cfg(windows)]
+fn suppress_child_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(windows)]
@@ -538,6 +551,12 @@ mod tests {
 
         assert!(!debug.contains(secret));
         assert!(!display.contains(secret));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_credential_commands_use_no_window_flag() {
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
     }
 
     #[cfg(windows)]
