@@ -32,7 +32,7 @@ decisions, and known acceptance gaps.
   environment acceptance item.
 - Frozen `v0.1.2` Windows executable candidate: 14,639,104 bytes, ProductVersion
   `0.1.2`, SHA-256
-  `F025EECFB8A14344F5E93754AA1C137451296A5EBC001C82BF8770D19C4EDDA3`.
+  `C21716304E3BEC7ADD78E970F22DF8B79FDF9DBD5777074A448770CEFC859233`.
   The public EXE remains unsigned and excludes the model and Sherpa runtime.
 
 ## 2026-08-04 — Meeting workflow usability remediation
