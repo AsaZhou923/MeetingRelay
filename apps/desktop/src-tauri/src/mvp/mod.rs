@@ -57,8 +57,9 @@ pub fn mvp_start(
     raw_audio_enabled: Option<bool>,
     translation: Option<TranslationConfig>,
     translation_provider_profile_id: Option<String>,
+    live_text_directory: Option<String>,
 ) -> Result<MvpSnapshot, String> {
-    service.start_with_devices_language_audio_mode_and_model(
+    service.start_with_devices_language_audio_mode_model_and_live_text(
         consent_accepted,
         AudioDeviceSelection {
             system_output_device_id,
@@ -70,6 +71,7 @@ pub fn mvp_start(
         translation_provider_profile_id.as_deref(),
         source_mode.unwrap_or_default(),
         raw_audio_enabled.unwrap_or(false),
+        live_text_directory.as_deref(),
     )
 }
 

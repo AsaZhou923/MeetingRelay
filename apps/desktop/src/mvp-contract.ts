@@ -14,6 +14,10 @@ export const MVP_EXPORT_FORMATS = ["json", "markdown", "txt", "docx", "pdf"] as 
 export const MVP_RECOGNITION_LANGUAGES = ["zh", "ja", "en"] as const;
 export const MVP_MEETING_LANGUAGES = [...MVP_RECOGNITION_LANGUAGES, "unknown"] as const;
 export const MVP_AUDIO_SOURCE_MODES = ["system_only", "microphone_only", "both"] as const;
+export const MVP_TRANSCRIPT_DISPLAY_MODES = [
+  "source_and_translation",
+  "translation_only",
+] as const;
 export const MVP_PROVIDER_CLASSES = ["local", "lan", "cloud"] as const;
 export const MVP_SUMMARY_JOB_STATUSES = [
   "idle",
@@ -44,12 +48,14 @@ export const MVP_TRANSLATION_RETRY_STATUSES = [
 export const MVP_INTERRUPTED_ACTIONS = ["recover", "finalize", "keep"] as const;
 export const AUDIO_DEVICE_PREFERENCE_KEY = "meetingrelay.audio-devices.v1";
 export const TRANSLATION_PREFERENCE_KEY = "meetingrelay.translation.v1";
+export const APP_PREFERENCE_KEY = "meetingrelay.app-settings.v1";
 
 export type MvpLifecycle = (typeof MVP_LIFECYCLES)[number];
 export type MvpExportFormat = (typeof MVP_EXPORT_FORMATS)[number];
 export type MvpRecognitionLanguage = (typeof MVP_RECOGNITION_LANGUAGES)[number];
 export type MvpMeetingLanguage = (typeof MVP_MEETING_LANGUAGES)[number];
 export type MvpAudioSourceMode = (typeof MVP_AUDIO_SOURCE_MODES)[number];
+export type MvpTranscriptDisplayMode = (typeof MVP_TRANSCRIPT_DISPLAY_MODES)[number];
 export type MvpProviderClass = (typeof MVP_PROVIDER_CLASSES)[number];
 export type MvpSummaryJobStatus = (typeof MVP_SUMMARY_JOB_STATUSES)[number];
 export type MvpDeleteEntryType = (typeof MVP_DELETE_ENTRY_TYPES)[number];
@@ -84,6 +90,15 @@ export type AudioDevicePreference = {
   version: 1;
   systemOutputDeviceId: string;
   microphoneDeviceId: string;
+};
+
+export type AppPreference = {
+  version: 1;
+  recognitionLanguage: MvpRecognitionLanguage;
+  sourceMode: MvpAudioSourceMode;
+  transcriptDisplayMode: MvpTranscriptDisplayMode;
+  liveTextEnabled: boolean;
+  liveTextDirectory: string;
 };
 
 export type ResolvedAudioDeviceSelection = {
@@ -136,6 +151,7 @@ export type TranslationConfig = {
 export type TranslationPreference = Omit<TranslationConfig, "apiKey"> & {
   version: 1;
   provider: string;
+  providerProfileId: string | null;
   baseUrl: "";
 };
 
@@ -570,6 +586,22 @@ export function formatMvpErrorMessage(value: unknown): string {
       "TRANSLATION_WORKER_UNAVAILABLE",
       "翻译后台线程未能启动；原文功能仍可使用，请重启应用后重试。",
     ],
+    [
+      "LIVE_TEXT_DIRECTORY_NOT_ABSOLUTE",
+      "实时 TXT 目录必须是绝对路径，例如 C:\\Users\\你\\Documents\\MeetingRelay。",
+    ],
+    [
+      "LIVE_TEXT_DIRECTORY_UNAVAILABLE",
+      "实时 TXT 目录不存在或不是文件夹；请先创建目录并确认当前用户可以访问。",
+    ],
+    [
+      "LIVE_TEXT_MIRROR_BEGIN_FAILED",
+      "无法创建本场会议的实时 TXT；请确认目录可写，且同名文件尚不存在。会议未开始。",
+    ],
+    [
+      "LIVE_TEXT_MIRROR_WRITE_FAILED",
+      "实时 TXT 写入已停止，但 SQLite 中已经提交的会议原文仍然安全。请在会后导出完整记录。",
+    ],
     ["MVP_PAUSE_TIMEOUT", "暂停操作没有及时完成。请停止会议；已经保存的文字不会丢失。"],
     ["MVP_RESUME_TIMEOUT", "继续操作没有及时完成。请停止会议后重新开始；已经保存的文字不会丢失。"],
   ];
@@ -691,6 +723,39 @@ export function parseAudioDevicePreference(serialized: string | null): AudioDevi
   } catch {
     return null;
   }
+}
+
+export function parseAppPreference(serialized: string | null): AppPreference | null {
+  if (serialized === null) return null;
+  try {
+    const preference = object(JSON.parse(serialized), "application preference");
+    if (preference.version !== 1) return null;
+    const liveTextDirectory = boundedString(
+      preference.liveTextDirectory,
+      "preference.liveTextDirectory",
+      1024,
+    ).trim();
+    if (CONTROL_CHARACTER.test(liveTextDirectory)) return null;
+    return {
+      version: 1,
+      recognitionLanguage: parseMvpRecognitionLanguage(preference.recognitionLanguage),
+      sourceMode: parseMvpAudioSourceMode(preference.sourceMode),
+      transcriptDisplayMode: enumValue(
+        preference.transcriptDisplayMode,
+        "preference.transcriptDisplayMode",
+        MVP_TRANSCRIPT_DISPLAY_MODES,
+      ),
+      liveTextEnabled: boolean(preference.liveTextEnabled, "preference.liveTextEnabled"),
+      liveTextDirectory,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function isWindowsAbsoluteDirectory(value: string): boolean {
+  const path = value.trim();
+  return /^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/.test(path);
 }
 
 function resolvePreferredDevice(
@@ -933,13 +998,16 @@ export function parseTranslationPreference(
     const preference = object(JSON.parse(serialized), "translation preference");
     if (preference.version !== 1) return null;
     const model = boundedString(preference.model, "translation model", 256).trim();
-    if (model.length === 0) return null;
     if ("apiKey" in preference || "Authorization" in preference) return null;
     if (preference.baseUrl !== undefined && preference.baseUrl !== "") return null;
     return {
       version: 1,
       enabled: boolean(preference.enabled, "translation enabled"),
       provider: providerKey(preference.provider ?? "custom"),
+      providerProfileId:
+        preference.providerProfileId === undefined || preference.providerProfileId === null
+          ? null
+          : identifier(preference.providerProfileId, "translation provider profile"),
       baseUrl: "",
       model,
       targetLanguage: parseMvpRecognitionLanguage(preference.targetLanguage),

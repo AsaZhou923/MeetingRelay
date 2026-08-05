@@ -1,6 +1,12 @@
-use std::sync::{
-    Arc, Mutex, MutexGuard,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use super::{
@@ -58,8 +64,6 @@ const RECOVERY_WINDOW_SAMPLES: u64 = 8 * 16_000;
 use std::{
     collections::VecDeque,
     env, fs,
-    io::Write,
-    path::{Path, PathBuf},
     process::Command,
     sync::{
         TryLockError,
@@ -102,6 +106,7 @@ pub struct MvpService {
     summary_active: Arc<AtomicBool>,
     retry_progress: Arc<Mutex<TranslationRetryProgressSnapshot>>,
     retry_cancel: Arc<AtomicBool>,
+    live_text_mirrors: Arc<Mutex<HashMap<String, LiveTextMirror>>>,
     inner: Mutex<ServiceInner>,
     shutdown_started: AtomicBool,
 }
@@ -343,6 +348,90 @@ struct ServiceInner {
     session: Option<RunningSession>,
 }
 
+#[derive(Debug)]
+struct LiveTextMirror {
+    path: PathBuf,
+    file: File,
+}
+
+impl LiveTextMirror {
+    fn begin(directory: &Path, meeting_id: &str) -> Result<Self, String> {
+        validate_live_text_directory(directory)?;
+        let path = directory.join(format!("MeetingRelay-{meeting_id}.txt"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| "LIVE_TEXT_MIRROR_BEGIN_FAILED".to_owned())?;
+        Ok(Self { path, file })
+    }
+
+    fn append_final_original(&mut self, text: &str) -> Result<(), String> {
+        self.file
+            .write_all(text.as_bytes())
+            .and_then(|_| self.file.write_all(b"\n"))
+            .and_then(|_| self.file.flush())
+            .map_err(|_| "LIVE_TEXT_MIRROR_WRITE_FAILED".to_owned())
+    }
+
+    fn cleanup_empty_file(self) {
+        let Self { path, file } = self;
+        drop(file);
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn validate_live_text_directory(directory: &Path) -> Result<(), String> {
+    if !directory.is_absolute() {
+        return Err("LIVE_TEXT_DIRECTORY_NOT_ABSOLUTE".to_owned());
+    }
+    std::fs::metadata(directory)
+        .map_err(|_| "LIVE_TEXT_DIRECTORY_UNAVAILABLE".to_owned())
+        .and_then(|metadata| {
+            metadata
+                .is_dir()
+                .then_some(())
+                .ok_or_else(|| "LIVE_TEXT_DIRECTORY_UNAVAILABLE".to_owned())
+        })
+}
+
+fn append_live_text_final(
+    mirrors: &Mutex<HashMap<String, LiveTextMirror>>,
+    meeting_id: &str,
+    text: &str,
+) -> Option<String> {
+    let mut mirrors = lock(mirrors);
+    let mirror = mirrors.get_mut(meeting_id)?;
+    match mirror.append_final_original(text) {
+        Ok(()) => None,
+        Err(error) => Some(disable_live_text_mirror_after_error(
+            &mut mirrors,
+            meeting_id,
+            &error,
+        )),
+    }
+}
+
+fn disable_live_text_mirror_after_error(
+    mirrors: &mut HashMap<String, LiveTextMirror>,
+    meeting_id: &str,
+    error: &str,
+) -> String {
+    mirrors.remove(meeting_id);
+    error.to_owned()
+}
+
+fn cleanup_live_text_mirror_empty_file(
+    mirrors: &Mutex<HashMap<String, LiveTextMirror>>,
+    meeting_id: &str,
+) {
+    if let Some(mirror) = lock(mirrors).remove(meeting_id) {
+        mirror.cleanup_empty_file();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum RecognitionLanguage {
     English,
@@ -446,6 +535,7 @@ impl MvpService {
             summary_active: Arc::new(AtomicBool::new(false)),
             retry_progress: Arc::new(Mutex::new(TranslationRetryProgressSnapshot::default())),
             retry_cancel: Arc::new(AtomicBool::new(false)),
+            live_text_mirrors: Arc::new(Mutex::new(HashMap::new())),
             inner: Mutex::new(ServiceInner::default()),
             shutdown_started: AtomicBool::new(false),
         }
@@ -1290,7 +1380,7 @@ impl MvpService {
         audio_source_mode: AudioSourceMode,
         raw_audio_enabled: bool,
     ) -> Result<MvpSnapshot, String> {
-        self.start_with_devices_language_audio_mode_and_model(
+        self.start_with_devices_language_audio_mode_model_and_live_text(
             consent_accepted,
             selection,
             language,
@@ -1299,10 +1389,12 @@ impl MvpService {
             translation_provider_profile_id,
             audio_source_mode,
             raw_audio_enabled,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn start_with_devices_language_audio_mode_and_model(
         &self,
         consent_accepted: bool,
@@ -1313,6 +1405,32 @@ impl MvpService {
         translation_provider_profile_id: Option<&str>,
         audio_source_mode: AudioSourceMode,
         raw_audio_enabled: bool,
+    ) -> Result<MvpSnapshot, String> {
+        self.start_with_devices_language_audio_mode_model_and_live_text(
+            consent_accepted,
+            selection,
+            language,
+            asr_model_id,
+            translation,
+            translation_provider_profile_id,
+            audio_source_mode,
+            raw_audio_enabled,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_devices_language_audio_mode_model_and_live_text(
+        &self,
+        consent_accepted: bool,
+        selection: AudioDeviceSelection,
+        language: &str,
+        asr_model_id: Option<&str>,
+        translation: Option<TranslationConfig>,
+        translation_provider_profile_id: Option<&str>,
+        audio_source_mode: AudioSourceMode,
+        raw_audio_enabled: bool,
+        live_text_directory: Option<&str>,
     ) -> Result<MvpSnapshot, String> {
         if !consent_accepted {
             return Err("CONSENT_REQUIRED".to_owned());
@@ -1333,6 +1451,7 @@ impl MvpService {
                 translation,
                 audio_source_mode,
                 raw_audio_enabled,
+                live_text_directory,
             )
         }
         #[cfg(not(windows))]
@@ -1344,6 +1463,7 @@ impl MvpService {
                 translation,
                 audio_source_mode,
                 raw_audio_enabled,
+                live_text_directory,
             );
             Err("MVP_WINDOWS_ONLY".to_owned())
         }
@@ -2591,6 +2711,7 @@ impl MvpService {
             profile,
             self.storage_writer.clone(),
             translation,
+            Arc::clone(&self.live_text_mirrors),
             language,
             asr_model.model_id.clone(),
         )
@@ -2714,6 +2835,7 @@ impl MvpService {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
     fn start_windows(
         &self,
         selection: AudioDeviceSelection,
@@ -2722,6 +2844,7 @@ impl MvpService {
         translation_config: TranslationConfig,
         audio_source_mode: AudioSourceMode,
         raw_audio_enabled: bool,
+        live_text_directory: Option<&str>,
     ) -> Result<MvpSnapshot, String> {
         let mut inner = lock(&self.inner);
         if inner.session.is_some() {
@@ -2791,6 +2914,20 @@ impl MvpService {
             let _ = writer.interrupt_meeting(&meeting.id);
             return Err(error);
         }
+        if let Some(directory) = live_text_directory {
+            match LiveTextMirror::begin(Path::new(directory), &meeting.id) {
+                Ok(mirror) => {
+                    lock(&self.live_text_mirrors).insert(meeting.id.clone(), mirror);
+                }
+                Err(error) => {
+                    if let Some(translation) = lock(&self.translation).as_ref() {
+                        translation.submitter().clear_session(&meeting.id);
+                    }
+                    let _ = writer.interrupt_meeting(&meeting.id);
+                    return Err(error);
+                }
+            }
+        }
 
         if let Some(inference) = inner.inference.as_ref() {
             inference
@@ -2826,6 +2963,7 @@ impl MvpService {
             audio_source_mode,
         )
         .map_err(|error| {
+            cleanup_live_text_mirror_empty_file(&self.live_text_mirrors, &meeting.id);
             let _ = writer.interrupt_meeting(&meeting.id);
             let code = public_audio_error(&error.to_string());
             self.fail(&code);
@@ -2854,6 +2992,7 @@ impl MvpService {
         }) {
             Ok(coordinator) => coordinator,
             Err(error) => {
+                cleanup_live_text_mirror_empty_file(&self.live_text_mirrors, &meeting.id);
                 drop(capture);
                 let _ = writer.interrupt_meeting(&meeting.id);
                 self.fail(&error);
@@ -2978,7 +3117,13 @@ impl MvpService {
             snapshot.microphone.status = SourceStatus::Capturing;
         }
         apply_disabled_sources(&mut snapshot, session.audio_source_mode);
-        snapshot.error = None;
+        if !snapshot
+            .error
+            .as_deref()
+            .is_some_and(should_preserve_public_commit_error)
+        {
+            snapshot.error = None;
+        }
         Ok(public_snapshot(
             &mut snapshot,
             inner.inference.as_ref().map(|worker| &worker.submitter),
@@ -3018,6 +3163,7 @@ impl MvpService {
         if let Some(translation) = lock(&self.translation).as_ref() {
             translation.submitter().clear_session(&session.meeting_id);
         }
+        lock(&self.live_text_mirrors).remove(&session.meeting_id);
         let writer = self
             .storage_writer
             .as_ref()
@@ -3027,6 +3173,11 @@ impl MvpService {
         let completion_error = meeting.completion_error.clone();
 
         let mut snapshot = lock(&self.snapshot);
+        let live_text_warning = snapshot
+            .error
+            .as_deref()
+            .filter(|error| *error == "LIVE_TEXT_MIRROR_WRITE_FAILED")
+            .map(str::to_owned);
         snapshot.lifecycle = Lifecycle::Ready;
         snapshot.durability_status = meeting.state;
         snapshot.system.active = false;
@@ -3047,6 +3198,11 @@ impl MvpService {
         }
         if completion_error.is_some() {
             snapshot.error = completion_error;
+        }
+        if snapshot.error.is_none()
+            && let Some(warning) = live_text_warning
+        {
+            set_public_error(&mut snapshot, &warning);
         }
         let mut public = public_snapshot(&mut snapshot, submitter.as_ref());
         public.translation_queue_depth = lock(&self.translation)
@@ -4130,7 +4286,11 @@ fn apply_paused_snapshot_for_mode(
     apply_disabled_sources(snapshot, mode);
     if let Some(error) = error {
         set_public_error(snapshot, error);
-    } else if snapshot.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+    } else if !snapshot
+        .error
+        .as_deref()
+        .is_some_and(should_preserve_public_commit_error)
+    {
         snapshot.error = None;
     }
 }
@@ -4608,6 +4768,7 @@ impl InferenceWorker {
         profile: RecognizerProfile,
         storage_writer: Option<Arc<MvpStorageWriter>>,
         translation: Option<TranslationSubmitter>,
+        live_text_mirrors: Arc<Mutex<HashMap<String, LiveTextMirror>>>,
         language: RecognitionLanguage,
         model_id: String,
     ) -> Result<Self, String> {
@@ -4632,6 +4793,7 @@ impl InferenceWorker {
                         snapshot,
                         storage_writer,
                         translation,
+                        live_text_mirrors,
                     );
                 }
             })
@@ -4699,6 +4861,7 @@ struct InferenceTask {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn inference_loop(
     recognizer: &mut PreparedRecognizer,
     profile: RecognizerProfile,
@@ -4707,10 +4870,12 @@ fn inference_loop(
     snapshot: Arc<Mutex<MvpSnapshot>>,
     storage_writer: Option<Arc<MvpStorageWriter>>,
     translation: Option<TranslationSubmitter>,
+    live_text_mirrors: Arc<Mutex<HashMap<String, LiveTextMirror>>>,
 ) {
     let sinks = InferenceSinks {
         storage_writer: storage_writer.as_deref(),
         translation: translation.as_ref(),
+        live_text_mirrors: &live_text_mirrors,
     };
     loop {
         let scheduled = match finals.try_recv() {
@@ -4744,6 +4909,7 @@ fn inference_loop(
 struct InferenceSinks<'a> {
     storage_writer: Option<&'a MvpStorageWriter>,
     translation: Option<&'a TranslationSubmitter>,
+    live_text_mirrors: &'a Mutex<HashMap<String, LiveTextMirror>>,
 }
 
 #[cfg(windows)]
@@ -4841,12 +5007,21 @@ fn process_inference_task(
                     Ok(ack) => {
                         shared.advance_durable_sequence_after_ack(ack.final_segment.sequence);
                         let mut final_segment = ack.final_segment;
+                        let mirror_error = if ack.duplicate {
+                            None
+                        } else {
+                            append_live_text_final(
+                                sinks.live_text_mirrors,
+                                &final_segment.meeting_id,
+                                &final_segment.text,
+                            )
+                        };
                         if !ack.duplicate
                             && let Some(translation) = sinks.translation
                         {
                             translation.decorate_and_submit(&mut final_segment);
                         }
-                        Some(Ok((final_segment, ack.duplicate)))
+                        Some(Ok((final_segment, ack.duplicate, mirror_error)))
                     }
                     Err(error) => {
                         task.session_errors.mark_incomplete(&error);
@@ -4884,7 +5059,11 @@ fn process_inference_task(
                             interim_generation.expect("interim tasks carry a generation"),
                             Ordering::Release,
                         );
-                        if current.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+                        if !current
+                            .error
+                            .as_deref()
+                            .is_some_and(should_preserve_public_commit_error)
+                        {
                             current.error = None;
                         }
                         current.enforce_bounds();
@@ -4920,10 +5099,10 @@ fn process_inference_task(
 #[cfg(windows)]
 fn apply_final_commit_result(
     current: &mut MvpSnapshot,
-    result: Result<(DurableFinal, bool), String>,
+    result: Result<(DurableFinal, bool, Option<String>), String>,
 ) {
     match result {
-        Ok((final_segment, duplicate)) => {
+        Ok((final_segment, duplicate, mirror_error)) => {
             let total = usize::try_from(final_segment.sequence).unwrap_or(usize::MAX);
             if !duplicate
                 && !current
@@ -4939,13 +5118,27 @@ fn apply_final_commit_result(
             current.total_final_count = total.to_string();
             current.last_saved_sequence = Some(final_segment.sequence.to_string());
             current.visible_final_window_start_sequence = visible_window_start_sequence(total);
-            if current.error.as_deref() != Some("ASR_FINAL_OVERLOAD") {
+            if let Some(error) = mirror_error {
+                set_public_error(current, &error);
+            } else if !current
+                .error
+                .as_deref()
+                .is_some_and(should_preserve_public_commit_error)
+            {
                 current.error = None;
             }
             current.enforce_bounds();
         }
         Err(error) => set_public_error(current, &error),
     }
+}
+
+#[cfg(windows)]
+fn should_preserve_public_commit_error(error: &str) -> bool {
+    matches!(
+        error,
+        "ASR_FINAL_OVERLOAD" | "LIVE_TEXT_MIRROR_WRITE_FAILED"
+    )
 }
 
 #[cfg(windows)]
@@ -5602,13 +5795,147 @@ mod tests {
         dsp::{BLOCK_SAMPLES, SPEECH_START_BLOCKS},
     };
 
-    #[cfg(windows)]
     fn unique_temp_root(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "meetingrelay-service-{test_name}-{}-{}",
             std::process::id(),
             crate::mvp::storage::now_ms_string()
         ))
+    }
+
+    #[test]
+    fn live_text_directory_must_be_existing_absolute_directory() {
+        let root = unique_temp_root("live-text-validation");
+        assert_eq!(
+            validate_live_text_directory(Path::new("relative-live-text")).unwrap_err(),
+            "LIVE_TEXT_DIRECTORY_NOT_ABSOLUTE"
+        );
+        assert_eq!(
+            validate_live_text_directory(&root).unwrap_err(),
+            "LIVE_TEXT_DIRECTORY_UNAVAILABLE"
+        );
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("not-a-directory");
+        std::fs::write(&file_path, "x").unwrap();
+
+        assert_eq!(
+            validate_live_text_directory(&file_path).unwrap_err(),
+            "LIVE_TEXT_DIRECTORY_UNAVAILABLE"
+        );
+        assert_eq!(validate_live_text_directory(&root), Ok(()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_text_mirror_creates_non_overwriting_utf8_lf_file() {
+        let root = unique_temp_root("live-text-create");
+        std::fs::create_dir_all(&root).unwrap();
+        let meeting_id = "meeting-live-text-create";
+        let expected_path = root.join(format!("MeetingRelay-{meeting_id}.txt"));
+        std::fs::write(&expected_path, "existing").unwrap();
+
+        assert_eq!(
+            LiveTextMirror::begin(&root, meeting_id).unwrap_err(),
+            "LIVE_TEXT_MIRROR_BEGIN_FAILED"
+        );
+        assert_eq!(std::fs::read_to_string(&expected_path).unwrap(), "existing");
+
+        let other_meeting = "meeting-live-text-other";
+        let mut mirror = LiveTextMirror::begin(&root, other_meeting).unwrap();
+        mirror.append_final_original("第一行").unwrap();
+        mirror.append_final_original("second line").unwrap();
+        drop(mirror);
+
+        let other_path = root.join(format!("MeetingRelay-{other_meeting}.txt"));
+        assert_eq!(
+            std::fs::read_to_string(other_path).unwrap(),
+            "第一行\nsecond line\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_text_error_disables_future_mirror_writes_for_meeting() {
+        let root = unique_temp_root("live-text-error-disable");
+        std::fs::create_dir_all(&root).unwrap();
+        let meeting_id = "meeting-live-text-error-disable";
+        let mirror = LiveTextMirror::begin(&root, meeting_id).unwrap();
+        let mirrors = Mutex::new(HashMap::from([(meeting_id.to_owned(), mirror)]));
+
+        let mut locked = lock(&mirrors);
+        assert_eq!(
+            disable_live_text_mirror_after_error(
+                &mut locked,
+                meeting_id,
+                "LIVE_TEXT_MIRROR_WRITE_FAILED"
+            ),
+            "LIVE_TEXT_MIRROR_WRITE_FAILED"
+        );
+        drop(locked);
+        assert_eq!(
+            append_live_text_final(&mirrors, meeting_id, "ignored"),
+            None
+        );
+        assert!(!lock(&mirrors).contains_key(meeting_id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_text_start_failure_cleanup_removes_only_empty_mirror_file() {
+        let root = unique_temp_root("live-text-cleanup");
+        std::fs::create_dir_all(&root).unwrap();
+        let empty_meeting = "meeting-live-text-empty-cleanup";
+        let empty_path = root.join(format!("MeetingRelay-{empty_meeting}.txt"));
+        let empty_mirror = LiveTextMirror::begin(&root, empty_meeting).unwrap();
+        let mirrors = Mutex::new(HashMap::from([(empty_meeting.to_owned(), empty_mirror)]));
+
+        cleanup_live_text_mirror_empty_file(&mirrors, empty_meeting);
+
+        assert!(!empty_path.exists());
+        assert!(!lock(&mirrors).contains_key(empty_meeting));
+
+        let nonempty_meeting = "meeting-live-text-nonempty-cleanup";
+        let nonempty_path = root.join(format!("MeetingRelay-{nonempty_meeting}.txt"));
+        let mut nonempty_mirror = LiveTextMirror::begin(&root, nonempty_meeting).unwrap();
+        nonempty_mirror
+            .append_final_original("already written")
+            .unwrap();
+        let mirrors = Mutex::new(HashMap::from([(
+            nonempty_meeting.to_owned(),
+            nonempty_mirror,
+        )]));
+
+        cleanup_live_text_mirror_empty_file(&mirrors, nonempty_meeting);
+
+        assert_eq!(
+            std::fs::read_to_string(&nonempty_path).unwrap(),
+            "already written\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_text_append_reports_first_failure_and_disables_meeting() {
+        let meeting_id = "meeting-live-text-disable";
+        let mirror = LiveTextMirror {
+            path: PathBuf::from("/dev/full"),
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        };
+        let mirrors = Mutex::new(HashMap::from([(meeting_id.to_owned(), mirror)]));
+
+        assert_eq!(
+            append_live_text_final(&mirrors, meeting_id, "will fail").as_deref(),
+            Some("LIVE_TEXT_MIRROR_WRITE_FAILED")
+        );
+        assert_eq!(
+            append_live_text_final(&mirrors, meeting_id, "ignored"),
+            None
+        );
+        assert!(!lock(&mirrors).contains_key(meeting_id));
     }
 
     #[cfg(windows)]
@@ -6625,6 +6952,29 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn durable_final_for_test(sequence: u64, text: &str) -> DurableFinal {
+        DurableFinal {
+            meeting_id: "meeting-test".to_owned(),
+            segment_id: format!("segment-{sequence}"),
+            sequence,
+            revision: 1,
+            text: text.to_owned(),
+            started_at_ms: "0".to_owned(),
+            ended_at_ms: "20".to_owned(),
+            content_sha256: sha256_hex(text.as_bytes()),
+            committed_at: now_ms_string(),
+            commit_id: format!("commit-{sequence}"),
+            meeting_sample_start: 0,
+            meeting_sample_end: 320,
+            timeline_revision: 1,
+            translation_status: "disabled".to_owned(),
+            translation_target: None,
+            translation_text: None,
+            translation_error: None,
+        }
+    }
+
     #[test]
     fn default_service_is_private_local_durable_and_booting() {
         let snapshot = MvpService::default().snapshot();
@@ -7392,6 +7742,25 @@ mod tests {
             snapshot.error.as_deref(),
             Some("MVP_STORAGE_FINAL_SEQUENCE_GAP_OR_REORDER")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_text_mirror_write_error_persists_after_later_final() {
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.error = Some("LIVE_TEXT_MIRROR_WRITE_FAILED".to_owned());
+
+        apply_final_commit_result(
+            &mut snapshot,
+            Ok((durable_final_for_test(2, "later"), false, None)),
+        );
+
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("LIVE_TEXT_MIRROR_WRITE_FAILED")
+        );
+        assert_eq!(snapshot.finals.len(), 1);
+        assert_eq!(snapshot.saved_final_count, "2");
     }
 
     #[cfg(windows)]

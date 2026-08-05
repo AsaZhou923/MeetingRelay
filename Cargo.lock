@@ -1760,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "meetingrelay-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cpal",
  "meetingrelay-model-worker-sherpa-native",
@@ -1774,11 +1774,11 @@ dependencies = [
 
 [[package]]
 name = "meetingrelay-model-worker-contract"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "meetingrelay-model-worker-sherpa-native"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "meetingrelay-model-worker-contract",
  "sha2",
