@@ -9,6 +9,8 @@ import {
   mergeProbeStates,
   nextTranscriptFollowState,
   returnToLatest,
+  selectLatestTranscriptLine,
+  translationOnlyText,
 } from "./frontend-state.ts";
 
 test("start state enters a running phase immediately", () => {
@@ -121,6 +123,58 @@ test("returning to latest clears unseen rows", () => {
   });
 });
 
+test("latest transcript dock prefers the interim sentence and otherwise keeps the newest final", () => {
+  assert.deepEqual(selectLatestTranscriptLine("正在确认这一句", ["第一句", "第二句"]), {
+    text: "正在确认这一句",
+    kind: "interim",
+  });
+  assert.deepEqual(selectLatestTranscriptLine(null, ["第一句", "第二句"]), {
+    text: "第二句",
+    kind: "final",
+  });
+  assert.deepEqual(selectLatestTranscriptLine(null, []), {
+    text: "等待实时文字。",
+    kind: "empty",
+  });
+});
+
+test("translation-only display never falls back to the original transcript", () => {
+  assert.deepEqual(
+    translationOnlyText({ translationStatus: "completed", translationText: "翻訳だけ" }),
+    { text: "翻訳だけ", kind: "translation" },
+  );
+  assert.deepEqual(translationOnlyText({ translationStatus: "pending", translationText: null }), {
+    text: "正在等待译文…",
+    kind: "status",
+  });
+  assert.deepEqual(translationOnlyText({ translationStatus: "failed", translationText: null }), {
+    text: "翻译失败；原文仍已安全保存。",
+    kind: "status",
+  });
+  assert.deepEqual(translationOnlyText({ translationStatus: "skipped", translationText: null }), {
+    text: "译文语言与识别语言相同，已跳过翻译。",
+    kind: "status",
+  });
+  assert.deepEqual(translationOnlyText({ translationStatus: "disabled", translationText: null }), {
+    text: "翻译未启用；可切回“原文 + 译文”查看原文。",
+    kind: "status",
+  });
+});
+
+test("latest transcript dock uses translation state in translation-only mode", () => {
+  const finals = [
+    {
+      text: "original must stay hidden",
+      translationStatus: "completed",
+      translationText: "翻訳だけ",
+    },
+  ];
+  assert.deepEqual(selectLatestTranscriptLine("interim must stay hidden", finals, "translation_only"), {
+    text: "翻訳だけ",
+    kind: "translation",
+  });
+});
+
 test("main source defines three primary navigation tabs outside the live transcript", () => {
   const source = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
   assert.match(source, /data-view="live"[^>]*>实时会议/);
@@ -132,4 +186,17 @@ test("main source defines three primary navigation tabs outside the live transcr
   assert.ok(transcriptStageStart >= 0);
   assert.ok(transcriptStageEnd > transcriptStageStart);
   assert.ok(consoleStart > transcriptStageEnd);
+  assert.match(source, /latest-dock-title[^>]*>最新一句/);
+  assert.match(source, /id="transcript-display-mode"/);
+  assert.match(source, /id="live-text-enabled"/);
+  assert.match(source, /liveTextDirectory:/);
+});
+
+test("layout source fixes the live transcript height and prevents secondary cards from clipping", () => {
+  const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  assert.match(styles, /#live-view\s*{[^}]*height:\s*100%[^}]*overflow:\s*hidden/s);
+  assert.match(styles, /\.workspace\s*{[^}]*height:\s*100%/s);
+  assert.match(styles, /\.secondary-workspace\s*{[^}]*grid-auto-rows:\s*max-content/s);
+  assert.match(styles, /\.secondary-workspace\s*>\s*\*\s*{[^}]*min-height:\s*auto/s);
+  assert.match(styles, /\.secondary-workspace \.console-card\s*{[^}]*overflow:\s*visible/s);
 });

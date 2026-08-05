@@ -31,6 +31,22 @@ export interface TranscriptFollowState {
   announcement: string;
 }
 
+export interface LatestTranscriptLine {
+  text: string;
+  kind: "interim" | "final" | "translation" | "status" | "empty";
+}
+
+export interface TranslationDisplaySource {
+  translationStatus: string;
+  translationText: string | null;
+}
+
+export interface TranscriptDisplaySource extends TranslationDisplaySource {
+  text: string;
+}
+
+export type TranscriptDisplayMode = "source_and_translation" | "translation_only";
+
 export function beginStartUiState(): StartUiState {
   return {
     phase: "running",
@@ -55,6 +71,46 @@ export function returnToLatest(): TranscriptFollowState {
     showJumpButton: false,
     announcement: "正在跟随最新内容。",
   };
+}
+
+export function selectLatestTranscriptLine(
+  interimText: string | null,
+  finals: readonly (string | TranscriptDisplaySource)[],
+  displayMode: TranscriptDisplayMode = "source_and_translation",
+): LatestTranscriptLine {
+  if (displayMode === "translation_only") {
+    const latestFinal = finals.at(-1);
+    if (latestFinal === undefined) return { text: "等待译文。", kind: "empty" };
+    if (typeof latestFinal === "string") {
+      return { text: "正在等待译文…", kind: "status" };
+    }
+    return translationOnlyText(latestFinal);
+  }
+  const interim = interimText?.trim() ?? "";
+  if (interim.length > 0) return { text: interim, kind: "interim" };
+  const latest = finals.at(-1);
+  const latestFinal = (typeof latest === "string" ? latest : latest?.text)?.trim() ?? "";
+  if (latestFinal.length > 0) return { text: latestFinal, kind: "final" };
+  return { text: "等待实时文字。", kind: "empty" };
+}
+
+export function translationOnlyText(source: TranslationDisplaySource): LatestTranscriptLine {
+  if (source.translationStatus === "completed") {
+    const translation = source.translationText?.trim() ?? "";
+    return translation.length > 0
+      ? { text: translation, kind: "translation" }
+      : { text: "译文为空；请重试翻译。", kind: "status" };
+  }
+  if (source.translationStatus === "pending") {
+    return { text: "正在等待译文…", kind: "status" };
+  }
+  if (source.translationStatus === "failed") {
+    return { text: "翻译失败；原文仍已安全保存。", kind: "status" };
+  }
+  if (source.translationStatus === "skipped") {
+    return { text: "译文语言与识别语言相同，已跳过翻译。", kind: "status" };
+  }
+  return { text: "翻译未启用；可切回“原文 + 译文”查看原文。", kind: "status" };
 }
 
 export function mergeProbeStates(

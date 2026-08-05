@@ -3,6 +3,38 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-08-05 — v0.1.2 Remembered settings and optional live text mirror
+
+- Added a persistent live-transcript display choice between original plus
+  translation and translation only. The main transcript, fixed latest-line dock,
+  and caption overlay share the same rule; pending, failed, skipped, and disabled
+  translations show an explicit status instead of leaking the original text or
+  leaving a blank row.
+- Kept translation opt-in and remembered the last non-secret meeting settings:
+  recognition language, audio-source mode, display mode, live-TXT choice and
+  directory, translation enabled state, target language, Provider Profile, model,
+  and remote-HTTP acknowledgement. Provider Base URL/model remain in the existing
+  versioned SQLite Profile; API tokens remain exclusively in Windows Credential
+  Manager and are not written to localStorage or SQLite.
+- Added an optional per-meeting UTF-8/LF TXT mirror. It is off by default, requires
+  an existing absolute directory, creates `MeetingRelay-{meeting_id}.txt` without
+  overwriting an existing file, and appends only non-duplicate final originals
+  after the SQLite commit acknowledgement. A mirror failure disables only the
+  external writer and leaves the durable meeting record intact.
+- Added actionable path/write errors and regression coverage for preference
+  parsing, secret exclusion, all translation-only states, IPC compatibility,
+  directory validation, non-overwrite behavior, commit ordering, and mirror
+  failure isolation.
+- Validation passed with 56 frontend tests, a TypeScript/Vite production build,
+  199 Rust tests (5 additional environment-dependent tests ignored by design),
+  `cargo fmt --check`, and Clippy with warnings denied. A real Windows meeting
+  writing to representative local/network-controlled directories remains an
+  environment acceptance item.
+- Frozen `v0.1.2` Windows executable candidate: 14,639,104 bytes, ProductVersion
+  `0.1.2`, SHA-256
+  `F025EECFB8A14344F5E93754AA1C137451296A5EBC001C82BF8770D19C4EDDA3`.
+  The public EXE remains unsigned and excludes the model and Sherpa runtime.
+
 ## 2026-08-04 — Meeting workflow usability remediation
 
 - Reorganized the desktop UI into three task-focused views: Live Meeting,
@@ -17,6 +49,11 @@ decisions, and known acceptance gaps.
 - Added an independent transcript scroller, explicit follow-latest state, an
   unseen-item counter with a Return to Latest action, and a fixed latest/current
   line area that does not disturb a user reading earlier transcript rows.
+- Corrected the follow-up layout regressions in Meeting Records and Settings:
+  secondary cards now keep their intrinsic height, use page-level scrolling,
+  and no longer clip their controls. The live workspace now owns the remaining
+  window height, keeps transcript history in a bounded scroller, and labels the
+  fixed bottom dock as the latest sentence.
 - Kept Provider test results in dedicated state so profile refreshes no longer
   erase success or failure feedback. Profile and secret mutations now invalidate
   stale results explicitly instead of presenting an old probe as current.
@@ -26,12 +63,13 @@ decisions, and known acceptance gaps.
 - Suppressed non-interactive Windows PowerShell windows for Credential Manager
   and disk-space checks, removing the known source of repeated console flashes.
 - Added pure frontend state coverage for start guards, Provider result
-  persistence, and transcript following. Validation passed with 50 frontend
+  persistence, transcript following, and latest-sentence selection. Validation
+  passed with 52 frontend
   tests, TypeScript/Vite production build, 214 Rust tests (5 ignored by design),
   and all 10 personal-release contract assertions.
 - Generated and window-smoke-tested a package-local personal build at
   14,605,312 bytes with SHA-256
-  `736DA15BDDB553FAE0984E23C80C81B1B696E5AAAD4619733EA74CC57997B5FB`.
+  `D72E5245E46DFF65BC181E2AF41003050FD8026E3904338F262AA331182E5CA0`.
 - Cold/warm start p50/p95, real local/LAN/cloud Provider matrices, high-DPI
   coverage, and long-meeting transcript pressure remain explicit environment
   acceptance work.

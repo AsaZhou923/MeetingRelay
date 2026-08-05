@@ -37,9 +37,12 @@ MeetingRelay captures system playback and microphone input, performs real-time s
 - **Chinese, Japanese, and English** — select one recognition language before each meeting; the choice is locked while recording.
 - **Focused meeting workflow** — separate Live Meeting, Meeting Records, and Settings views keep session controls and the transcript visible without mixing in administration tools.
 - **Stable live transcript** — final rows are reconciled by stable keys, scroll independently, follow the latest line by default, and preserve the reading position when the user reviews earlier content.
+- **Selectable transcript presentation** — keep the default original-plus-translation view, or persist a translation-only live view across the transcript, latest-line dock, and caption overlay.
 - **Predictable Provider checks** — connection feedback remains visible in place, uses a bounded 15-second probe, and does not flash PowerShell console windows.
 - **Persistence first** — the original transcript is committed to SQLite/WAL before it is shown as saved or submitted for translation.
 - **Optional AI translation** — supports local and third-party OpenAI-compatible Chat Completions services.
+- **Optional live TXT mirror** — write committed final originals to a new per-meeting UTF-8/LF file in an explicitly configured directory, without replacing the SQLite source of truth.
+- **Remembered non-secret settings** — restores the last recognition/source/display/translation/live-TXT choices and selected Provider Profile while keeping API tokens in the OS vault.
 - **Failure isolation** — translation, network, or model failures do not affect committed originals.
 - **Meeting recovery** — recover committed finals after an abnormal exit and reopen the most recent meeting.
 - **Copy and export** — copy the complete transcript or export JSON, Markdown, and TXT.
@@ -54,6 +57,7 @@ flowchart LR
     CAP --> ASR["Local Cohere GPU or SenseVoice CPU ASR"]
     ASR --> DB["SQLite / WAL<br/>durable final"]
     DB --> UI["Stable live transcript"]
+    DB --> TXT["Optional per-meeting TXT mirror"]
     DB --> TQ["Independent translation queue"]
     TQ --> LLM["OpenAI-compatible service"]
     LLM --> TR["Translation state and result"]
@@ -68,6 +72,10 @@ The ordering is always:
 3. The UI marks the segment as saved.
 4. If translation is enabled, the committed final is submitted asynchronously.
 5. The translation is persisted independently as `completed`, `failed`, or `skipped`.
+
+The optional live TXT mirror follows the same durability boundary: it receives a
+non-duplicate original only after the SQLite final commit succeeds. It is an
+additional convenience output, not a replacement for the meeting database.
 
 ## Quick Start
 
@@ -208,8 +216,9 @@ Choose **Other compatible service** to enter a custom Base URL, model ID, and AP
    available for other compatible services.
 4. Enter the API token when the provider requires one. **Test connection** or starting a meeting stores it in Windows Credential Manager, not in ordinary preferences or SQLite.
 5. Select the translation language for the meeting: Chinese, Japanese, or English.
-6. Run **Test connection**. The probe sends only a fixed synthetic sentence, never meeting content.
-7. Confirm the recording and third-party data disclosure before starting the meeting.
+6. Choose whether the live UI shows **Original + translation** or **Translation only**.
+7. Run **Test connection**. The probe sends only a fixed synthetic sentence, never meeting content.
+8. Confirm the recording and third-party data disclosure before starting the meeting.
 
 If the translation language is the same as the recognition language, MeetingRelay does not contact the provider and persists the segment as `skipped`.
 
@@ -241,13 +250,29 @@ HTTP is allowed directly for `localhost`, `127.0.0.1`, and `[::1]`. Non-loopback
 
 API tokens are loaded into process memory only while needed and are persisted exclusively in Windows Credential Manager. They are never written to localStorage, SQLite, logs, or exports. Use **Remove from OS vault** in Provider management to delete a stored token. The non-secret remote HTTP acknowledgement may be stored locally as a preference.
 
+### Last-used settings and live TXT
+
+MeetingRelay restores the last recognition language, audio-source mode, live
+display mode, translation enabled state, target language, Provider Profile,
+model, remote-HTTP acknowledgement, and live-TXT directory choice. Provider Base
+URLs and models use the existing versioned SQLite Profile store; ordinary browser
+preferences never contain a token or a Provider Base URL.
+
+Live TXT is off by default. When enabled, enter an existing writable absolute
+directory before starting. Each meeting creates a new
+`MeetingRelay-{meeting_id}.txt`, appends only committed final originals as UTF-8
+with LF line endings, and refuses to overwrite an existing name. The directory is
+locked for the active meeting. If that external write later fails, MeetingRelay
+stops mirroring and reports the failure while continuing to protect committed
+originals in SQLite.
+
 ## Downloads and releases
 
-Latest formal release: [MeetingRelay v0.1.1](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+Latest formal release: [MeetingRelay v0.1.2](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | File | Size | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.1/MeetingRelay.exe) | 14,357,504 bytes | `B2276B4EFBF974EFCFA5B7D4A09C9DAE9789D8052880DBB0BDEC45C4C178997C` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.2/MeetingRelay.exe) | 14,639,104 bytes | `F025EECFB8A14344F5E93754AA1C137451296A5EBC001C82BF8770D19C4EDDA3` |
 
 Build a complete same-machine package:
 
@@ -345,6 +370,8 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
   advantage over SenseVoice.
 - Mixed-language recognition is not supported. Each meeting uses one selected recognition language.
 - OpenAI-compatible translation uses non-streaming requests per final segment. Manual segment/meeting retry and sanitized attempt provenance are included; token streaming, context windows, proxies, and custom headers/bodies are not.
+- Translation-only is a live presentation choice, not a deletion or storage mode; original finals remain durable and available for meeting records, recovery, copy, and export.
+- Live TXT currently mirrors committed original finals only and accepts an existing absolute directory entered by the user; native directory picking and translated/bilingual live-file modes are not included.
 - The 60-minute microphone path and an audible system-loopback short meeting have passed real-device validation. Device hot-plug behavior still requires validation.
 - A short real Windows system-audio meeting has passed the full local-ASR → remote-translation → SQLite path with `gpt-5.4-mini`. The repository now includes a repeatable Windows acceptance evidence gate for 10–20 minute HTTPS meetings, cost/latency/quality reporting, two-hour dual-source loss/gap, and timeline p95/max thresholds. A real evidence run on representative hardware, a second clean Windows machine, and a signed installer have not been validated.
 - The published `MeetingRelay.exe` is unsigned, and public assets do not include the model or Sherpa runtime. The repository can build an explicitly marked unsigned NSIS test installer; a formal installer remains blocked until asset redistribution is approved and an Authenticode certificate is supplied.

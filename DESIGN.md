@@ -3,7 +3,7 @@
 ## Source of truth
 
 - Status: Implemented baseline
-- Last refreshed: 2026-08-04
+- Last refreshed: 2026-08-05
 - Primary product surfaces: Windows 桌面端的实时会议、会议记录、设置与诊断界面
 - Evidence reviewed:
   - `apps/desktop/src/main.ts`
@@ -22,7 +22,7 @@
 
 ## Implementation snapshot
 
-The 2026-08-04 baseline now includes the three primary views, persistent in-place provider probe results, immediate and duplicate-safe start feedback, an independent transcript viewport with explicit follow-latest behavior, a fixed latest-line area, a Chinese-first visual language, no-window PowerShell execution, and a 15-second provider probe budget. The meeting controls remain visible at the top of the live-meeting rail while its detailed checks scroll independently.
+The 2026-08-05 baseline now includes the three primary views, persistent in-place provider probe results, immediate and duplicate-safe start feedback, an independent transcript viewport with explicit follow-latest behavior, a fixed and explicitly labelled latest-line area, a persistent original-plus-translation/translation-only display choice shared by the main view and overlay, remembered non-secret meeting/Provider settings, an optional post-commit live TXT mirror, a Chinese-first visual language, no-window PowerShell execution, and a 15-second provider probe budget. The meeting controls remain visible at the top of the live-meeting rail while its detailed checks scroll independently. Meeting Records and Settings use intrinsically sized cards inside their own vertical workspaces, so card contents are never compressed or clipped to satisfy the grid.
 
 The remaining measurement work is explicitly tracked rather than treated as complete: cold/warm start p50/p95 telemetry, a real local/LAN/cloud provider matrix, 125%/150% Windows scaling coverage, and further decomposition of `main.ts`.
 
@@ -84,7 +84,9 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - `SessionControlBar`：开始、启动中阶段、停止和运行时长；开始后保持位置稳定。
 - `ProviderProbeResult`：连接测试的加载、成功、失败和详情；结果独立于配置列表刷新。
 - `TranscriptViewport`：只承载最终文字历史，拥有独立滚动区域。
-- `LatestLineDock`：固定显示当前临时句或最新一句；不随历史列表滚走。
+- `LatestLineDock`：固定在文字区底部，优先显示当前临时句，否则显示最新确认句；不随历史列表滚走，内容过长时限制在三行内。
+- `TranscriptDisplayPicker`：持久化选择“原文 + 译文”或“仅显示译文”；实时列表、最新一句与悬浮字幕必须遵循同一规则。
+- `LiveTextMirrorSetting`：会前选择是否把 durable final 原文实时写入独立 TXT；活动会议中锁定目录。
 - `FollowLatestButton`：用户离开底部且有新内容时出现，点击后恢复自动跟随。
 - `SecondaryWorkspace`：会议详情、说话人、摘要、导出、治理与诊断的次级工作区。
 
@@ -102,6 +104,7 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - 目标桌面基线：1920×1080、1366×768、1280×720；900×700 作为紧凑窗口验收尺寸。
 - 宽屏时就绪清单与文字区可并排；窄于约 1100 px 时清单折叠到文字区上方。
 - 中部内容区占用剩余高度，只有 `TranscriptViewport` 和次级列表独立滚动。
+- 会议记录与设置的卡片按内容高度展开，由各自的 `SecondaryWorkspace` 统一纵向滚动；不得用等分网格行压缩卡片内容。
 - 主要控制条固定在窗口底部，不应被历史列表或高级设置推离视口。
 - 不以横向滚动解决主流程空间不足；技术表格可在次级页面内局部滚动。
 
@@ -131,6 +134,9 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - 用户主动向上滚动后暂停跟随，保持阅读位置，并显示新内容数量与“回到最新”。
 - 点击“回到最新”或滚回底部后恢复跟随。
 - 临时句更新不应重建整个历史列表，也不应改变用户当前的历史阅读位置。
+- 默认显示原文与译文；选择“仅显示译文”时，completed 显示译文，pending/failed/skipped/disabled 显示明确状态，任何一种状态都不得回退显示原文或留空。
+- “仅显示译文”只改变展示，不改变原文的 SQLite 持久化、会议历史、复制或导出语义。
+- 实时 TXT 默认关闭；启用后只在 SQLite final commit ACK 后追加非重复原文，使用 UTF-8/LF、逐会议新文件并拒绝覆盖。
 
 ## Content voice
 
@@ -153,8 +159,8 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 ## Open questions
 
 - 用户更偏好固定显示“正在说的临时句”，还是固定显示“最新确认句 + 临时句”两行？
-- 翻译默认展示原文与译文，还是提供“只显示翻译”的持久化偏好？
 - 主要使用的窗口尺寸和缩放比例是什么？是否需要兼容 125%/150% Windows 缩放？
 - 连接测试短超时应统一为 15 秒，还是按本地/LAN/云服务分别配置？
 - 凭据访问的中期方案是批量/惰性 PowerShell，还是切换到原生 Windows Credential API？
 - 当前真实的点击开始到录制成功 p50/p95 尚未测量；应先埋点再确定性能预算。
+- 实时 TXT 是否需要原生目录选择器，以及译文/双语实时文件模式？当前首版明确只接受已存在的绝对目录并写 durable 原文。

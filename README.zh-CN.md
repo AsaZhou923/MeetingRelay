@@ -37,9 +37,12 @@ MeetingRelay 同时采集电脑播放声音和麦克风输入，在本机完成�
 - **中、日、英三语**：每场会议开始前选择中文、日文或英文，会议进行中锁定。
 - **聚焦会议主流程**：实时会议、会议记录和设置分为三个视图，会议控制与实时文字不会再和管理工具挤在同一长页面。
 - **稳定实时字幕**：确认文字按稳定键增量更新、独立滚动并默认跟随最新内容；用户查看旧内容时保留阅读位置，并可一键回到最新。
+- **可选字幕显示**：默认显示“原文 + 译文”，也可持久化选择“仅显示译文”；实时列表、最新一句和悬浮字幕使用同一规则。
 - **可预期的服务检查**：连接结果就地保留，探测预算限制为 15 秒，并且不会闪出 PowerShell 控制台窗口。
 - **持久化优先**：原文先提交 SQLite/WAL，再显示为已保存并进入翻译队列。
 - **可选 AI 翻译**：支持本机和第三方 OpenAI-compatible Chat Completions 服务。
+- **可选实时 TXT**：把已提交的 final 原文追加到用户指定目录下的新会议文件，SQLite 仍是唯一主存储。
+- **记住非密钥设置**：恢复上次的识别、音源、显示、翻译和实时 TXT 选择，以及所选 Provider Profile；API Token 仍只保存在系统凭据中。
 - **故障隔离**：翻译、网络或模型失败不影响已经提交的原文。
 - **会议恢复**：异常退出后可以恢复已提交的 final，并重新打开最近会议。
 - **复制与导出**：支持复制完整转写，以及导出 JSON、Markdown 和 TXT。
@@ -54,6 +57,7 @@ flowchart LR
     CAP --> ASR["Cohere GPU 或 SenseVoice CPU 本地 ASR"]
     ASR --> DB["SQLite / WAL<br/>durable final"]
     DB --> UI["稳定实时字幕"]
+    DB --> TXT["可选的逐会议实时 TXT"]
     DB --> TQ["独立翻译队列"]
     TQ --> LLM["OpenAI-compatible 服务"]
     LLM --> TR["译文状态与结果"]
@@ -68,6 +72,8 @@ flowchart LR
 3. UI 显示“已保存”。
 4. 若启用翻译，再异步请求所选服务。
 5. 译文以 `completed`、`failed` 或 `skipped` 状态独立持久化。
+
+可选实时 TXT 也遵守同一持久化边界：只有非重复 final 原文成功提交 SQLite 后才会写入。它是附加的便捷输出，不替代会议数据库。
 
 ## 快速开始
 
@@ -201,9 +207,11 @@ MeetingRelay 不捆绑翻译模型。可以使用本机 Ollama / LM Studio，也
 2. 选择服务预设，或填写自定义 Base URL。
 3. 使用 Ollama 或 LM Studio 时，点击“刷新本地模型”读取 loopback
    `/v1/models` 列表并选择已安装模型；其他兼容服务仍可手填 model ID。
-4. 选择本场会议的译文语言：中文、日文或英文。
-5. 点击“测试连接”；测试只发送固定合成短句，不发送会议内容。
-6. 确认录音与第三方数据发送提示后开始会议。
+4. 服务需要凭据时填写 API Token；测试连接或开始会议会把它保存到 Windows 凭据管理器，而不是普通偏好或 SQLite。
+5. 选择本场会议的译文语言：中文、日文或英文。
+6. 选择实时界面显示“原文 + 译文”或“仅显示译文”。
+7. 点击“测试连接”；测试只发送固定合成短句，不发送会议内容。
+8. 确认录音与第三方数据发送提示后开始会议。
 
 当译文语言与识别语言相同时，MeetingRelay 不会请求模型，而是把该条记录为 `skipped`。
 
@@ -216,15 +224,21 @@ Local profile 只接受 loopback 地址。Provider 测试会先确认所选模�
 > [!WARNING]
 > 远程 HTTP 会以明文传输 API Token 和 durable final 原文，可能被读取或篡改。风险确认只表达用户选择，不能提供传输机密性或完整性；请优先配置 HTTPS。
 
-API Token 只保存在当前应用进程内存，不写入 localStorage、SQLite、日志或导出。远程 HTTP 的风险确认属于非密钥偏好，可以保存在本机。
+API Token 仅在需要时载入进程内存，并且只持久化到 Windows 凭据管理器；不会写入 localStorage、SQLite、日志或导出。可以在服务管理中点击“从系统凭据移除”删除已保存 Token。远程 HTTP 的风险确认属于非密钥偏好，可以保存在本机。
+
+### 上次设置与实时 TXT
+
+MeetingRelay 会恢复上次的识别语言、音源模式、实时显示模式、翻译开关、译文语言、Provider Profile、模型、远程 HTTP 风险确认，以及实时 TXT 开关和目录。Provider Base URL 与模型继续使用带版本的 SQLite Profile；普通浏览器偏好不保存 Token，也不保存 Provider Base URL。
+
+实时 TXT 默认关闭。启用后，需要在开始会议前填写一个已存在、可写的绝对目录。每场会议创建新的 `MeetingRelay-{meeting_id}.txt`，以 UTF-8 和 LF 逐行追加已提交的 final 原文，并拒绝覆盖同名文件。会议进行中目录锁定；如果外部文件写入失败，只停止本场镜像并显示错误，SQLite 中已提交的原文不受影响。
 
 ## 下载与发布
 
-最新正式版本：[MeetingRelay v0.1.1](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+最新正式版本：[MeetingRelay v0.1.2](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.1/MeetingRelay.exe) | 14,357,504 bytes | `B2276B4EFBF974EFCFA5B7D4A09C9DAE9789D8052880DBB0BDEC45C4C178997C` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.2/MeetingRelay.exe) | 14,639,104 bytes | `F025EECFB8A14344F5E93754AA1C137451296A5EBC001C82BF8770D19C4EDDA3` |
 
 生成完整的同机运行目录：
 
@@ -310,6 +324,8 @@ MeetingRelay/
 - Cohere 已通过上述本机 CUDA/集成 smoke，但仍需中/日/英同材料、噪声环境和代表性长会对比，才能量化它比 SenseVoice 强多少。
 - 当前不做中日英混合识别；每场会议只选择一种识别语言。
 - OpenAI-compatible 翻译目前是 final 级非流式请求；已支持单段/整场手动重试和脱敏 attempt provenance，但仍不支持 token streaming、上下文窗口、代理和自定义 Header/请求体。
+- “仅显示译文”只是实时界面的显示偏好，不会删除或停止保存原文；会议记录、恢复、复制和导出仍以完整 durable 数据为准。
+- 实时 TXT 首版只写已提交原文，目录由用户填写为已存在的绝对路径；尚未提供系统目录选择器，也不支持实时文件的译文/双语模式。
 - 60 分钟麦克风链路和有声系统输出短会已经通过真实设备验收；设备热插拔仍需继续验证。
 - 短会已通过本地 ASR → 远程翻译 → SQLite 全链路。仓库也加入了可重复执行的 Windows 验收门禁，覆盖 10–20 分钟 HTTPS 会议、费用/延迟/质量、2 小时双音源 loss/gap 和 timeline p95/max；这些长时真实证据仍需代表性硬件完成。
 - 已发布的 `MeetingRelay.exe` 未签名，公开附件不包含模型或 Sherpa runtime。仓库可构建带明确标记的未签名 NSIS 测试安装包；正式安装包仍等待资产再分发审批和 Authenticode 证书。

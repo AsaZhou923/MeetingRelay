@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   MVP_CONTRACT_VERSION,
+  APP_PREFERENCE_KEY,
   formatMvpErrorMessage,
   formatMvpSnapshotError,
   formatElapsed,
@@ -11,8 +12,10 @@ import {
   hasAllMvpExportFormats,
   isMvpActiveLifecycle,
   isMvpActiveSession,
+  isWindowsAbsoluteDirectory,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
+  parseAppPreference,
   parseAsrModelProfiles,
   parseDeletePreview,
   parseDeleteResult,
@@ -54,6 +57,51 @@ test("accepts only the three R2 audio source modes", () => {
   assert.equal(parseMvpAudioSourceMode("microphone_only"), "microphone_only");
   assert.equal(parseMvpAudioSourceMode("both"), "both");
   assert.throws(() => parseMvpAudioSourceMode("none"), /audio source mode/);
+});
+
+test("parses non-secret last-used application settings", () => {
+  assert.equal(APP_PREFERENCE_KEY, "meetingrelay.app-settings.v1");
+  assert.deepEqual(
+    parseAppPreference(
+      JSON.stringify({
+        version: 1,
+        recognitionLanguage: "ja",
+        sourceMode: "system_only",
+        transcriptDisplayMode: "translation_only",
+        liveTextEnabled: true,
+        liveTextDirectory: "C:\\Users\\Example\\Documents\\MeetingRelay Live",
+      }),
+    ),
+    {
+      version: 1,
+      recognitionLanguage: "ja",
+      sourceMode: "system_only",
+      transcriptDisplayMode: "translation_only",
+      liveTextEnabled: true,
+      liveTextDirectory: "C:\\Users\\Example\\Documents\\MeetingRelay Live",
+    },
+  );
+  assert.equal(
+    parseAppPreference(
+      JSON.stringify({
+        version: 1,
+        recognitionLanguage: "ja",
+        sourceMode: "system_only",
+        transcriptDisplayMode: "translation_only",
+        liveTextEnabled: true,
+        liveTextDirectory: "C:\\invalid\u0000path",
+      }),
+    ),
+    null,
+  );
+});
+
+test("recognizes drive and UNC live-text directories before backend validation", () => {
+  assert.equal(isWindowsAbsoluteDirectory("C:\\Users\\Example\\MeetingRelay"), true);
+  assert.equal(isWindowsAbsoluteDirectory("D:/MeetingRelay"), true);
+  assert.equal(isWindowsAbsoluteDirectory("\\\\server\\share\\MeetingRelay"), true);
+  assert.equal(isWindowsAbsoluteDirectory("C:relative"), false);
+  assert.equal(isWindowsAbsoluteDirectory("relative\\MeetingRelay"), false);
 });
 
 test("parses the bounded R7 ASR model registry", () => {
@@ -286,6 +334,7 @@ test("parses non-secret local translation preferences and probe results", () => 
       model: "qwen2.5:7b",
       targetLanguage: "zh",
       allowInsecureHttp: false,
+      providerProfileId: null,
     },
   );
   assert.equal(
@@ -303,6 +352,29 @@ test("parses non-secret local translation preferences and probe results", () => 
     true,
   );
   assert.equal(parseTranslationPreference('{"version":1,"apiKey":"secret"}'), null);
+  assert.deepEqual(
+    parseTranslationPreference(
+      JSON.stringify({
+        version: 1,
+        enabled: false,
+        provider: "openai",
+        providerProfileId: "provider-cloud-default",
+        baseUrl: "",
+        model: "",
+        targetLanguage: "ja",
+      }),
+    ),
+    {
+      version: 1,
+      enabled: false,
+      provider: "openai",
+      providerProfileId: "provider-cloud-default",
+      baseUrl: "",
+      model: "",
+      targetLanguage: "ja",
+      allowInsecureHttp: false,
+    },
+  );
   assert.equal(
     parseTranslationPreference(
       JSON.stringify({
@@ -1099,6 +1171,10 @@ test("turns recoverable runtime error codes into actionable product messages", (
   assert.match(formatMvpErrorMessage("TRANSLATION_TIMEOUT"), /原文已保存在本机/);
   assert.match(formatMvpErrorMessage("TRANSLATION_PROBE_TIMEOUT"), /15 秒内未响应/);
   assert.match(formatMvpErrorMessage("LOCAL_TRANSLATION_SERVICE_TIMEOUT"), /本地翻译服务/);
+  assert.match(formatMvpErrorMessage("LIVE_TEXT_DIRECTORY_NOT_ABSOLUTE"), /绝对路径/);
+  assert.match(formatMvpErrorMessage("LIVE_TEXT_DIRECTORY_UNAVAILABLE"), /不存在或不是文件夹/);
+  assert.match(formatMvpErrorMessage("LIVE_TEXT_MIRROR_BEGIN_FAILED"), /会议未开始/);
+  assert.match(formatMvpErrorMessage("LIVE_TEXT_MIRROR_WRITE_FAILED"), /SQLite/);
   assert.equal(formatMvpErrorMessage("CUSTOM_FAILURE"), "CUSTOM_FAILURE");
   assert.match(
     formatMvpSnapshotError({

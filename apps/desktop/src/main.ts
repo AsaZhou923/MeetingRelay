@@ -8,12 +8,15 @@ import {
   mergeProbeStates,
   nextTranscriptFollowState,
   returnToLatest,
+  selectLatestTranscriptLine,
+  translationOnlyText,
   type ProbeUiState,
   type StartUiState,
   type TranscriptFollowState,
 } from "./frontend-state";
 import {
   AUDIO_DEVICE_PREFERENCE_KEY,
+  APP_PREFERENCE_KEY,
   TRANSLATION_PREFERENCE_KEY,
   formatMvpErrorMessage,
   formatMvpSnapshotError,
@@ -21,6 +24,7 @@ import {
   hasCompleteMvpTranscript,
   hasAllMvpExportFormats,
   isMvpActiveSession,
+  isWindowsAbsoluteDirectory,
   parseDeletePreview,
   parseDeleteResult,
   parseExportOptions,
@@ -29,6 +33,7 @@ import {
   parseMvpTranscriptText,
   parseAudioDeviceInventory,
   parseAudioDevicePreference,
+  parseAppPreference,
   parseAsrModelProfiles,
   parseProviderProfiles,
   parseProviderProfileDraft,
@@ -62,6 +67,7 @@ import {
   type MvpAudioSourceMode,
   type MvpRecognitionLanguage,
   type MvpSnapshot,
+  type MvpTranscriptDisplayMode,
   type ProviderProfile,
   type ProviderProfileDraft,
   type SegmentAudioLocation,
@@ -267,6 +273,18 @@ app.innerHTML = `
             <div><dt>磁盘可用</dt><dd id="disk-free">检测中</dd></div>
           </dl>
           <p id="disk-warning" class="disk-warning" aria-live="polite"></p>
+          <div class="live-text-settings">
+            <label class="raw-audio-toggle">
+              <input id="live-text-enabled" type="checkbox" />
+              <span>同时实时写入 TXT（默认关闭）</span>
+            </label>
+            <label class="device-picker">
+              <span>实时 TXT 目录</span>
+              <input id="live-text-directory" type="text" placeholder="例如 C:\\Users\\你\\Documents\\MeetingRelay" spellcheck="false" />
+              <small>填写已存在的绝对目录；每场会议创建独立文件。只有 SQLite 提交成功的确认原文才会追加写入。</small>
+            </label>
+            <p id="live-text-status" class="copy-status" aria-live="polite"></p>
+          </div>
           <button id="create-diagnostic-bundle" class="secondary-button" type="button">生成最小诊断包</button>
           <p id="diagnostic-status" class="copy-status" aria-live="polite"></p>
         </section>
@@ -301,6 +319,13 @@ app.innerHTML = `
           <div class="session-clock">
             <span id="lifecycle">启动中</span>
             <strong id="elapsed">00:00:00</strong>
+            <label class="transcript-display-picker">
+              <small>显示</small>
+              <select id="transcript-display-mode">
+                <option value="source_and_translation">原文 + 译文</option>
+                <option value="translation_only">仅显示译文</option>
+              </select>
+            </label>
             <button id="overlay-toggle" class="secondary-button overlay-toggle" type="button" aria-pressed="false" disabled>显示悬浮字幕</button>
           </div>
         </div>
@@ -317,7 +342,10 @@ app.innerHTML = `
             <span id="new-content-count">0 条新内容</span>
           </button>
           <div id="latest-dock" class="latest-dock" aria-live="polite">
-            <span id="follow-state">正在跟随最新内容</span>
+            <div class="latest-dock-meta">
+              <strong class="latest-dock-title">最新一句</strong>
+              <span id="follow-state">正在跟随最新内容</span>
+            </div>
             <p id="latest-line">等待实时文字。</p>
           </div>
           <div id="interim" class="interim-line" hidden>
@@ -564,6 +592,7 @@ const controls = {
   error: element<HTMLParagraphElement>("#error"),
   lifecycle: element<HTMLSpanElement>("#lifecycle"),
   elapsed: element<HTMLElement>("#elapsed"),
+  transcriptDisplayMode: element<HTMLSelectElement>("#transcript-display-mode"),
   overlayToggle: element<HTMLButtonElement>("#overlay-toggle"),
   model: element<HTMLElement>("#model-status"),
   empty: element<HTMLElement>("#empty-state"),
@@ -585,6 +614,9 @@ const controls = {
   meetingId: element<HTMLElement>("#meeting-id"),
   diskFree: element<HTMLElement>("#disk-free"),
   diskWarning: element<HTMLParagraphElement>("#disk-warning"),
+  liveTextEnabled: element<HTMLInputElement>("#live-text-enabled"),
+  liveTextDirectory: element<HTMLInputElement>("#live-text-directory"),
+  liveTextStatus: element<HTMLParagraphElement>("#live-text-status"),
   createDiagnosticBundle: element<HTMLButtonElement>("#create-diagnostic-bundle"),
   diagnosticStatus: element<HTMLParagraphElement>("#diagnostic-status"),
   retryFailedTranslations: element<HTMLButtonElement>("#retry-failed-translations"),
@@ -752,6 +784,7 @@ let latestSpeakerVersion: SpeakerVersion | null = null;
 let speakerVersion: SpeakerVersion | null = null;
 let providerProfiles: ProviderProfile[] = [];
 let selectedProviderId: string | null = null;
+let preferredProviderProfileId: string | null = null;
 let deletePreviewState: DeletePreview | null = null;
 let summaryJob: SummaryJob | null = null;
 let summaryPollTimer: number | null = null;
@@ -932,6 +965,87 @@ function currentSourceMode(): MvpAudioSourceMode {
   return parseMvpAudioSourceMode(controls.sourceMode.value);
 }
 
+function currentTranscriptDisplayMode(): MvpTranscriptDisplayMode {
+  return controls.transcriptDisplayMode.value === "translation_only"
+    ? "translation_only"
+    : "source_and_translation";
+}
+
+function currentLiveTextDirectory(): string | null {
+  if (!controls.liveTextEnabled.checked) return null;
+  const directory = controls.liveTextDirectory.value.trim();
+  return directory.length > 0 ? directory : null;
+}
+
+function liveTextConfigReady(): boolean {
+  const directory = currentLiveTextDirectory();
+  return (
+    !controls.liveTextEnabled.checked ||
+    (directory !== null && isWindowsAbsoluteDirectory(directory))
+  );
+}
+
+function readAppPreference() {
+  try {
+    const serialized = window.localStorage.getItem(APP_PREFERENCE_KEY);
+    const preference = parseAppPreference(serialized);
+    if (serialized !== null && preference === null) {
+      window.localStorage.removeItem(APP_PREFERENCE_KEY);
+    }
+    return preference;
+  } catch {
+    return null;
+  }
+}
+
+function persistAppPreference(): void {
+  try {
+    window.localStorage.setItem(
+      APP_PREFERENCE_KEY,
+      JSON.stringify({
+        version: 1,
+        recognitionLanguage: currentRecognitionLanguage(),
+        sourceMode: currentSourceMode(),
+        transcriptDisplayMode: currentTranscriptDisplayMode(),
+        liveTextEnabled: controls.liveTextEnabled.checked,
+        liveTextDirectory: controls.liveTextDirectory.value.trim(),
+      }),
+    );
+  } catch {
+    // The current selections remain usable when browser storage is unavailable.
+  }
+}
+
+function applyAppPreference(): void {
+  const preference = readAppPreference();
+  if (preference === null) return;
+  controls.recognitionLanguage.value = preference.recognitionLanguage;
+  controls.sourceMode.value = preference.sourceMode;
+  controls.transcriptDisplayMode.value = preference.transcriptDisplayMode;
+  controls.liveTextEnabled.checked = preference.liveTextEnabled;
+  controls.liveTextDirectory.value = preference.liveTextDirectory;
+}
+
+function renderLiveTextControls(active: boolean): void {
+  controls.liveTextEnabled.disabled = active;
+  controls.liveTextDirectory.disabled = active || !controls.liveTextEnabled.checked;
+  if (!controls.liveTextEnabled.checked) {
+    controls.liveTextStatus.dataset.status = "idle";
+    controls.liveTextStatus.textContent = "关闭；SQLite/WAL 仍会保存完整会议原文。";
+  } else if (!liveTextConfigReady()) {
+    controls.liveTextStatus.dataset.status = "error";
+    controls.liveTextStatus.textContent =
+      "请填写 Windows 绝对目录，例如 C:\\Users\\你\\Documents\\MeetingRelay。";
+  } else if (active) {
+    controls.liveTextStatus.dataset.status = "success";
+    controls.liveTextStatus.textContent = "会议进行中；每条确认原文会在 SQLite 提交后刷新到独立 TXT。";
+  } else {
+    controls.liveTextStatus.dataset.status = "ready";
+    controls.liveTextStatus.textContent =
+      "路径格式就绪；开始时会确认目录存在并可写，再创建不覆盖的 TXT。";
+  }
+}
+
 function currentTranslationConfig(): TranslationConfig {
   return {
     enabled: controls.translationEnabled.checked,
@@ -977,6 +1091,7 @@ async function persistTranslationProviderProfile(): Promise<string | null> {
   const profile = translationProviderProfile(config);
   if (profile === null) throw new Error("TRANSLATION_PROVIDER_PROFILE_REQUIRED");
   selectedProviderId = profile.profileId;
+  preferredProviderProfileId = profile.profileId;
   if (profile.baseUrl !== config.baseUrl || profile.model !== config.model) {
     await invoke<unknown>("mvp_save_provider_profile", {
       profile: {
@@ -1000,6 +1115,7 @@ async function persistTranslationProviderProfile(): Promise<string | null> {
     controls.translationApiKey.value = "";
   }
   await loadProviderProfiles();
+  persistTranslationPreference();
   return profile.profileId;
 }
 
@@ -1031,7 +1147,6 @@ function readTranslationPreference(): TranslationPreference | null {
 
 function persistTranslationPreference(): void {
   const config = currentTranslationConfig();
-  if (config.model.length === 0) return;
   try {
     window.localStorage.setItem(
       TRANSLATION_PREFERENCE_KEY,
@@ -1039,6 +1154,7 @@ function persistTranslationPreference(): void {
         version: 1,
         enabled: config.enabled,
         provider: controls.translationProvider.value,
+        providerProfileId: selectedProviderId ?? preferredProviderProfileId,
         baseUrl: "",
         model: config.model,
         targetLanguage: config.targetLanguage,
@@ -1052,6 +1168,7 @@ function persistTranslationPreference(): void {
 
 function applyTranslationPreference(preference: TranslationPreference | null): void {
   if (preference === null) return;
+  preferredProviderProfileId = preference.providerProfileId;
   controls.translationEnabled.checked = preference.enabled;
   controls.translationModel.value = preference.model;
   controls.translationLanguage.value = preference.targetLanguage;
@@ -1602,6 +1719,8 @@ function renderProviderProfiles(): void {
       button.title = `${profile.baseUrl}\n${profile.model}\n${profile.dataFlow}${profile.policyUrl ? `\n隐私政策：${profile.policyUrl}` : ""}${profile.lastError ? `\n错误：${profile.lastError}` : ""}`;
       button.addEventListener("click", () => {
         selectedProviderId = profile.profileId;
+        preferredProviderProfileId = profile.profileId;
+        persistTranslationPreference();
         controls.providerSecret.value = "";
         renderProviderProfiles();
       });
@@ -1770,9 +1889,21 @@ function updateTranscriptRow(item: HTMLLIElement, segment: TranscriptSegment): v
   const sequence = segment.sequence.padStart(2, "0");
   if (order.textContent !== sequence) order.textContent = sequence;
   if (body.textContent !== segment.text) body.textContent = segment.text;
+  const translationOnly = currentTranscriptDisplayMode() === "translation_only";
+  body.hidden = translationOnly;
+  item.dataset.displayMode = currentTranscriptDisplayMode();
   translation.dataset.status = segment.translationStatus;
+  delete translation.dataset.kind;
   translation.title = "";
-  if (segment.translationStatus === "completed") {
+  if (translationOnly) {
+    const presentation = translationOnlyText(segment);
+    translation.hidden = false;
+    translation.textContent = presentation.text;
+    translation.dataset.kind = presentation.kind;
+    if (segment.translationStatus === "failed") {
+      translation.title = segment.translationError ?? "";
+    }
+  } else if (segment.translationStatus === "completed") {
     translation.hidden = false;
     translation.textContent = `${LANGUAGE_LABELS[segment.translationTarget ?? "zh"]} 译文 · ${segment.translationText ?? ""}`;
   } else if (segment.translationStatus === "pending") {
@@ -1873,7 +2004,11 @@ function renderTranscript(finals: readonly TranscriptSegment[]): void {
       }
     }
     if (latestInserted) {
-      controls.transcriptAnnouncer.textContent = `已保存第 ${latestInserted.sequence} 条：${latestInserted.text}`;
+      const announced =
+        currentTranscriptDisplayMode() === "translation_only"
+          ? translationOnlyText(latestInserted).text
+          : latestInserted.text;
+      controls.transcriptAnnouncer.textContent = `已保存第 ${latestInserted.sequence} 条：${announced}`;
     }
     transcriptFollowState = nextTranscriptFollowState({
       followLatest: transcriptFollowState.followLatest,
@@ -1924,6 +2059,7 @@ function render(snapshot: MvpSnapshot): void {
     languagePreparing ||
     translationTesting ||
     !translationConfigReady() ||
+    !liveTextConfigReady() ||
     preparedLanguage !== currentRecognitionLanguage() ||
     preparedAsrModelId !== currentAsrModelId() ||
     !controls.consent.checked ||
@@ -1949,6 +2085,7 @@ function render(snapshot: MvpSnapshot): void {
   controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
   renderAudioDeviceControls(active);
   renderTranslationControls(active);
+  renderLiveTextControls(active);
   renderOverlayToggle(snapshot);
   controls.queue.textContent = `${snapshot.queueDepth} / 8`;
   controls.translationQueue.textContent = controls.translationEnabled.checked
@@ -2006,10 +2143,14 @@ function render(snapshot: MvpSnapshot): void {
   controls.empty.hidden = snapshot.finals.length > 0 || snapshot.interim !== null || active;
   controls.interim.hidden = true;
   controls.interimText.textContent = snapshot.interim?.text ?? "";
-  const latestFinal = snapshot.finals.at(-1);
-  controls.latestLine.textContent =
-    snapshot.interim?.text ?? latestFinal?.text ?? "等待实时文字。";
-  controls.latestLine.dataset.kind = snapshot.interim === null ? "final" : "interim";
+  const latestLine = selectLatestTranscriptLine(
+    snapshot.interim?.text ?? null,
+    snapshot.finals,
+    currentTranscriptDisplayMode(),
+  );
+  controls.latestLine.textContent = latestLine.text;
+  controls.latestLine.title = latestLine.text;
+  controls.latestLine.dataset.kind = latestLine.kind;
   updateTranscriptFollowControls();
   renderRecent(snapshot);
   renderExports(snapshot);
@@ -2311,13 +2452,26 @@ async function saveMeetingTags(): Promise<void> {
 async function loadProviderProfiles(): Promise<void> {
   providerProfiles = parseProviderProfiles(await invoke<unknown>("mvp_provider_profiles"));
   providerProbeStates = mergeProbeStates(providerProbeStates, providerProfiles);
-  if (
+  const preferredProfile = providerProfiles.find(
+    (profile) => profile.profileId === preferredProviderProfileId,
+  );
+  if (preferredProfile !== undefined) {
+    selectedProviderId = preferredProfile.profileId;
+    controls.translationBaseUrl.value = preferredProfile.baseUrl;
+    controls.translationModel.value = preferredProfile.model;
+  } else if (
     selectedProviderId === null ||
     !providerProfiles.some((profile) => profile.profileId === selectedProviderId)
   ) {
     selectedProviderId = providerProfiles[0]?.profileId ?? null;
   }
+  if (preferredProviderProfileId !== null && preferredProfile === undefined) {
+    preferredProviderProfileId = null;
+    controls.translationEnabled.checked = false;
+    persistTranslationPreference();
+  }
   renderProviderProfiles();
+  renderTranslationControls(latest !== null && isActive(latest));
 }
 
 function currentProviderDraft(): ProviderProfileDraft {
@@ -2341,6 +2495,8 @@ async function saveProviderProfile(): Promise<void> {
     await invoke<unknown>("mvp_save_provider_profile", { profile }),
   );
   selectedProviderId = profile.profileId;
+  preferredProviderProfileId = profile.profileId;
+  persistTranslationPreference();
   providerProbeStates.set(profile.profileId, {
     profileId: profile.profileId,
     phase: "success",
@@ -2740,6 +2896,7 @@ for (const select of [controls.systemDevice, controls.microphoneDevice]) {
 }
 
 controls.sourceMode.addEventListener("change", () => {
+  persistAppPreference();
   if (latest) {
     render(latest);
   } else {
@@ -2750,6 +2907,20 @@ controls.sourceMode.addEventListener("change", () => {
 controls.rawAudioEnabled.addEventListener("change", () => {
   if (latest) render(latest);
 });
+
+controls.transcriptDisplayMode.addEventListener("change", () => {
+  persistAppPreference();
+  if (latest) render(latest);
+});
+
+function liveTextSettingsChanged(): void {
+  persistAppPreference();
+  renderLiveTextControls(latest !== null && isActive(latest));
+  if (latest) render(latest);
+}
+
+controls.liveTextEnabled.addEventListener("change", liveTextSettingsChanged);
+controls.liveTextDirectory.addEventListener("input", liveTextSettingsChanged);
 
 function translationSettingsChanged(): void {
   persistTranslationPreference();
@@ -2899,6 +3070,7 @@ async function prepareSelectedAsr(): Promise<void> {
     preparedLanguage = language;
     preparedAsrModelId = asrModelId;
     persistAsrModelPreference();
+    persistAppPreference();
     render(snapshot);
   } catch (error) {
     controls.recognitionLanguage.value = preparedLanguage;
@@ -2944,6 +3116,7 @@ controls.start.addEventListener("click", async () => {
         asrModelId: currentAsrModelId(),
         sourceMode: currentSourceMode(),
         rawAudioEnabled: controls.rawAudioEnabled.checked,
+        liveTextDirectory: currentLiveTextDirectory(),
         translation: currentTranslationConfig(),
         translationProviderProfileId,
         ...selection,
@@ -3416,8 +3589,10 @@ controls.refreshInterrupted.addEventListener("click", async () => {
   }
 });
 
+applyAppPreference();
 applyTranslationPreference(readTranslationPreference());
 renderTranslationControls(false);
+renderLiveTextControls(false);
 renderRetryProgress(null);
 renderRecoveryCenter();
 
