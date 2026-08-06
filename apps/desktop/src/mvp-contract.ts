@@ -1,4 +1,5 @@
 export const MVP_CONTRACT_VERSION = "meetingrelay.mvp.durable.v3";
+export const MAX_INFERENCE_QUEUE_DEPTH = 32;
 
 export const MVP_LIFECYCLES = [
   "booting",
@@ -386,6 +387,13 @@ export type DiskHealthSnapshot = {
   warning: string | null;
 };
 
+export type DataDirectorySettings = {
+  activeDataDir: string;
+  configuredDataDir: string;
+  restartRequired: boolean;
+  environmentOverride: boolean;
+};
+
 export type TranslationRetryProgress = {
   batchId: string | null;
   status: MvpTranslationRetryStatus;
@@ -502,6 +510,14 @@ export function formatMvpErrorMessage(value: unknown): string {
     ["ASR_MODEL_NOT_FOUND", "所选本地识别模型不在已校验的模型注册表中。"],
     ["ASR_MODEL_NOT_READY", "所选本地识别模型尚未安装或完整性校验失败。"],
     ["ASR_MODEL_LANGUAGE_UNSUPPORTED", "所选本地识别模型不支持本次会议语言。"],
+    ["MVP_DATA_DIR_INVALID", "主数据目录必须是有效的 Windows 绝对路径。"],
+    ["MVP_DATA_DIR_UNWRITABLE", "无法创建或写入所选主数据目录。"],
+    ["MVP_DATA_DIR_SETTINGS_UNAVAILABLE", "无法保存主数据目录设置。"],
+    ["MVP_DATA_DIR_SESSION_ACTIVE", "会议进行中不能修改主数据目录。"],
+    [
+      "MVP_DATA_DIR_ENV_OVERRIDE",
+      "当前由 MEETINGRELAY_MVP_DATA_DIR 环境变量固定数据目录，界面设置不能覆盖。",
+    ],
     [
       "SHERPA_REALTIME_RECOGNITION_UNAVAILABLE",
       "本地转写引擎重试后仍不可用。请停止后重新开始；已经保存的文字不会丢失。",
@@ -1029,6 +1045,37 @@ function diskHealth(value: unknown): DiskHealthSnapshot {
     freeBytes: uint64(disk.freeBytes, "disk.freeBytes"),
     requiredBytes: uint64(disk.requiredBytes, "disk.requiredBytes"),
     warning: nullableString(disk.warning, "disk.warning", 512),
+  };
+}
+
+export function parseDataDirectorySettings(value: unknown): DataDirectorySettings {
+  const settings = object(value, "data directory settings");
+  const activeDataDir = boundedString(
+    settings.activeDataDir,
+    "data directory activeDataDir",
+    1024,
+  ).trim();
+  const configuredDataDir = boundedString(
+    settings.configuredDataDir,
+    "data directory configuredDataDir",
+    1024,
+  ).trim();
+  if (
+    !isWindowsAbsoluteDirectory(activeDataDir) ||
+    !isWindowsAbsoluteDirectory(configuredDataDir)
+  ) {
+    throw new Error(
+      "data directory activeDataDir/configuredDataDir require absolute Windows paths.",
+    );
+  }
+  return {
+    activeDataDir,
+    configuredDataDir,
+    restartRequired: boolean(settings.restartRequired, "data directory restartRequired"),
+    environmentOverride: boolean(
+      settings.environmentOverride,
+      "data directory environmentOverride",
+    ),
   };
 }
 
@@ -1678,7 +1725,7 @@ export function parseMvpSnapshot(value: unknown): MvpSnapshot {
     typeof snapshot.queueDepth !== "number" ||
     !Number.isSafeInteger(snapshot.queueDepth) ||
     snapshot.queueDepth < 0 ||
-    snapshot.queueDepth > 8
+    snapshot.queueDepth > MAX_INFERENCE_QUEUE_DEPTH
   ) {
     throw new Error("queueDepth is outside the MVP bound.");
   }

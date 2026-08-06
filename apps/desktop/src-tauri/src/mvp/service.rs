@@ -34,8 +34,9 @@ use super::{
         MvpStorageWriter, ProviderProfileInput, ProviderProfileRecord, RecoveryActionKind,
         SegmentSearchQuery, SummaryChunkInput, SummaryCompletionInput, SummaryJobInput,
         SummaryJobRecord, SummaryProviderProvenance, SummaryResultInput, SummaryResultRecord,
-        TranslationCandidate, TranslationCompletion, now_ms_string, segment_from_durable,
-        sha256_hex, visible_window_start_sequence,
+        TranslationCandidate, TranslationCompletion, configured_data_root,
+        data_root_has_environment_override, now_ms_string, save_configured_data_root,
+        segment_from_durable, sha256_hex, visible_window_start_sequence,
     },
     summary::{
         MeetingSummary, SummaryConfig, SummaryOutcome, SummaryProgressSnapshot, SummaryRunRequest,
@@ -59,6 +60,8 @@ const PROVIDER_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const RECOVERY_WINDOW_SAMPLES: u64 = 8 * 16_000;
+#[cfg(windows)]
+const FINAL_QUEUE_BACKPRESSURE: Duration = Duration::from_millis(250);
 
 #[cfg(windows)]
 use std::{
@@ -150,6 +153,15 @@ pub struct SecretStoreSnapshot {
     pub backend: String,
     pub available: bool,
     pub configured: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataDirectorySettingsSnapshot {
+    pub active_data_dir: String,
+    pub configured_data_dir: String,
+    pub restart_required: bool,
+    pub environment_override: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -432,6 +444,25 @@ fn cleanup_live_text_mirror_empty_file(
     }
 }
 
+fn data_directory_settings_snapshot(
+    active: PathBuf,
+    configured: PathBuf,
+) -> DataDirectorySettingsSnapshot {
+    let active_data_dir = active.to_string_lossy().into_owned();
+    let configured_data_dir = configured.to_string_lossy().into_owned();
+    let restart_required = if cfg!(windows) {
+        !active_data_dir.eq_ignore_ascii_case(&configured_data_dir)
+    } else {
+        active_data_dir != configured_data_dir
+    };
+    DataDirectorySettingsSnapshot {
+        active_data_dir,
+        configured_data_dir,
+        restart_required,
+        environment_override: data_root_has_environment_override(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum RecognitionLanguage {
     English,
@@ -539,6 +570,35 @@ impl MvpService {
             inner: Mutex::new(ServiceInner::default()),
             shutdown_started: AtomicBool::new(false),
         }
+    }
+
+    pub fn data_directory_settings(&self) -> Result<DataDirectorySettingsSnapshot, String> {
+        let active = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+            .data_root()?;
+        let configured = configured_data_root()?;
+        Ok(data_directory_settings_snapshot(active, configured))
+    }
+
+    pub fn save_data_directory(
+        &self,
+        data_directory: &str,
+    ) -> Result<DataDirectorySettingsSnapshot, String> {
+        if matches!(
+            lock(&self.snapshot).lifecycle,
+            Lifecycle::Starting | Lifecycle::Recording | Lifecycle::Paused | Lifecycle::Stopping
+        ) {
+            return Err("MVP_DATA_DIR_SESSION_ACTIVE".to_owned());
+        }
+        let active = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
+            .data_root()?;
+        let configured = save_configured_data_root(data_directory)?;
+        Ok(data_directory_settings_snapshot(active, configured))
     }
 
     pub fn secret_store_status(
@@ -2748,7 +2808,7 @@ impl MvpService {
 
     #[cfg(windows)]
     fn preflight_windows(&self) -> Result<MvpSnapshot, String> {
-        let mut inner = lock(&self.inner);
+        let inner = lock(&self.inner);
         if inner.session.is_some() {
             return Ok(self.snapshot_locked(&inner));
         }
@@ -2786,22 +2846,18 @@ impl MvpService {
             code
         })?;
 
-        let language = RecognitionLanguage::default();
-        let asr_model = resolve_asr_model(None, language.code())?;
-        self.ensure_inference_worker(&mut inner, language, &asr_model)?;
-
         let mut snapshot = lock(&self.snapshot);
         snapshot.lifecycle = Lifecycle::Ready;
         snapshot.durability_status = "ready".to_owned();
-        snapshot.model_ready = true;
-        snapshot.model_label = language.model_label(&asr_model);
+        // Model selection lives in the frontend preference. Preparing the Rust
+        // default here made a cold start load SenseVoice and then immediately
+        // tear it down when the saved/high-quality model was selected.
+        snapshot.model_ready = false;
+        snapshot.model_label = "等待准备所选识别模型".to_owned();
         snapshot.system = ready_source(SourceId::System, &devices.system_output);
         snapshot.microphone = ready_source(SourceId::Microphone, &devices.microphone);
         snapshot.error = None;
-        Ok(public_snapshot(
-            &mut snapshot,
-            inner.inference.as_ref().map(|worker| &worker.submitter),
-        ))
+        Ok(public_snapshot(&mut snapshot, None))
     }
 
     #[cfg(windows)]
@@ -4557,31 +4613,38 @@ impl InferenceSubmitter {
 
     fn submit_final(&self, task: InferenceTask) -> Result<(), String> {
         self.shared.pending.fetch_add(1, Ordering::AcqRel);
-        match self.finals.try_send(task) {
-            Ok(()) => {
-                self.shared.latest_interim.fetch_add(1, Ordering::AcqRel);
-                let retired = match self.shared.interim.try_lock() {
-                    Ok(mut interim) => interim.take().is_some(),
-                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take().is_some(),
-                    Err(TryLockError::WouldBlock) => false,
-                };
-                if retired {
-                    self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+        let deadline = Instant::now() + FINAL_QUEUE_BACKPRESSURE;
+        let mut pending_task = task;
+        loop {
+            match self.finals.try_send(pending_task) {
+                Ok(()) => {
+                    self.shared.latest_interim.fetch_add(1, Ordering::AcqRel);
+                    let retired = match self.shared.interim.try_lock() {
+                        Ok(mut interim) => interim.take().is_some(),
+                        Err(TryLockError::Poisoned(poisoned)) => {
+                            poisoned.into_inner().take().is_some()
+                        }
+                        Err(TryLockError::WouldBlock) => false,
+                    };
+                    if retired {
+                        self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    self.worker_thread.unpark();
+                    return Ok(());
                 }
-                self.worker_thread.unpark();
-                Ok(())
-            }
-            Err(error) => {
-                self.shared.pending.fetch_sub(1, Ordering::AcqRel);
-                match error {
-                    TrySendError::Full(task) => {
-                        task.session_errors.mark_incomplete("ASR_FINAL_OVERLOAD");
-                        Err("ASR_FINAL_OVERLOAD".to_owned())
-                    }
-                    TrySendError::Disconnected(task) => {
-                        task.session_errors.mark_incomplete("ASR_WORKER_STOPPED");
-                        Err("ASR_WORKER_STOPPED".to_owned())
-                    }
+                Err(TrySendError::Full(task)) if Instant::now() < deadline => {
+                    pending_task = task;
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(TrySendError::Full(task)) => {
+                    self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+                    task.session_errors.mark_incomplete("ASR_FINAL_OVERLOAD");
+                    return Err("ASR_FINAL_OVERLOAD".to_owned());
+                }
+                Err(TrySendError::Disconnected(task)) => {
+                    self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+                    task.session_errors.mark_incomplete("ASR_WORKER_STOPPED");
+                    return Err("ASR_WORKER_STOPPED".to_owned());
                 }
             }
         }
@@ -7439,6 +7502,29 @@ mod tests {
         set_public_error(&mut snapshot, take_runtime_error(&errors).unwrap());
         set_public_error(&mut snapshot, "AUDIO_STREAM_ERROR");
         assert_eq!(snapshot.error.as_deref(), Some("ASR_FINAL_OVERLOAD"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_queue_absorbs_a_transient_high_speech_rate_burst() {
+        let (submitter, finals) = test_submitter();
+        for revision in 1..=MAX_INFERENCE_QUEUE_DEPTH {
+            submitter
+                .submit(queued_task(u32::try_from(revision).unwrap(), true))
+                .unwrap();
+        }
+        let drainer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let task = finals.recv().unwrap();
+            thread::sleep(Duration::from_millis(50));
+            task
+        });
+
+        let started = Instant::now();
+        submitter.submit(queued_task(99, true)).unwrap();
+
+        assert!(started.elapsed() < FINAL_QUEUE_BACKPRESSURE);
+        assert!(drainer.join().unwrap().is_final);
     }
 
     #[cfg(windows)]

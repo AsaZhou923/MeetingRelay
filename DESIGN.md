@@ -87,6 +87,8 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - `LatestLineDock`：固定在文字区底部，优先显示当前临时句，否则显示最新确认句；不随历史列表滚走，内容过长时限制在三行内。
 - `TranscriptDisplayPicker`：持久化选择“原文 + 译文”或“仅显示译文”；实时列表、最新一句与悬浮字幕必须遵循同一规则。
 - `LiveTextMirrorSetting`：会前选择是否把 durable final 原文实时写入独立 TXT；活动会议中锁定目录。
+- `DataDirectorySetting`：输入并验证主数据绝对目录；明确区分当前目录与重启后目录，不暗示自动迁移旧数据。
+- `CaptionOverlay`：固定标题为“实时字幕”，优先 interim、否则保留最新 final；不显示 revision/timeline/队列等调试信息，提供拖动、右下角缩放和持久化字号控制。
 - `FollowLatestButton`：用户离开底部且有新内容时出现，点击后恢复自动跟随。
 - `SecondaryWorkspace`：会议详情、说话人、摘要、导出、治理与诊断的次级工作区。
 
@@ -106,6 +108,7 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - 中部内容区占用剩余高度，只有 `TranscriptViewport` 和次级列表独立滚动。
 - 会议记录与设置的卡片按内容高度展开，由各自的 `SecondaryWorkspace` 统一纵向滚动；不得用等分网格行压缩卡片内容。
 - 主要控制条固定在窗口底部，不应被历史列表或高级设置推离视口。
+- 悬浮字幕默认 `760×180`，在紧凑到 `320px` 宽时仍保留字幕、字号控制与右下角缩放入口，不产生横向滚动。
 - 不以横向滚动解决主流程空间不足；技术表格可在次级页面内局部滚动。
 
 ## Interaction states

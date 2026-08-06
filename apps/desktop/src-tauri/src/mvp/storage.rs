@@ -1,6 +1,6 @@
 use std::{
     env, fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
@@ -519,6 +519,13 @@ impl MvpStorage {
             fs::create_dir_all(parent).map_err(|_| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())?;
         }
         Ok(Self { db_path })
+    }
+
+    pub fn data_root(&self) -> Result<PathBuf, String> {
+        self.db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())
     }
 
     pub fn default_export_dir(&self) -> PathBuf {
@@ -5928,8 +5935,28 @@ fn durable_final_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DurableFi
     })
 }
 
+pub fn configured_data_root() -> Result<PathBuf, String> {
+    default_data_root()
+}
+
+pub fn data_root_has_environment_override() -> bool {
+    env::var_os("MEETINGRELAY_MVP_DATA_DIR").is_some()
+}
+
+pub fn save_configured_data_root(value: &str) -> Result<PathBuf, String> {
+    if data_root_has_environment_override() {
+        return Err("MVP_DATA_DIR_ENV_OVERRIDE".to_owned());
+    }
+    let root = validate_data_root(PathBuf::from(value.trim()))?;
+    write_data_root_preference_at(&data_root_preference_path()?, &root)?;
+    Ok(root)
+}
+
 fn default_data_root() -> Result<PathBuf, String> {
     if let Some(root) = env::var_os("MEETINGRELAY_MVP_DATA_DIR").map(PathBuf::from) {
+        return Ok(root);
+    }
+    if let Some(root) = read_data_root_preference_at(&data_root_preference_path()?)? {
         return Ok(root);
     }
     #[cfg(windows)]
@@ -5939,6 +5966,82 @@ fn default_data_root() -> Result<PathBuf, String> {
     env::current_dir()
         .map(|root| root.join("target").join("meetingrelay-mvp-data"))
         .map_err(|_| "MVP_STORAGE_ROOT_UNAVAILABLE".to_owned())
+}
+
+fn data_root_preference_path() -> Result<PathBuf, String> {
+    if let Some(root) = env::var_os("MEETINGRELAY_MVP_SETTINGS_DIR").map(PathBuf::from) {
+        return Ok(root.join("data-directory.txt"));
+    }
+    #[cfg(windows)]
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        return Ok(local_app_data
+            .join("MeetingRelay")
+            .join("settings")
+            .join("data-directory.txt"));
+    }
+    env::current_dir()
+        .map(|root| {
+            root.join("target")
+                .join("meetingrelay-mvp-settings")
+                .join("data-directory.txt")
+        })
+        .map_err(|_| "MVP_DATA_DIR_SETTINGS_UNAVAILABLE".to_owned())
+}
+
+fn read_data_root_preference_at(path: &Path) -> Result<Option<PathBuf>, String> {
+    let value = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("MVP_DATA_DIR_SETTINGS_UNAVAILABLE".to_owned()),
+    };
+    parse_data_root_preference(&value).map(Some)
+}
+
+fn parse_data_root_preference(value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) || !Path::new(value).is_absolute() {
+        return Err("MVP_DATA_DIR_INVALID".to_owned());
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn validate_data_root(root: PathBuf) -> Result<PathBuf, String> {
+    if root.as_os_str().is_empty()
+        || root.to_string_lossy().chars().any(char::is_control)
+        || !root.is_absolute()
+    {
+        return Err("MVP_DATA_DIR_INVALID".to_owned());
+    }
+    fs::create_dir_all(&root).map_err(|_| "MVP_DATA_DIR_UNWRITABLE".to_owned())?;
+    if !root
+        .metadata()
+        .map_err(|_| "MVP_DATA_DIR_UNWRITABLE".to_owned())?
+        .is_dir()
+    {
+        return Err("MVP_DATA_DIR_UNWRITABLE".to_owned());
+    }
+    let probe = root.join(format!(
+        ".meetingrelay-write-probe-{}-{}",
+        std::process::id(),
+        now_ms_string()
+    ));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|_| "MVP_DATA_DIR_UNWRITABLE".to_owned())?;
+    fs::remove_file(probe).map_err(|_| "MVP_DATA_DIR_UNWRITABLE".to_owned())?;
+    root.canonicalize()
+        .map_err(|_| "MVP_DATA_DIR_UNWRITABLE".to_owned())
+}
+
+fn write_data_root_preference_at(path: &Path, root: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "MVP_DATA_DIR_SETTINGS_UNAVAILABLE".to_owned())?;
+    fs::create_dir_all(parent).map_err(|_| "MVP_DATA_DIR_SETTINGS_UNAVAILABLE".to_owned())?;
+    fs::write(path, format!("{}\n", root.to_string_lossy()))
+        .map_err(|_| "MVP_DATA_DIR_SETTINGS_UNAVAILABLE".to_owned())
 }
 
 fn next_id(prefix: &str) -> String {
@@ -6165,6 +6268,36 @@ mod tests {
         let storage = MvpStorage::open_at(temp_db(test_name)).unwrap();
         let writer = MvpStorageWriter::start(storage.clone()).unwrap();
         (storage, writer)
+    }
+
+    #[test]
+    fn data_root_preference_requires_an_absolute_writable_directory() {
+        assert_eq!(
+            parse_data_root_preference("relative\\MeetingRelay").unwrap_err(),
+            "MVP_DATA_DIR_INVALID"
+        );
+
+        let root = env::temp_dir().join(format!("meetingrelay-data-root-{}", now_ms_string()));
+        let settings = root.join("settings").join("data-directory.txt");
+        let configured = validate_data_root(root.join("records")).unwrap();
+        write_data_root_preference_at(&settings, &configured).unwrap();
+
+        assert_eq!(
+            read_data_root_preference_at(&settings).unwrap(),
+            Some(configured)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_exposes_the_root_that_owns_database_and_exports() {
+        let db_path = temp_db("data-root-owner");
+        let expected = db_path.parent().unwrap().to_path_buf();
+        let storage = MvpStorage::open_at(&db_path).unwrap();
+
+        assert_eq!(storage.data_root().unwrap(), expected);
+        assert_eq!(storage.default_export_dir(), expected.join("exports"));
+        let _ = fs::remove_dir_all(expected);
     }
 
     #[test]

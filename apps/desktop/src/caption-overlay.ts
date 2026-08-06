@@ -1,15 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { translationOnlyText } from "./frontend-state";
+import {
+  OVERLAY_FONT_SIZE_STORAGE_KEY,
+  nextOverlayFontSize,
+  parseOverlayFontSize,
+  selectOverlayCaption,
+} from "./caption-overlay-state";
 import {
   APP_PREFERENCE_KEY,
-  formatElapsed,
   parseAppPreference,
   parseMvpSnapshot,
   type MvpSnapshot,
   type MvpTranscriptDisplayMode,
-  type TranscriptSegment,
 } from "./mvp-contract";
 import "./overlay.css";
 
@@ -18,38 +21,33 @@ if (!app) throw new Error("MeetingRelay overlay root is missing.");
 
 app.innerHTML = `
   <main class="overlay-shell" aria-labelledby="overlay-title">
-    <header class="overlay-header">
-      <div>
-        <p class="overlay-kicker">MeetingRelay compact overlay</p>
-        <h1 id="overlay-title">Live captions</h1>
+    <header class="overlay-toolbar" aria-label="悬浮字幕控制">
+      <span id="overlay-title" class="overlay-title" data-overlay-drag-region>实时字幕</span>
+      <div class="overlay-font-controls" aria-label="字幕字号">
+        <button id="overlay-font-smaller" type="button" aria-label="缩小字幕">A-</button>
+        <output id="overlay-font-size" aria-live="polite">34px</output>
+        <button id="overlay-font-larger" type="button" aria-label="放大字幕">A+</button>
       </div>
-      <dl class="overlay-meta" aria-label="Read-only session status">
-        <div><dt>State</dt><dd id="overlay-state">BOOTING</dd></div>
-        <div><dt>Time</dt><dd id="overlay-elapsed">00:00:00</dd></div>
-        <div><dt>Finals</dt><dd id="overlay-count">0</dd></div>
-      </dl>
     </header>
-    <section class="overlay-interim" aria-labelledby="overlay-interim-title">
-      <h2 id="overlay-interim-title">正在识别</h2>
-      <p id="overlay-interim-text">等待实时字幕…</p>
-    </section>
-    <section class="overlay-finals" aria-labelledby="overlay-finals-title">
-      <h2 id="overlay-finals-title">最近已保存</h2>
-      <ol id="overlay-finals-list" aria-live="polite"></ol>
+    <section class="overlay-caption" aria-live="polite">
+      <p id="overlay-caption-text"></p>
     </section>
     <p id="overlay-error" class="overlay-error" role="status"></p>
+    <button id="overlay-resize-handle" class="overlay-resize-handle" type="button" aria-label="拖动调整窗口大小"></button>
   </main>
 `;
 
-const state = element<HTMLElement>("#overlay-state");
-const elapsed = element<HTMLElement>("#overlay-elapsed");
-const count = element<HTMLElement>("#overlay-count");
-const interimTitle = element<HTMLElement>("#overlay-interim-title");
-const interim = element<HTMLParagraphElement>("#overlay-interim-text");
-const finals = element<HTMLOListElement>("#overlay-finals-list");
+const caption = element<HTMLParagraphElement>("#overlay-caption-text");
+const fontSize = element<HTMLOutputElement>("#overlay-font-size");
+const fontSmaller = element<HTMLButtonElement>("#overlay-font-smaller");
+const fontLarger = element<HTMLButtonElement>("#overlay-font-larger");
+const resizeHandle = element<HTMLButtonElement>("#overlay-resize-handle");
 const errorLine = element<HTMLParagraphElement>("#overlay-error");
 const overlayWindow = getCurrentWindow();
 let refreshInFlight = false;
+let captionFontSizePx = parseOverlayFontSize(
+  window.localStorage.getItem(OVERLAY_FONT_SIZE_STORAGE_KEY),
+);
 
 function element<T extends Element>(selector: string): T {
   const value = document.querySelector<T>(selector);
@@ -68,39 +66,40 @@ function currentDisplayMode(): MvpTranscriptDisplayMode {
   }
 }
 
-function renderSegment(
-  segment: TranscriptSegment,
-  displayMode: MvpTranscriptDisplayMode,
-): HTMLLIElement {
-  const item = document.createElement("li");
-  const heading = document.createElement("strong");
-  const text = document.createElement("p");
-  const meta = document.createElement("small");
-  heading.textContent = `#${segment.sequence} · rev ${segment.revision} · timeline ${segment.timelineRevision}`;
-  text.textContent =
-    displayMode === "translation_only" ? translationOnlyText(segment).text : segment.text;
-  meta.textContent = `samples ${segment.meetingSampleStart}–${segment.meetingSampleEnd}`;
-  item.append(heading, text, meta);
-  return item;
-}
-
 function render(snapshot: MvpSnapshot): void {
   const displayMode = currentDisplayMode();
-  state.textContent = snapshot.lifecycle.toUpperCase();
-  state.dataset.state = snapshot.lifecycle;
-  elapsed.textContent = formatElapsed(snapshot.elapsedMs);
-  count.textContent = `${snapshot.savedFinalCount}/${snapshot.totalFinalCount}`;
-  interimTitle.textContent = displayMode === "translation_only" ? "译文状态" : "正在识别";
-  interim.textContent =
-    displayMode === "translation_only"
-      ? "临时句尚无译文；等待确认并完成翻译。"
-      : snapshot.interim === null
-        ? "等待实时字幕…"
-        : `${snapshot.interim.text} · rev ${snapshot.interim.revision} · timeline ${snapshot.interim.timelineRevision}`;
-  finals.replaceChildren(
-    ...snapshot.finals.slice(-5).map((segment) => renderSegment(segment, displayMode)),
-  );
+  const selectedCaption = selectOverlayCaption(snapshot, displayMode);
+  caption.textContent = selectedCaption.text;
+  caption.dataset.kind = selectedCaption.kind;
   errorLine.textContent = snapshot.error === null ? "" : snapshot.error;
+}
+
+function persistCaptionFontSize(nextSizePx: number): void {
+  captionFontSizePx = nextSizePx;
+  caption.style.fontSize = `${captionFontSizePx}px`;
+  fontSize.textContent = `${captionFontSizePx}px`;
+  window.localStorage.setItem(OVERLAY_FONT_SIZE_STORAGE_KEY, String(captionFontSizePx));
+}
+
+function adjustCaptionFontSize(direction: "smaller" | "larger"): void {
+  persistCaptionFontSize(nextOverlayFontSize(captionFontSizePx, direction));
+}
+
+function installWindowChromeHandlers(): void {
+  for (const dragRegion of document.querySelectorAll<HTMLElement>("[data-overlay-drag-region]")) {
+    dragRegion.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      if ((event.target as HTMLElement | null)?.closest("button")) return;
+      void overlayWindow.startDragging();
+    });
+  }
+
+  resizeHandle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void overlayWindow.startResizeDragging("SouthEast");
+  });
 }
 
 async function refreshWhenVisible(): Promise<void> {
@@ -121,5 +120,9 @@ async function refreshWhenVisible(): Promise<void> {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) void refreshWhenVisible();
 });
+fontSmaller.addEventListener("click", () => adjustCaptionFontSize("smaller"));
+fontLarger.addEventListener("click", () => adjustCaptionFontSize("larger"));
+persistCaptionFontSize(captionFontSizePx);
+installWindowChromeHandlers();
 void refreshWhenVisible();
 window.setInterval(() => void refreshWhenVisible(), 750);

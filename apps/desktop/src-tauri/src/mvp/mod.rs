@@ -80,6 +80,21 @@ pub fn mvp_asr_models() -> Vec<AsrModelProfile> {
     asr_models::asr_model_profiles()
 }
 
+#[tauri::command]
+pub fn mvp_data_directory_settings(
+    service: tauri::State<'_, MvpService>,
+) -> Result<service::DataDirectorySettingsSnapshot, String> {
+    service.data_directory_settings()
+}
+
+#[tauri::command]
+pub fn mvp_save_data_directory(
+    service: tauri::State<'_, MvpService>,
+    data_directory: String,
+) -> Result<service::DataDirectorySettingsSnapshot, String> {
+    service.save_data_directory(&data_directory)
+}
+
 #[tauri::command(async)]
 pub fn mvp_prepare_language(
     service: tauri::State<'_, MvpService>,

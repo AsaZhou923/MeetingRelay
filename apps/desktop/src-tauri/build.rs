@@ -2,6 +2,8 @@ const APP_COMMANDS: &[&str] = &[
     "mvp_preflight",
     "mvp_audio_devices",
     "mvp_asr_models",
+    "mvp_data_directory_settings",
+    "mvp_save_data_directory",
     "mvp_prepare_language",
     "mvp_discover_local_translation_models",
     "mvp_secret_store_status",

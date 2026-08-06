@@ -20,7 +20,7 @@ use std::{
 use std::sync::mpsc::{TrySendError, sync_channel};
 
 /// Default number of audio packets that may wait for the consumer.
-pub const DEFAULT_PACKET_QUEUE_CAPACITY: usize = 32;
+pub const DEFAULT_PACKET_QUEUE_CAPACITY: usize = 128;
 /// Default number of capture status messages that may wait for the consumer.
 pub const DEFAULT_STATUS_QUEUE_CAPACITY: usize = 16;
 /// Maximum serialized CPAL device identifier accepted across IPC.
