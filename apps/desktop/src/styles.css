@@ -713,6 +713,7 @@ h2 {
   white-space: nowrap;
 }
 
+.data-directory-settings,
 .live-text-settings {
   display: grid;
   gap: 9px;
@@ -723,6 +724,7 @@ h2 {
   background: rgb(121 216 220 / 3%);
 }
 
+.data-directory-settings .device-picker small,
 .live-text-settings .device-picker small {
   color: var(--muted);
   font-size: 12px;
@@ -735,6 +737,19 @@ h2 {
 }
 
 #live-text-status[data-status="error"] {
+  color: var(--danger);
+}
+
+#data-directory-status[data-status="ready"] {
+  color: var(--lime-soft);
+}
+
+#data-directory-status[data-status="warning"],
+#data-directory-status[data-status="loading"] {
+  color: var(--amber);
+}
+
+#data-directory-status[data-status="error"] {
   color: var(--danger);
 }
 

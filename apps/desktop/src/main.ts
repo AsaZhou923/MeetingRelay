@@ -17,6 +17,7 @@ import {
 import {
   AUDIO_DEVICE_PREFERENCE_KEY,
   APP_PREFERENCE_KEY,
+  MAX_INFERENCE_QUEUE_DEPTH,
   TRANSLATION_PREFERENCE_KEY,
   formatMvpErrorMessage,
   formatMvpSnapshotError,
@@ -27,6 +28,7 @@ import {
   isWindowsAbsoluteDirectory,
   parseDeletePreview,
   parseDeleteResult,
+  parseDataDirectorySettings,
   parseExportOptions,
   parseMeetingDetail,
   parseMeetingListPage,
@@ -61,6 +63,7 @@ import {
   type InterruptedMeeting,
   type ExportArtifact,
   type DeletePreview,
+  type DataDirectorySettings,
   type MeetingDetail,
   type MeetingListPage,
   type MvpExportResult,
@@ -273,6 +276,15 @@ app.innerHTML = `
             <div><dt>磁盘可用</dt><dd id="disk-free">检测中</dd></div>
           </dl>
           <p id="disk-warning" class="disk-warning" aria-live="polite"></p>
+          <div class="data-directory-settings">
+            <label class="device-picker">
+              <span>主数据目录</span>
+              <input id="data-directory" type="text" placeholder="例如 D:\\MeetingRelay Data" spellcheck="false" />
+              <small>保存后从下次启动开始使用；不会自动移动旧目录中的数据库、录音或导出文件。</small>
+            </label>
+            <button id="save-data-directory" class="secondary-button" type="button">保存数据目录</button>
+            <p id="data-directory-status" class="copy-status" aria-live="polite"></p>
+          </div>
           <div class="live-text-settings">
             <label class="raw-audio-toggle">
               <input id="live-text-enabled" type="checkbox" />
@@ -364,7 +376,7 @@ app.innerHTML = `
           <ul id="export-results" class="export-results" aria-live="polite"></ul>
         </section>
         <footer class="stage-footer">
-          <span>待处理 <strong id="queue-depth">0 / 8</strong></span>
+          <span>待处理 <strong id="queue-depth">0 / ${MAX_INFERENCE_QUEUE_DEPTH}</strong></span>
           <span>翻译 <strong id="translation-queue-depth">关闭</strong></span>
           <span>识别语言 <strong id="footer-language">中文 · ZH</strong></span>
           <span>存储 <strong id="footer-storage">初始化</strong></span>
@@ -614,6 +626,9 @@ const controls = {
   meetingId: element<HTMLElement>("#meeting-id"),
   diskFree: element<HTMLElement>("#disk-free"),
   diskWarning: element<HTMLParagraphElement>("#disk-warning"),
+  dataDirectory: element<HTMLInputElement>("#data-directory"),
+  saveDataDirectory: element<HTMLButtonElement>("#save-data-directory"),
+  dataDirectoryStatus: element<HTMLParagraphElement>("#data-directory-status"),
   liveTextEnabled: element<HTMLInputElement>("#live-text-enabled"),
   liveTextDirectory: element<HTMLInputElement>("#live-text-directory"),
   liveTextStatus: element<HTMLParagraphElement>("#live-text-status"),
@@ -774,6 +789,7 @@ let lastClipboardText: string | null = null;
 let latestRetryProgress: TranslationRetryProgress | null = null;
 let retryProgressTimer: number | null = null;
 let diagnosticBundle: DiagnosticBundleResult | null = null;
+let dataDirectorySettings: DataDirectorySettings | null = null;
 let interruptedMeetings: InterruptedMeeting[] = [];
 let busyInterruptedMeetingIds = new Set<string>();
 let audioPreview: HTMLAudioElement | null = null;
@@ -2075,19 +2091,18 @@ function render(snapshot: MvpSnapshot): void {
     active ||
     languagePreparing ||
     snapshot.lifecycle !== "ready" ||
-    !snapshot.modelReady;
+    asrModels.length === 0;
   controls.asrModel.disabled =
     active ||
     languagePreparing ||
     snapshot.lifecycle !== "ready" ||
-    !snapshot.modelReady ||
     asrModels.length === 0;
   controls.footerLanguage.textContent = LANGUAGE_LABELS[currentRecognitionLanguage()];
   renderAudioDeviceControls(active);
   renderTranslationControls(active);
   renderLiveTextControls(active);
   renderOverlayToggle(snapshot);
-  controls.queue.textContent = `${snapshot.queueDepth} / 8`;
+  controls.queue.textContent = `${snapshot.queueDepth} / ${MAX_INFERENCE_QUEUE_DEPTH}`;
   controls.translationQueue.textContent = controls.translationEnabled.checked
     ? `${snapshot.translationQueueDepth} / 32`
     : "关闭";
@@ -2122,6 +2137,7 @@ function render(snapshot: MvpSnapshot): void {
   controls.visibleWindow.textContent = `${snapshot.finals.length} / ${snapshot.totalFinalCount}`;
   controls.meetingId.textContent = snapshot.meetingId ?? "未打开";
   renderDisk(snapshot);
+  renderDataDirectorySettings(active);
   controls.createDiagnosticBundle.disabled = active;
   controls.retryFailedTranslations.disabled =
     active ||
@@ -2702,6 +2718,36 @@ function renderDisk(snapshot: MvpSnapshot): void {
     `数据目录 ${snapshot.disk.dataDir}；启动预留 ${formatBytes(snapshot.disk.requiredBytes)}。`;
 }
 
+function renderDataDirectorySettings(active: boolean): void {
+  const settings = dataDirectorySettings;
+  controls.dataDirectory.disabled = active || settings?.environmentOverride === true;
+  controls.saveDataDirectory.disabled =
+    active ||
+    settings?.environmentOverride === true ||
+    !isWindowsAbsoluteDirectory(controls.dataDirectory.value);
+  if (settings === null) return;
+  if (settings.environmentOverride) {
+    controls.dataDirectoryStatus.dataset.status = "warning";
+    controls.dataDirectoryStatus.textContent =
+      `当前由 MEETINGRELAY_MVP_DATA_DIR 固定为 ${settings.activeDataDir}，界面设置不可覆盖。`;
+  } else if (settings.restartRequired) {
+    controls.dataDirectoryStatus.dataset.status = "warning";
+    controls.dataDirectoryStatus.textContent =
+      `已保存 ${settings.configuredDataDir}；重启 MeetingRelay 后生效。旧数据仍保留在 ${settings.activeDataDir}。`;
+  } else {
+    controls.dataDirectoryStatus.dataset.status = "ready";
+    controls.dataDirectoryStatus.textContent = `当前使用 ${settings.activeDataDir}。`;
+  }
+}
+
+async function loadDataDirectorySettings(): Promise<void> {
+  dataDirectorySettings = parseDataDirectorySettings(
+    await invoke<unknown>("mvp_data_directory_settings"),
+  );
+  controls.dataDirectory.value = dataDirectorySettings.configuredDataDir;
+  renderDataDirectorySettings(latest !== null && isActive(latest));
+}
+
 function renderRetryProgress(progress: TranslationRetryProgress | null): void {
   latestRetryProgress = progress;
   const running = progress?.status === "running";
@@ -2921,6 +2967,31 @@ function liveTextSettingsChanged(): void {
 
 controls.liveTextEnabled.addEventListener("change", liveTextSettingsChanged);
 controls.liveTextDirectory.addEventListener("input", liveTextSettingsChanged);
+controls.dataDirectory.addEventListener("input", () => {
+  renderDataDirectorySettings(latest !== null && isActive(latest));
+});
+controls.saveDataDirectory.addEventListener("click", async () => {
+  const dataDirectory = controls.dataDirectory.value.trim();
+  if (!isWindowsAbsoluteDirectory(dataDirectory)) {
+    controls.dataDirectoryStatus.dataset.status = "error";
+    controls.dataDirectoryStatus.textContent = "请输入盘符路径或 UNC 绝对目录。";
+    return;
+  }
+  controls.saveDataDirectory.disabled = true;
+  controls.dataDirectoryStatus.dataset.status = "loading";
+  controls.dataDirectoryStatus.textContent = "正在验证并保存数据目录...";
+  try {
+    dataDirectorySettings = parseDataDirectorySettings(
+      await invoke<unknown>("mvp_save_data_directory", { dataDirectory }),
+    );
+    controls.dataDirectory.value = dataDirectorySettings.configuredDataDir;
+    renderDataDirectorySettings(latest !== null && isActive(latest));
+  } catch (error) {
+    controls.dataDirectoryStatus.dataset.status = "error";
+    controls.dataDirectoryStatus.textContent = `保存失败：${message(error)}`;
+    controls.saveDataDirectory.disabled = false;
+  }
+});
 
 function translationSettingsChanged(): void {
   persistTranslationPreference();
@@ -3615,6 +3686,10 @@ void (async () => {
   }
   try {
     render(await call("mvp_preflight"));
+    await loadDataDirectorySettings().catch((error) => {
+      controls.dataDirectoryStatus.dataset.status = "error";
+      controls.dataDirectoryStatus.textContent = `数据目录设置不可用：${message(error)}`;
+    });
     if (preparedAsrModelId !== currentAsrModelId()) {
       await prepareSelectedAsr();
     }

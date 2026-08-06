@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   MVP_CONTRACT_VERSION,
   APP_PREFERENCE_KEY,
+  MAX_INFERENCE_QUEUE_DEPTH,
   formatMvpErrorMessage,
   formatMvpSnapshotError,
   formatElapsed,
@@ -19,6 +20,7 @@ import {
   parseAsrModelProfiles,
   parseDeletePreview,
   parseDeleteResult,
+  parseDataDirectorySettings,
   parseDiagnosticBundleResult,
   parseExportOptions,
   parseInterruptedMeetings,
@@ -43,6 +45,41 @@ import {
   requiresInsecureRemoteHttpAcknowledgement,
   resolveAudioDeviceSelection,
 } from "./mvp-contract.ts";
+
+test("parses restart-scoped data directory settings", () => {
+  assert.deepEqual(
+    parseDataDirectorySettings({
+      activeDataDir: "C:\\Users\\Example\\AppData\\Local\\MeetingRelay\\mvp",
+      configuredDataDir: "D:\\MeetingRelay Data",
+      restartRequired: true,
+      environmentOverride: false,
+    }),
+    {
+      activeDataDir: "C:\\Users\\Example\\AppData\\Local\\MeetingRelay\\mvp",
+      configuredDataDir: "D:\\MeetingRelay Data",
+      restartRequired: true,
+      environmentOverride: false,
+    },
+  );
+  assert.throws(
+    () =>
+      parseDataDirectorySettings({
+        activeDataDir: "relative",
+        configuredDataDir: "D:\\MeetingRelay Data",
+        restartRequired: true,
+        environmentOverride: false,
+      }),
+    /activeDataDir/,
+  );
+});
+
+test("wires data directory changes as a validated restart-scoped setting", () => {
+  const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+  assert.match(mainSource, /id="data-directory"/);
+  assert.match(mainSource, /invoke<unknown>\("mvp_save_data_directory", \{ dataDirectory \}\)/);
+  assert.match(mainSource, /重启 MeetingRelay 后生效/);
+  assert.match(mainSource, /旧数据仍保留/);
+});
 
 test("accepts only the per-meeting Chinese Japanese and English choices", () => {
   assert.equal(parseMvpRecognitionLanguage("zh"), "zh");
@@ -595,7 +632,7 @@ test("rejects interim/final confusion, unsaved finals, and queue overflow", () =
     /saved final/,
   );
   assert.throws(
-    () => parseMvpSnapshot({ ...snapshot, queueDepth: 9 }),
+    () => parseMvpSnapshot({ ...snapshot, queueDepth: MAX_INFERENCE_QUEUE_DEPTH + 1 }),
     /outside the MVP bound/,
   );
 });

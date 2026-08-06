@@ -10,7 +10,7 @@ pub const SILENCE_FINALIZE_BLOCKS: usize = 650_usize.div_ceil(BLOCK_DURATION_MS 
 pub const INTERIM_BLOCKS: usize = 2_000 / BLOCK_DURATION_MS as usize;
 pub const MAX_SEGMENT_BLOCKS: usize = 8_000 / BLOCK_DURATION_MS as usize;
 pub const SPEECH_START_BLOCKS: usize = 120 / BLOCK_DURATION_MS as usize;
-pub const MINIMUM_SPEECH_BLOCKS: usize = 200 / BLOCK_DURATION_MS as usize;
+pub const MINIMUM_SPEECH_BLOCKS: usize = 120 / BLOCK_DURATION_MS as usize;
 
 pub type AudioBlock = [f32; BLOCK_SAMPLES];
 
@@ -770,8 +770,12 @@ mod tests {
 
         let (segment, reason) = final_event(segmenter.push_block(&silence));
         assert_eq!(reason, FinalReason::Silence);
+        assert_eq!(MINIMUM_SPEECH_BLOCKS, SPEECH_START_BLOCKS);
         assert_eq!(segment.started_at_sample, 11 * BLOCK_SAMPLES as u64);
-        assert_eq!(segment.ended_at_sample, 63 * BLOCK_SAMPLES as u64);
+        assert_eq!(
+            segment.ended_at_sample,
+            (20 + MINIMUM_SPEECH_BLOCKS + SILENCE_FINALIZE_BLOCKS) as u64 * BLOCK_SAMPLES as u64
+        );
         assert_eq!(
             segment.samples.len(),
             (PREROLL_BLOCKS + MINIMUM_SPEECH_BLOCKS - SPEECH_START_BLOCKS

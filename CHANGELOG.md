@@ -3,6 +3,38 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## 2026-08-06 — v0.1.3 Data location, burst resilience, and caption overlay controls
+
+- Added a user-configurable primary data directory in Settings. MeetingRelay
+  validates and creates the absolute directory, probes write access, saves the
+  choice outside the active data root, and applies it after restart. Existing
+  data is not moved automatically, and `MEETINGRELAY_MVP_DATA_DIR` remains the
+  explicit environment override.
+- Deferred ASR worker preparation until the saved model choice is known. Startup
+  no longer prepares the default Sherpa model and then immediately replaces it
+  with a different selected model.
+- Increased the audio packet queue from 32 to 128 and the final-inference queue
+  from 8 to 32, shortened the minimum accepted speech block from 200 ms to 120
+  ms, and added a bounded 250 ms final-queue retry. This reduces dropped short or
+  bursty utterances while preserving bounded memory and fail-closed overload
+  behavior.
+- Simplified the caption overlay to a persistent `实时字幕` surface. It prefers
+  the current interim text and otherwise keeps the newest final, shows no
+  waiting/debug revision/timeline text, supports persisted A-/A+ font sizing,
+  and exposes native drag and southeast resize controls.
+- Added frontend and Rust regression coverage for data-directory validation,
+  queue bounds and burst absorption, short-speech acceptance, overlay fallback,
+  font-size limits, and the narrowed Tauri window permissions. Validation passed
+  with 64 frontend tests, TypeScript/Vite production build, and 222 Rust tests
+  (7 environment-dependent tests ignored by design), plus fmt and strict Clippy.
+  Real Windows
+  high-rate speech and native drag/resize acceptance remain to be run on the
+  packaged desktop application.
+- Frozen `v0.1.3` Windows executable candidate: 14,681,088 bytes,
+  ProductVersion/FileVersion `0.1.3`, SHA-256
+  `40751DAAC18A233DE7ED7C140A569A8712D2066C03C60AAD679935AE2B67EBE2`.
+  The public EXE remains unsigned and excludes model/runtime assets.
+
 ## 2026-08-05 — v0.1.2 Remembered settings and optional live text mirror
 
 - Added a persistent live-transcript display choice between original plus

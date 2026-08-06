@@ -4,5 +4,10 @@
   "description": "Read-only capability for the compact caption overlay.",
   "windows": ["caption-overlay"],
   "platforms": ["windows"],
-  "permissions": ["core:window:allow-is-visible", "allow-mvp-snapshot"]
+  "permissions": [
+    "core:window:allow-is-visible",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging",
+    "allow-mvp-snapshot"
+  ]
 }

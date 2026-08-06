@@ -12,6 +12,8 @@
     "allow-mvp-preflight",
     "allow-mvp-audio-devices",
     "allow-mvp-asr-models",
+    "allow-mvp-data-directory-settings",
+    "allow-mvp-save-data-directory",
     "allow-mvp-prepare-language",
     "allow-mvp-discover-local-translation-models",
     "allow-mvp-secret-store-status",

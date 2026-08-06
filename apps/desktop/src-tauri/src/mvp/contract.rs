@@ -2,7 +2,7 @@ use serde::Serialize;
 
 pub const MVP_CONTRACT_VERSION: &str = "meetingrelay.mvp.durable.v3";
 pub const MAX_FINAL_SEGMENTS: usize = 64;
-pub const MAX_INFERENCE_QUEUE_DEPTH: usize = 8;
+pub const MAX_INFERENCE_QUEUE_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

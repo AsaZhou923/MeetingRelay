@@ -38,10 +38,12 @@ MeetingRelay captures system playback and microphone input, performs real-time s
 - **Focused meeting workflow** — separate Live Meeting, Meeting Records, and Settings views keep session controls and the transcript visible without mixing in administration tools.
 - **Stable live transcript** — final rows are reconciled by stable keys, scroll independently, follow the latest line by default, and preserve the reading position when the user reviews earlier content.
 - **Selectable transcript presentation** — keep the default original-plus-translation view, or persist a translation-only live view across the transcript, latest-line dock, and caption overlay.
+- **Adjustable caption overlay** — show only the live caption, retain the last final between utterances, drag or resize the native window, and persist A-/A+ font sizing.
 - **Predictable Provider checks** — connection feedback remains visible in place, uses a bounded 15-second probe, and does not flash PowerShell console windows.
 - **Persistence first** — the original transcript is committed to SQLite/WAL before it is shown as saved or submitted for translation.
 - **Optional AI translation** — supports local and third-party OpenAI-compatible Chat Completions services.
 - **Optional live TXT mirror** — write committed final originals to a new per-meeting UTF-8/LF file in an explicitly configured directory, without replacing the SQLite source of truth.
+- **Configurable primary data directory** — validate and save the root used for SQLite, exports, and diagnostics, then activate it on the next application start.
 - **Remembered non-secret settings** — restores the last recognition/source/display/translation/live-TXT choices and selected Provider Profile while keeping API tokens in the OS vault.
 - **Failure isolation** — translation, network, or model failures do not affect committed originals.
 - **Meeting recovery** — recover committed finals after an abnormal exit and reopen the most recent meeting.
@@ -250,13 +252,20 @@ HTTP is allowed directly for `localhost`, `127.0.0.1`, and `[::1]`. Non-loopback
 
 API tokens are loaded into process memory only while needed and are persisted exclusively in Windows Credential Manager. They are never written to localStorage, SQLite, logs, or exports. Use **Remove from OS vault** in Provider management to delete a stored token. The non-secret remote HTTP acknowledgement may be stored locally as a preference.
 
-### Last-used settings and live TXT
+### Last-used settings, primary data directory, and live TXT
 
 MeetingRelay restores the last recognition language, audio-source mode, live
 display mode, translation enabled state, target language, Provider Profile,
 model, remote-HTTP acknowledgement, and live-TXT directory choice. Provider Base
 URLs and models use the existing versioned SQLite Profile store; ordinary browser
 preferences never contain a token or a Provider Base URL.
+
+In **Settings → Storage**, enter a drive or UNC absolute directory for the next
+application start. MeetingRelay creates it, probes write access, and saves the
+choice outside the active data root. The current directory remains active until
+restart and existing databases/exports are not migrated automatically.
+`MEETINGRELAY_MVP_DATA_DIR` remains the highest-priority operator override and
+cannot be replaced from the UI.
 
 Live TXT is off by default. When enabled, enter an existing writable absolute
 directory before starting. Each meeting creates a new
@@ -268,11 +277,11 @@ originals in SQLite.
 
 ## Downloads and releases
 
-Latest formal release: [MeetingRelay v0.1.2](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+Latest formal release: [MeetingRelay v0.1.3](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | File | Size | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.2/MeetingRelay.exe) | 14,639,104 bytes | `C21716304E3BEC7ADD78E970F22DF8B79FDF9DBD5777074A448770CEFC859233` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.3/MeetingRelay.exe) | 14,681,088 bytes | `40751DAAC18A233DE7ED7C140A569A8712D2066C03C60AAD679935AE2B67EBE2` |
 
 Build a complete same-machine package:
 
@@ -364,6 +373,10 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
   also does not provide word timestamps, diarization, or automatic language
   detection; MeetingRelay fixes the meeting language and owns the segment
   timeline.
+- Audio/final queue capacity, short-speech acceptance, and bounded final-queue
+  backpressure have been hardened to reduce loss under bursty speech. A
+  representative fast-speech real-device meeting is still required; this does
+  not establish that the selected model can never miss an utterance.
 - Cohere has passed the local CUDA/integration smoke described above, but
   representative same-material Chinese/Japanese/English, noisy-room, and
   long-meeting comparisons are still required before quantifying its quality
@@ -372,6 +385,8 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
 - OpenAI-compatible translation uses non-streaming requests per final segment. Manual segment/meeting retry and sanitized attempt provenance are included; token streaming, context windows, proxies, and custom headers/bodies are not.
 - Translation-only is a live presentation choice, not a deletion or storage mode; original finals remain durable and available for meeting records, recovery, copy, and export.
 - Live TXT currently mirrors committed original finals only and accepts an existing absolute directory entered by the user; native directory picking and translated/bilingual live-file modes are not included.
+- A changed primary data directory takes effect after restart and does not
+  automatically migrate the previous database, exports, or diagnostics.
 - The 60-minute microphone path and an audible system-loopback short meeting have passed real-device validation. Device hot-plug behavior still requires validation.
 - A short real Windows system-audio meeting has passed the full local-ASR → remote-translation → SQLite path with `gpt-5.4-mini`. The repository now includes a repeatable Windows acceptance evidence gate for 10–20 minute HTTPS meetings, cost/latency/quality reporting, two-hour dual-source loss/gap, and timeline p95/max thresholds. A real evidence run on representative hardware, a second clean Windows machine, and a signed installer have not been validated.
 - The published `MeetingRelay.exe` is unsigned, and public assets do not include the model or Sherpa runtime. The repository can build an explicitly marked unsigned NSIS test installer; a formal installer remains blocked until asset redistribution is approved and an Authenticode certificate is supplied.
