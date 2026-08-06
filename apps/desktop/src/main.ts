@@ -2730,6 +2730,14 @@ function renderDataDirectorySettings(active: boolean): void {
     controls.dataDirectoryStatus.dataset.status = "warning";
     controls.dataDirectoryStatus.textContent =
       `当前由 MEETINGRELAY_MVP_DATA_DIR 固定为 ${settings.activeDataDir}，界面设置不可覆盖。`;
+  } else if (!settings.activeStorageAvailable) {
+    controls.dataDirectoryStatus.dataset.status = "error";
+    const recoverySaved =
+      settings.activeDataDir.toLocaleLowerCase() !==
+      settings.configuredDataDir.toLocaleLowerCase();
+    controls.dataDirectoryStatus.textContent = recoverySaved
+      ? `当前启动的数据目录 ${settings.activeDataDir} 不可用；已保存 ${settings.configuredDataDir}，重启 MeetingRelay 后恢复。旧目录中的数据不会自动迁移。`
+      : `当前配置的数据目录 ${settings.activeDataDir} 不可用。请选择新的可写绝对目录并保存，然后重启 MeetingRelay。`;
   } else if (settings.restartRequired) {
     controls.dataDirectoryStatus.dataset.status = "warning";
     controls.dataDirectoryStatus.textContent =
@@ -3668,6 +3676,10 @@ renderRetryProgress(null);
 renderRecoveryCenter();
 
 void (async () => {
+  await loadDataDirectorySettings().catch((error) => {
+    controls.dataDirectoryStatus.dataset.status = "error";
+    controls.dataDirectoryStatus.textContent = `数据目录设置不可用：${message(error)}`;
+  });
   await syncOverlayState().catch((error) => {
     controls.error.textContent = `悬浮字幕窗口不可用：${message(error)}`;
   });
@@ -3686,10 +3698,6 @@ void (async () => {
   }
   try {
     render(await call("mvp_preflight"));
-    await loadDataDirectorySettings().catch((error) => {
-      controls.dataDirectoryStatus.dataset.status = "error";
-      controls.dataDirectoryStatus.textContent = `数据目录设置不可用：${message(error)}`;
-    });
     if (preparedAsrModelId !== currentAsrModelId()) {
       await prepareSelectedAsr();
     }

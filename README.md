@@ -264,6 +264,9 @@ In **Settings → Storage**, enter a drive or UNC absolute directory for the nex
 application start. MeetingRelay creates it, probes write access, and saves the
 choice outside the active data root. The current directory remains active until
 restart and existing databases/exports are not migrated automatically.
+If a previously saved root is unavailable at launch, this setting remains
+accessible before preflight so a writable replacement can be saved and applied
+after restart.
 `MEETINGRELAY_MVP_DATA_DIR` remains the highest-priority operator override and
 cannot be replaced from the UI.
 

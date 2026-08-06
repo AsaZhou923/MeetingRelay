@@ -3,6 +3,15 @@
 This file records user-visible product changes, validation evidence, security-relevant
 decisions, and known acceptance gaps.
 
+## Unreleased
+
+- Kept primary data-directory settings available before storage preflight. If a
+  saved root cannot be opened on launch, the Settings UI now identifies the
+  unavailable root and can validate and save a replacement without requiring
+  the active SQLite storage to exist; the replacement is applied after restart.
+- Aligned the caption overlay's native Tauri minimum width with its documented
+  and CSS-tested 320 px compact layout instead of stopping resize at 480 px.
+
 ## 2026-08-06 — v0.1.3 Data location, burst resilience, and caption overlay controls
 
 - Added a user-configurable primary data directory in Settings. MeetingRelay

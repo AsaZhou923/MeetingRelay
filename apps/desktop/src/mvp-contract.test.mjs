@@ -53,12 +53,14 @@ test("parses restart-scoped data directory settings", () => {
       configuredDataDir: "D:\\MeetingRelay Data",
       restartRequired: true,
       environmentOverride: false,
+      activeStorageAvailable: true,
     }),
     {
       activeDataDir: "C:\\Users\\Example\\AppData\\Local\\MeetingRelay\\mvp",
       configuredDataDir: "D:\\MeetingRelay Data",
       restartRequired: true,
       environmentOverride: false,
+      activeStorageAvailable: true,
     },
   );
   assert.throws(
@@ -68,15 +70,21 @@ test("parses restart-scoped data directory settings", () => {
         configuredDataDir: "D:\\MeetingRelay Data",
         restartRequired: true,
         environmentOverride: false,
+        activeStorageAvailable: true,
       }),
     /activeDataDir/,
   );
 });
 
-test("wires data directory changes as a validated restart-scoped setting", () => {
+test("wires data directory recovery before preflight as a validated restart-scoped setting", () => {
   const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
   assert.match(mainSource, /id="data-directory"/);
   assert.match(mainSource, /invoke<unknown>\("mvp_save_data_directory", \{ dataDirectory \}\)/);
+  assert.match(
+    mainSource,
+    /await loadDataDirectorySettings\(\)[\s\S]*render\(await call\("mvp_preflight"\)\)/,
+  );
+  assert.match(mainSource, /activeStorageAvailable/);
   assert.match(mainSource, /重启 MeetingRelay 后生效/);
   assert.match(mainSource, /旧数据仍保留/);
 });

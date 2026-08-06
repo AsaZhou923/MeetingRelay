@@ -392,6 +392,7 @@ export type DataDirectorySettings = {
   configuredDataDir: string;
   restartRequired: boolean;
   environmentOverride: boolean;
+  activeStorageAvailable: boolean;
 };
 
 export type TranslationRetryProgress = {
@@ -1075,6 +1076,10 @@ export function parseDataDirectorySettings(value: unknown): DataDirectorySetting
     environmentOverride: boolean(
       settings.environmentOverride,
       "data directory environmentOverride",
+    ),
+    activeStorageAvailable: boolean(
+      settings.activeStorageAvailable,
+      "data directory activeStorageAvailable",
     ),
   };
 }

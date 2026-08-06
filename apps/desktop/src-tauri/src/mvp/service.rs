@@ -162,6 +162,7 @@ pub struct DataDirectorySettingsSnapshot {
     pub configured_data_dir: String,
     pub restart_required: bool,
     pub environment_override: bool,
+    pub active_storage_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -446,11 +447,12 @@ fn cleanup_live_text_mirror_empty_file(
 
 fn data_directory_settings_snapshot(
     active: PathBuf,
+    active_storage_available: bool,
     configured: PathBuf,
 ) -> DataDirectorySettingsSnapshot {
     let active_data_dir = active.to_string_lossy().into_owned();
     let configured_data_dir = configured.to_string_lossy().into_owned();
-    let restart_required = if cfg!(windows) {
+    let configured_differs = if cfg!(windows) {
         !active_data_dir.eq_ignore_ascii_case(&configured_data_dir)
     } else {
         active_data_dir != configured_data_dir
@@ -458,8 +460,9 @@ fn data_directory_settings_snapshot(
     DataDirectorySettingsSnapshot {
         active_data_dir,
         configured_data_dir,
-        restart_required,
+        restart_required: !active_storage_available || configured_differs,
         environment_override: data_root_has_environment_override(),
+        active_storage_available,
     }
 }
 
@@ -573,13 +576,16 @@ impl MvpService {
     }
 
     pub fn data_directory_settings(&self) -> Result<DataDirectorySettingsSnapshot, String> {
-        let active = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
-            .data_root()?;
         let configured = configured_data_root()?;
-        Ok(data_directory_settings_snapshot(active, configured))
+        let (active, active_storage_available) = match self.storage.as_ref() {
+            Some(storage) => (storage.data_root()?, true),
+            None => (configured.clone(), false),
+        };
+        Ok(data_directory_settings_snapshot(
+            active,
+            active_storage_available,
+            configured,
+        ))
     }
 
     pub fn save_data_directory(
@@ -592,13 +598,17 @@ impl MvpService {
         ) {
             return Err("MVP_DATA_DIR_SESSION_ACTIVE".to_owned());
         }
-        let active = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "MVP_STORAGE_UNAVAILABLE".to_owned())?
-            .data_root()?;
+        let current_configured = configured_data_root()?;
+        let (active, active_storage_available) = match self.storage.as_ref() {
+            Some(storage) => (storage.data_root()?, true),
+            None => (current_configured, false),
+        };
         let configured = save_configured_data_root(data_directory)?;
-        Ok(data_directory_settings_snapshot(active, configured))
+        Ok(data_directory_settings_snapshot(
+            active,
+            active_storage_available,
+            configured,
+        ))
     }
 
     pub fn secret_store_status(
@@ -7073,6 +7083,18 @@ mod tests {
         {
             assert_eq!(service.start(true), Err("MVP_WINDOWS_ONLY".to_owned()));
         }
+    }
+
+    #[test]
+    fn unavailable_storage_exposes_restart_scoped_data_directory_recovery() {
+        let configured = std::env::temp_dir().join("meetingrelay-unavailable-data-root");
+        let settings =
+            data_directory_settings_snapshot(configured.clone(), false, configured.clone());
+
+        assert!(!settings.active_storage_available);
+        assert!(settings.restart_required);
+        assert_eq!(settings.active_data_dir, configured.to_string_lossy());
+        assert_eq!(settings.configured_data_dir, configured.to_string_lossy());
     }
 
     #[test]

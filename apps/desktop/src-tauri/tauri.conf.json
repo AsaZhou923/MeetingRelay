@@ -26,7 +26,7 @@
         "title": "MeetingRelay Caption Overlay",
         "width": 760,
         "height": 180,
-        "minWidth": 480,
+        "minWidth": 320,
         "minHeight": 120,
         "visible": false,
         "alwaysOnTop": true,

@@ -107,6 +107,9 @@ test("overlay font size controls step within bounds", () => {
 
 test("overlay exposes only live captions plus bounded native window controls", () => {
   const overlaySource = readFileSync(new URL("./caption-overlay.ts", import.meta.url), "utf8");
+  const tauriConfig = JSON.parse(
+    readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
+  );
   const capability = JSON.parse(
     readFileSync(
       new URL("../src-tauri/capabilities/caption-overlay.json", import.meta.url),
@@ -120,4 +123,6 @@ test("overlay exposes only live captions plus bounded native window controls", (
   assert.doesNotMatch(overlaySource, /State|Time|Finals|revision|timeline|samples|等待实时字幕/);
   assert.ok(capability.permissions.includes("core:window:allow-start-dragging"));
   assert.ok(capability.permissions.includes("core:window:allow-start-resize-dragging"));
+  const overlayWindow = tauriConfig.app.windows.find((window) => window.label === "caption-overlay");
+  assert.equal(overlayWindow?.minWidth, 320);
 });
