@@ -238,11 +238,11 @@ MeetingRelay 会恢复上次的识别语言、音源模式、实时显示模式�
 
 ## 下载与发布
 
-最新正式版本：[MeetingRelay v0.1.3](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+最新正式版本：[MeetingRelay v0.1.4](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.3/MeetingRelay.exe) | 14,681,088 bytes | `40751DAAC18A233DE7ED7C140A569A8712D2066C03C60AAD679935AE2B67EBE2` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.4/MeetingRelay.exe) | 14,710,784 bytes | `59912C834FA414B762AB0A95E44F402D7EDD2F4BD1C526409F0049F2C55A25FF` |
 
 生成完整的同机运行目录：
 

@@ -23,14 +23,19 @@ decisions, and known acceptance gaps.
   close behavior, and compact overlay dimensions. Local validation passed with
   66 frontend tests, TypeScript/Vite production build, 228 Rust tests (7
   environment-dependent tests ignored), fmt, strict Clippy, launcher, release,
-  acceptance contracts, and 90 distribution assertions. Representative
-  fast/overlapping-speech and packaged native-window acceptance remain pending.
+  acceptance contracts, and 90 distribution assertions. The exact PR candidate
+  and post-merge `main` Windows CI runs also passed. Representative fast/
+  overlapping-speech and packaged native-window acceptance remain pending.
 - Kept primary data-directory settings available before storage preflight. If a
   saved root cannot be opened on launch, the Settings UI now identifies the
   unavailable root and can validate and save a replacement without requiring
   the active SQLite storage to exist; the replacement is applied after restart.
 - Aligned the caption overlay's native Tauri minimum width with its documented
   and CSS-tested 320 px compact layout instead of stopping resize at 480 px.
+- Frozen `v0.1.4` Windows executable candidate from final merged source:
+  14,710,784 bytes, ProductVersion/FileVersion `0.1.4`, SHA-256
+  `59912C834FA414B762AB0A95E44F402D7EDD2F4BD1C526409F0049F2C55A25FF`.
+  The public EXE remains unsigned and excludes model/runtime assets.
 
 ## 2026-08-06 — v0.1.3 Data location, burst resilience, and caption overlay controls
 
