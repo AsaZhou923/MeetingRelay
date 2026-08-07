@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Window } from "@tauri-apps/api/window";
 
 import {
@@ -811,6 +812,7 @@ const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 const ASR_MODEL_PREFERENCE_KEY = "meetingrelay.asr-model.v1";
 const R3_PAGE_SIZE = 50;
 const CAPTION_OVERLAY_WINDOW_LABEL = "caption-overlay";
+const CAPTION_OVERLAY_HIDDEN_EVENT = "meetingrelay://caption-overlay-hidden";
 
 function message(error: unknown): string {
   return formatMvpErrorMessage(error);
@@ -2204,6 +2206,16 @@ async function setOverlayVisible(visible: boolean): Promise<void> {
   }
 }
 
+void listen(CAPTION_OVERLAY_HIDDEN_EVENT, () => {
+  void syncOverlayState();
+})
+  .then((unlisten) => {
+    window.addEventListener("beforeunload", () => unlisten(), { once: true });
+  })
+  .catch((error) => {
+    controls.error.textContent = `悬浮字幕状态监听不可用：${message(error)}`;
+  });
+
 async function openRecentMeeting(): Promise<void> {
   render(await call("mvp_open_recent"));
 }
@@ -3241,6 +3253,7 @@ controls.pauseResume.addEventListener("click", async () => {
 
 controls.overlayToggle.addEventListener("click", async () => {
   try {
+    await syncOverlayState();
     await setOverlayVisible(!overlayVisible);
   } catch (error) {
     controls.error.textContent = `悬浮字幕控制失败：${message(error)}`;

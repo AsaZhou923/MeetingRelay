@@ -5,6 +5,26 @@ decisions, and known acceptance gaps.
 
 ## Unreleased
 
+## 2026-08-07 — v0.1.4 Faster live captions and compact overlay
+
+- Reduced chunked-ASR latency from a two-second interim cadence and eight-second
+  continuous-speech final boundary to one second and four seconds respectively,
+  while retaining the 650 ms silence endpoint. A meaningful interim that was
+  already published may now use the existing SQLite-first final path only when
+  the matching final ASR call succeeds with low-information text; ASR errors or
+  mismatched session, segment, revision, or sample bounds never use the fallback.
+- Expanded the caption overlay into an oldest-to-newest three-line recency stack,
+  with the current line emphasized and translation-only status rules shared with
+  the main UI. Added a close control that hides rather than destroys the native
+  window, immediate main-window visibility synchronization, a 250 ms visible
+  polling cadence, and responsive latest-line preservation down to 320×120.
+- Added regression coverage for endpoint timing, interim/final salvage boundaries,
+  translation-only privacy, minimal Tauri event/window permissions, hide-only
+  close behavior, and compact overlay dimensions. Local validation passed with
+  66 frontend tests, TypeScript/Vite production build, 228 Rust tests (7
+  environment-dependent tests ignored), fmt, strict Clippy, launcher, release,
+  acceptance contracts, and 90 distribution assertions. Representative
+  fast/overlapping-speech and packaged native-window acceptance remain pending.
 - Kept primary data-directory settings available before storage preflight. If a
   saved root cannot be opened on launch, the Settings UI now identifies the
   unavailable root and can validate and save a replacement without requiring

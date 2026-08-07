@@ -1,4 +1,7 @@
-import type { LatestTranscriptLine, TranslationDisplaySource } from "./frontend-state";
+import {
+  translationOnlyText,
+  type LatestTranscriptLine,
+} from "./frontend-state.ts";
 import type {
   MvpSnapshot,
   MvpTranscriptDisplayMode,
@@ -11,25 +14,53 @@ export const OVERLAY_MIN_FONT_SIZE_PX = 20;
 export const OVERLAY_MAX_FONT_SIZE_PX = 72;
 export const OVERLAY_FONT_SIZE_STEP_PX = 4;
 
-export type OverlayCaptionLine = LatestTranscriptLine;
+export type OverlayCaptionLine = LatestTranscriptLine & {
+  key: string;
+  current: boolean;
+};
 
-export function selectOverlayCaption(
+export function selectOverlayCaptions(
   snapshot: Pick<MvpSnapshot, "interim" | "finals">,
   displayMode: MvpTranscriptDisplayMode,
-): OverlayCaptionLine {
+): OverlayCaptionLine[] {
   if (displayMode === "translation_only") {
-    const latestFinal = latestFinalSegment(snapshot.finals);
-    if (latestFinal === undefined) return { text: "", kind: "empty" };
-    return translationOnlyCaption(latestFinal);
+    const lines = snapshot.finals.slice(-3).map((final) => ({
+      ...translationOnlyText(final),
+      key: finalCaptionKey(final),
+      current: false,
+    }));
+    return markCurrent(lines);
   }
 
   const interimText = snapshot.interim?.text.trim() ?? "";
-  if (interimText.length > 0) return { text: interimText, kind: "interim" };
+  if (interimText.length > 0) {
+    return markCurrent([
+      ...meaningfulFinals(snapshot.finals).slice(-2).map((final) => ({
+        text: final.text.trim(),
+        kind: "final" as const,
+        key: finalCaptionKey(final),
+        current: false,
+      })),
+      {
+        text: interimText,
+        kind: "interim" as const,
+        key: `interim:${snapshot.interim?.segmentId ?? "current"}`,
+        current: false,
+      },
+    ]);
+  }
 
-  const finalText = latestFinalSegment(snapshot.finals)?.text.trim() ?? "";
-  if (finalText.length > 0) return { text: finalText, kind: "final" };
+  const lines = meaningfulFinals(snapshot.finals)
+    .slice(-3)
+    .map((final) => ({
+      text: final.text.trim(),
+      kind: "final" as const,
+      key: finalCaptionKey(final),
+      current: false,
+    }));
+  if (lines.length > 0) return markCurrent(lines);
 
-  return { text: "", kind: "empty" };
+  return [{ text: "", kind: "empty", key: "empty", current: true }];
 }
 
 export function parseOverlayFontSize(value: string | null): number {
@@ -50,25 +81,17 @@ export function clampOverlayFontSize(value: number): number {
   );
 }
 
-function latestFinalSegment(finals: readonly TranscriptSegment[]): TranscriptSegment | undefined {
-  return finals.at(-1);
+function meaningfulFinals(finals: readonly TranscriptSegment[]): TranscriptSegment[] {
+  return finals.filter((final) => final.text.trim().length > 0);
 }
 
-function translationOnlyCaption(source: TranslationDisplaySource): LatestTranscriptLine {
-  if (source.translationStatus === "completed") {
-    const translation = source.translationText?.trim() ?? "";
-    return translation.length > 0
-      ? { text: translation, kind: "translation" }
-      : { text: "译文为空；请重试翻译。", kind: "status" };
-  }
-  if (source.translationStatus === "pending") {
-    return { text: "正在等待译文…", kind: "status" };
-  }
-  if (source.translationStatus === "failed") {
-    return { text: "翻译失败；原文仍已安全保存。", kind: "status" };
-  }
-  if (source.translationStatus === "skipped") {
-    return { text: "译文语言与识别语言相同，已跳过翻译。", kind: "status" };
-  }
-  return { text: "翻译未启用；可切回“原文 + 译文”查看原文。", kind: "status" };
+function finalCaptionKey(final: TranscriptSegment): string {
+  return `final:${final.segmentId}`;
+}
+
+function markCurrent(lines: OverlayCaptionLine[]): OverlayCaptionLine[] {
+  return lines.map((line, index) => ({
+    ...line,
+    current: index === lines.length - 1,
+  }));
 }

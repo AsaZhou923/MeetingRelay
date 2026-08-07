@@ -2,8 +2,8 @@
 
 ## Source of truth
 
-- Status: Implemented baseline
-- Last refreshed: 2026-08-05
+- Status: Implemented and automated-verified; packaged Windows acceptance pending
+- Last refreshed: 2026-08-07
 - Primary product surfaces: Windows 桌面端的实时会议、会议记录、设置与诊断界面
 - Evidence reviewed:
   - `apps/desktop/src/main.ts`
@@ -11,6 +11,10 @@
   - `apps/desktop/src/mvp-contract.ts`
   - `apps/desktop/src/transcript-render.test.mjs`
   - `apps/desktop/src/mvp-contract.test.mjs`
+  - `apps/desktop/src/caption-overlay-state.ts`
+  - `apps/desktop/src/caption-overlay.ts`
+  - `apps/desktop/src/overlay.css`
+  - `apps/desktop/src-tauri/src/mvp/dsp.rs`
   - `apps/desktop/src-tauri/src/mvp/service.rs`
   - `apps/desktop/src-tauri/src/mvp/secret_store.rs`
   - `apps/desktop/src-tauri/src/mvp/translation.rs`
@@ -18,13 +22,15 @@
   - `E:\Project Code\docs\01 - Projects\MeetingRelay\产品需求与 MVP.md`
   - `E:\Project Code\docs\01 - Projects\MeetingRelay\当前架构与实现状态.md`
   - 2026-08-04 用户反馈与界面截图
-- This document is the stable design direction. The detailed investigation and delivery plan live in `E:\Project Code\docs\01 - Projects\MeetingRelay\界面与交互优化调查及修改方案.md`.
+- This document is the stable design direction. The active realtime-transcript and caption-overlay delivery plan lives in `E:\Project Code\docs\01 - Projects\MeetingRelay\08 - Plans\实时转写与悬浮字幕重点优化计划.md`.
 
 ## Implementation snapshot
 
 The 2026-08-05 baseline now includes the three primary views, persistent in-place provider probe results, immediate and duplicate-safe start feedback, an independent transcript viewport with explicit follow-latest behavior, a fixed and explicitly labelled latest-line area, a persistent original-plus-translation/translation-only display choice shared by the main view and overlay, remembered non-secret meeting/Provider settings, an optional post-commit live TXT mirror, a Chinese-first visual language, no-window PowerShell execution, and a 15-second provider probe budget. The meeting controls remain visible at the top of the live-meeting rail while its detailed checks scroll independently. Meeting Records and Settings use intrinsically sized cards inside their own vertical workspaces, so card contents are never compressed or clipped to satisfy the grid.
 
 The remaining measurement work is explicitly tracked rather than treated as complete: cold/warm start p50/p95 telemetry, a real local/LAN/cloud provider matrix, 125%/150% Windows scaling coverage, and further decomposition of `main.ts`.
+
+The 2026-08-07 optimization contract is implemented and covered by automated tests. It shortens chunked live updates to a 1-second interim cadence and a 4-second continuous-speech final boundary, permits only a strictly matching already-published interim to survive a successful-but-low-information final decode, and changes the caption overlay into a three-entry recency stack with a hide-only close control. Production-browser inspection covers `760×280`, `320×280`, and minimum `320×120` layouts. These changes do not claim native token streaming, packaged Tauri interaction acceptance, or speaker separation; system output and microphone remain one mixed recognition stream.
 
 ## Brand
 
@@ -88,7 +94,7 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - `TranscriptDisplayPicker`：持久化选择“原文 + 译文”或“仅显示译文”；实时列表、最新一句与悬浮字幕必须遵循同一规则。
 - `LiveTextMirrorSetting`：会前选择是否把 durable final 原文实时写入独立 TXT；活动会议中锁定目录。
 - `DataDirectorySetting`：输入并验证主数据绝对目录；明确区分当前目录与重启后目录，不暗示自动迁移旧数据。
-- `CaptionOverlay`：固定标题为“实时字幕”，优先 interim、否则保留最新 final；不显示 revision/timeline/队列等调试信息，提供拖动、右下角缩放和持久化字号控制。
+- `CaptionOverlay`：固定标题为“实时字幕”，最多显示三条从旧到新的最近内容；有 interim 时显示最近两条有效 final + 当前 interim，否则显示最近三条 final。仅译文模式只显示最近 final 的译文或明确状态，绝不显示 interim 原文。最新内容视觉最强，不显示 revision/timeline/队列等调试信息，并提供隐藏窗口的关闭按钮、拖动、右下角缩放和持久化字号控制。
 - `FollowLatestButton`：用户离开底部且有新内容时出现，点击后恢复自动跟随。
 - `SecondaryWorkspace`：会议详情、说话人、摘要、导出、治理与诊断的次级工作区。
 
@@ -108,7 +114,7 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - 中部内容区占用剩余高度，只有 `TranscriptViewport` 和次级列表独立滚动。
 - 会议记录与设置的卡片按内容高度展开，由各自的 `SecondaryWorkspace` 统一纵向滚动；不得用等分网格行压缩卡片内容。
 - 主要控制条固定在窗口底部，不应被历史列表或高级设置推离视口。
-- 悬浮字幕默认 `760×180`，在紧凑到 `320px` 宽时仍保留字幕、字号控制与右下角缩放入口，不产生横向滚动。
+- 悬浮字幕默认 `760×280`，在紧凑到 `320px` 宽或最小高度时优先保留最新句，并仍保留关闭、字号控制与右下角缩放入口，不产生横向滚动。
 - 不以横向滚动解决主流程空间不足；技术表格可在次级页面内局部滚动。
 
 ## Interaction states
@@ -137,6 +143,8 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 - 用户主动向上滚动后暂停跟随，保持阅读位置，并显示新内容数量与“回到最新”。
 - 点击“回到最新”或滚回底部后恢复跟随。
 - 临时句更新不应重建整个历史列表，也不应改变用户当前的历史阅读位置。
+- 分块式识别目标为约每 1 秒更新 interim，连续语音最迟约 4 秒形成 final；这是一项延迟预算，不得描述为原生 token streaming。
+- 已经公开的 interim 只能在同 session、同 segment、同起点且结束范围合法，并且 final ASR 调用成功但返回低信息文本时进入现有 final 持久化路径；ASR 错误时不得补写。
 - 默认显示原文与译文；选择“仅显示译文”时，completed 显示译文，pending/failed/skipped/disabled 显示明确状态，任何一种状态都不得回退显示原文或留空。
 - “仅显示译文”只改变展示，不改变原文的 SQLite 持久化、会议历史、复制或导出语义。
 - 实时 TXT 默认关闭；启用后只在 SQLite final commit ACK 后追加非重复原文，使用 UTF-8/LF、逐会议新文件并拒绝覆盖。
@@ -161,8 +169,9 @@ MeetingRelay 应表现为一个安静、可靠、尊重隐私的本地会议工�
 
 ## Open questions
 
-- 用户更偏好固定显示“正在说的临时句”，还是固定显示“最新确认句 + 临时句”两行？
 - 主要使用的窗口尺寸和缩放比例是什么？是否需要兼容 125%/150% Windows 缩放？
+- 三条字幕在用户常用字号和最小窗口高度下的可读性，仍需 packaged Windows 真机验收。
+- 真正同时说话是否需要系统输出/麦克风分路识别与说话人身份，是后续架构决策；本轮单声道混音不承诺解决重叠语音。
 - 连接测试短超时应统一为 15 秒，还是按本地/LAN/云服务分别配置？
 - 凭据访问的中期方案是批量/惰性 PowerShell，还是切换到原生 Windows Credential API？
 - 当前真实的点击开始到录制成功 p50/p95 尚未测量；应先埋点再确定性能预算。
