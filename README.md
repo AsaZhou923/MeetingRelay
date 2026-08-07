@@ -280,11 +280,11 @@ originals in SQLite.
 
 ## Downloads and releases
 
-Latest formal release: [MeetingRelay v0.1.3](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
+Latest formal release: [MeetingRelay v0.1.4](https://github.com/AsaZhou923/MeetingRelay/releases/latest)
 
 | File | Size | SHA-256 |
 | --- | ---: | --- |
-| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.3/MeetingRelay.exe) | 14,681,088 bytes | `40751DAAC18A233DE7ED7C140A569A8712D2066C03C60AAD679935AE2B67EBE2` |
+| [`MeetingRelay.exe`](https://github.com/AsaZhou923/MeetingRelay/releases/download/v0.1.4/MeetingRelay.exe) | 14,710,784 bytes | `59912C834FA414B762AB0A95E44F402D7EDD2F4BD1C526409F0049F2C55A25FF` |
 
 Build a complete same-machine package:
 
