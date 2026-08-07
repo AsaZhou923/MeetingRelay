@@ -4681,6 +4681,7 @@ impl InferenceSubmitter {
 #[derive(Default)]
 struct InferenceShared {
     interim: Mutex<Option<(u64, InferenceTask)>>,
+    published_interim_record: Mutex<Option<PublishedInterimTranscript>>,
     pending: AtomicUsize,
     latest_interim: AtomicU64,
     published_interim: AtomicU64,
@@ -4723,6 +4724,64 @@ impl InferenceShared {
             self.published_interim.store(0, Ordering::Release);
         }
     }
+
+    fn remember_published_interim(&self, interim: PublishedInterimTranscript) {
+        *lock(&self.published_interim_record) = Some(interim);
+    }
+
+    fn published_interim_record(&self) -> Option<PublishedInterimTranscript> {
+        lock(&self.published_interim_record).clone()
+    }
+
+    fn clear_published_interim(&self) {
+        *lock(&self.published_interim_record) = None;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublishedInterimTranscript {
+    session_id: String,
+    segment_id: String,
+    revision: u32,
+    text: String,
+    meeting_sample_start: u64,
+    meeting_sample_end: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TranscriptCandidateBounds<'a> {
+    session_id: &'a str,
+    segment_id: &'a str,
+    revision: u32,
+    meeting_sample_start: u64,
+    meeting_sample_end: u64,
+}
+
+fn meaningful_final_text_or_interim(
+    final_candidate: TranscriptCandidateBounds<'_>,
+    final_text: &str,
+    published_interim: Option<&PublishedInterimTranscript>,
+) -> Option<String> {
+    if is_meaningful_transcript(final_text) {
+        return Some(final_text.to_owned());
+    }
+    let interim = published_interim?;
+    if interim_matches_final(final_candidate, interim) && is_meaningful_transcript(&interim.text) {
+        Some(interim.text.clone())
+    } else {
+        None
+    }
+}
+
+fn interim_matches_final(
+    final_candidate: TranscriptCandidateBounds<'_>,
+    interim: &PublishedInterimTranscript,
+) -> bool {
+    interim.session_id == final_candidate.session_id
+        && interim.segment_id == final_candidate.segment_id
+        && interim.revision < final_candidate.revision
+        && interim.meeting_sample_start == final_candidate.meeting_sample_start
+        && interim.meeting_sample_end <= final_candidate.meeting_sample_end
 }
 
 #[cfg(windows)]
@@ -5047,11 +5106,34 @@ fn process_inference_task(
     let result = transcribe_with_recovery(recognizer, profile, &task);
     let session_id = task.session_id.clone();
     let durable_final = match result {
-        Ok(text) => {
-            if !is_meaningful_transcript(&text) {
-                return;
-            }
+        Ok(mut text) => {
             if task.is_final {
+                let final_candidate = TranscriptCandidateBounds {
+                    session_id: &task.session_id,
+                    segment_id: &task.segment_id,
+                    revision: task.revision,
+                    meeting_sample_start: task.meeting_sample_start,
+                    meeting_sample_end: task.meeting_sample_end,
+                };
+                let Some(commit_text) = meaningful_final_text_or_interim(
+                    final_candidate,
+                    &text,
+                    shared.published_interim_record().as_ref(),
+                ) else {
+                    let _ = publish_if_current(
+                        shared,
+                        snapshot,
+                        interim_generation,
+                        &session_id,
+                        |current| {
+                            current.interim = None;
+                            shared.clear_published_interim();
+                            shared.published_interim.store(0, Ordering::Release);
+                        },
+                    );
+                    return;
+                };
+                text = commit_text;
                 let sequence = shared.next_durable_sequence_candidate();
                 let Some(storage_writer) = sinks.storage_writer else {
                     task.session_errors
@@ -5102,6 +5184,9 @@ fn process_inference_task(
                     }
                 }
             } else {
+                if !is_meaningful_transcript(&text) {
+                    return;
+                }
                 let segment = TranscriptSegment {
                     segment_id: task.segment_id.clone(),
                     sequence: "0".to_owned(),
@@ -5127,6 +5212,14 @@ fn process_inference_task(
                     interim_generation,
                     &session_id,
                     move |current| {
+                        shared.remember_published_interim(PublishedInterimTranscript {
+                            session_id: task.session_id.clone(),
+                            segment_id: task.segment_id.clone(),
+                            revision: task.revision,
+                            text: segment.text.clone(),
+                            meeting_sample_start: task.meeting_sample_start,
+                            meeting_sample_end: task.meeting_sample_end,
+                        });
                         current.interim = Some(segment);
                         shared.published_interim.store(
                             interim_generation.expect("interim tasks carry a generation"),
@@ -5160,6 +5253,7 @@ fn process_inference_task(
         move |current| {
             if task.is_final {
                 current.interim = None;
+                shared.clear_published_interim();
                 shared.published_interim.store(0, Ordering::Release);
             }
             if let Some(result) = durable_final {
@@ -7493,6 +7587,82 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn final_invalidation_scrubs_visible_interim_but_retains_matching_salvage_record() {
+        let (submitter, _finals) = test_submitter();
+        submitter
+            .shared
+            .published_interim
+            .store(1, Ordering::Release);
+        submitter.shared.latest_interim.store(2, Ordering::Release);
+        submitter
+            .shared
+            .remember_published_interim(PublishedInterimTranscript {
+                session_id: "session-test".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                revision: 2,
+                text: "今天我们讨论发布流程".to_owned(),
+                meeting_sample_start: 1_600,
+                meeting_sample_end: 32_000,
+            });
+        let mut snapshot = MvpSnapshot::booting();
+        snapshot.session_id = Some("session-test".to_owned());
+        snapshot.interim = Some(TranscriptSegment {
+            segment_id: "segment-1".to_owned(),
+            sequence: "0".to_owned(),
+            revision: 2,
+            is_final: false,
+            saved: false,
+            text: "今天我们讨论发布流程".to_owned(),
+            started_at_ms: "100".to_owned(),
+            ended_at_ms: None,
+            committed_at: None,
+            commit_id: None,
+            meeting_sample_start: "1600".to_owned(),
+            meeting_sample_end: "32000".to_owned(),
+            timeline_revision: 1,
+            translation_status: "disabled".to_owned(),
+            translation_target: None,
+            translation_text: None,
+            translation_error: None,
+        });
+
+        let returned = public_snapshot(&mut snapshot, Some(&submitter));
+
+        assert!(returned.interim.is_none());
+        assert!(snapshot.interim.is_none());
+        assert_eq!(
+            submitter.shared.published_interim.load(Ordering::Acquire),
+            0
+        );
+        let retained = submitter
+            .shared
+            .published_interim_record()
+            .expect("scrubbed UI interim should remain available for final salvage");
+        let matching_final = TranscriptCandidateBounds {
+            session_id: "session-test",
+            segment_id: "segment-1",
+            revision: 3,
+            meeting_sample_start: 1_600,
+            meeting_sample_end: 64_000,
+        };
+        assert_eq!(
+            meaningful_final_text_or_interim(matching_final, "。", Some(&retained)).as_deref(),
+            Some("今天我们讨论发布流程")
+        );
+        let other_session = TranscriptCandidateBounds {
+            session_id: "other-session",
+            ..matching_final
+        };
+        let other_segment = TranscriptCandidateBounds {
+            segment_id: "segment-2",
+            ..matching_final
+        };
+        assert!(meaningful_final_text_or_interim(other_session, "。", Some(&retained)).is_none());
+        assert!(meaningful_final_text_or_interim(other_segment, "。", Some(&retained)).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn final_queue_only_rejects_capacity_and_ignores_interim_contention() {
         let (submitter, _finals) = test_submitter();
         for _ in 0..MAX_INFERENCE_QUEUE_DEPTH {
@@ -7917,6 +8087,132 @@ mod tests {
         assert!(is_meaningful_transcript("等等，我马上回来"));
         assert!(is_meaningful_transcript("可以。"));
         assert!(is_meaningful_transcript("OK"));
+    }
+
+    #[test]
+    fn matching_published_interim_salvages_low_information_final_text() {
+        let final_candidate = TranscriptCandidateBounds {
+            session_id: "session-test",
+            segment_id: "segment-1",
+            revision: 3,
+            meeting_sample_start: 1_600,
+            meeting_sample_end: 64_000,
+        };
+        let interim = PublishedInterimTranscript {
+            session_id: "session-test".to_owned(),
+            segment_id: "segment-1".to_owned(),
+            revision: 2,
+            text: "今天我们讨论发布流程".to_owned(),
+            meeting_sample_start: 1_600,
+            meeting_sample_end: 32_000,
+        };
+
+        assert_eq!(
+            meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).as_deref(),
+            Some("今天我们讨论发布流程")
+        );
+    }
+
+    #[test]
+    fn meaningful_final_text_takes_priority_over_published_interim() {
+        let final_candidate = TranscriptCandidateBounds {
+            session_id: "session-test",
+            segment_id: "segment-1",
+            revision: 3,
+            meeting_sample_start: 0,
+            meeting_sample_end: 64_000,
+        };
+        let interim = PublishedInterimTranscript {
+            session_id: "session-test".to_owned(),
+            segment_id: "segment-1".to_owned(),
+            revision: 2,
+            text: "interim should not replace final".to_owned(),
+            meeting_sample_start: 0,
+            meeting_sample_end: 32_000,
+        };
+
+        assert_eq!(
+            meaningful_final_text_or_interim(
+                final_candidate,
+                "final transcript wins",
+                Some(&interim),
+            )
+            .as_deref(),
+            Some("final transcript wins")
+        );
+    }
+
+    #[test]
+    fn asr_error_has_no_successful_final_text_to_salvage() {
+        let final_candidate = TranscriptCandidateBounds {
+            session_id: "session-test",
+            segment_id: "segment-1",
+            revision: 3,
+            meeting_sample_start: 0,
+            meeting_sample_end: 64_000,
+        };
+        let interim = PublishedInterimTranscript {
+            session_id: "session-test".to_owned(),
+            segment_id: "segment-1".to_owned(),
+            revision: 2,
+            text: "valid interim text".to_owned(),
+            meeting_sample_start: 0,
+            meeting_sample_end: 32_000,
+        };
+        let final_asr_result: Result<&str, ()> = Err(());
+
+        assert!(
+            final_asr_result
+                .ok()
+                .and_then(|text| meaningful_final_text_or_interim(
+                    final_candidate,
+                    text,
+                    Some(&interim),
+                ))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mismatched_or_out_of_range_interim_does_not_salvage_low_information_final() {
+        let final_candidate = TranscriptCandidateBounds {
+            session_id: "session-test",
+            segment_id: "segment-1",
+            revision: 3,
+            meeting_sample_start: 1_600,
+            meeting_sample_end: 64_000,
+        };
+        let mut interim = PublishedInterimTranscript {
+            session_id: "session-test".to_owned(),
+            segment_id: "segment-1".to_owned(),
+            revision: 2,
+            text: "valid interim text".to_owned(),
+            meeting_sample_start: 1_600,
+            meeting_sample_end: 32_000,
+        };
+
+        interim.session_id = "other-session".to_owned();
+        assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
+
+        interim.session_id = "session-test".to_owned();
+        interim.segment_id = "segment-2".to_owned();
+        assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
+
+        interim.segment_id = "segment-1".to_owned();
+        interim.revision = 3;
+        assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
+
+        interim.revision = 2;
+        interim.meeting_sample_start = 0;
+        assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
+
+        interim.meeting_sample_start = 1_600;
+        interim.meeting_sample_end = 64_001;
+        assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
+
+        interim.meeting_sample_end = 32_000;
+        interim.text = "等等等等等等".to_owned();
+        assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
     }
 
     #[cfg(windows)]

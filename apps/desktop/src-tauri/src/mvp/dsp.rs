@@ -7,8 +7,8 @@ pub const BLOCK_SAMPLES: usize =
     (TARGET_SAMPLE_RATE_HZ as usize * BLOCK_DURATION_MS as usize) / 1_000;
 pub const PREROLL_BLOCKS: usize = 300 / BLOCK_DURATION_MS as usize;
 pub const SILENCE_FINALIZE_BLOCKS: usize = 650_usize.div_ceil(BLOCK_DURATION_MS as usize);
-pub const INTERIM_BLOCKS: usize = 2_000 / BLOCK_DURATION_MS as usize;
-pub const MAX_SEGMENT_BLOCKS: usize = 8_000 / BLOCK_DURATION_MS as usize;
+pub const INTERIM_BLOCKS: usize = 1_000 / BLOCK_DURATION_MS as usize;
+pub const MAX_SEGMENT_BLOCKS: usize = 4_000 / BLOCK_DURATION_MS as usize;
 pub const SPEECH_START_BLOCKS: usize = 120 / BLOCK_DURATION_MS as usize;
 pub const MINIMUM_SPEECH_BLOCKS: usize = 120 / BLOCK_DURATION_MS as usize;
 
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_emits_interim_snapshots_every_two_seconds() {
+    fn endpoint_emits_interim_snapshots_every_second() {
         let mut segmenter = EnergyEndpointSegmenter::new();
         let speech = constant_block(0.2);
         let mut interims = Vec::new();
@@ -805,12 +805,12 @@ mod tests {
             INTERIM_BLOCKS * 2 * BLOCK_SAMPLES
         );
         assert_eq!(interims[0].started_at_sample, 0);
-        assert_eq!(interims[0].ended_at_sample, 32_000);
-        assert_eq!(interims[1].ended_at_sample, 64_000);
+        assert_eq!(interims[0].ended_at_sample, 16_000);
+        assert_eq!(interims[1].ended_at_sample, 32_000);
     }
 
     #[test]
-    fn endpoint_hard_finalizes_at_eight_seconds_and_can_continue() {
+    fn endpoint_hard_finalizes_at_four_seconds_and_can_continue() {
         let mut segmenter = EnergyEndpointSegmenter::new();
         let speech = constant_block(0.2);
         let mut final_segment = None;
@@ -821,11 +821,11 @@ mod tests {
             }
         }
 
-        let (segment, reason) = final_segment.expect("eight seconds must finalize");
+        let (segment, reason) = final_segment.expect("four seconds must finalize");
         assert_eq!(reason, FinalReason::MaxDuration);
         assert_eq!(segment.started_at_sample, 0);
-        assert_eq!(segment.ended_at_sample, 128_000);
-        assert_eq!(segment.samples.len(), 128_000);
+        assert_eq!(segment.ended_at_sample, 64_000);
+        assert_eq!(segment.samples.len(), 64_000);
         assert!(!segmenter.is_active());
 
         for _ in 0..MINIMUM_SPEECH_BLOCKS {

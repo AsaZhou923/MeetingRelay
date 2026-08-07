@@ -36,9 +36,9 @@ MeetingRelay captures system playback and microphone input, performs real-time s
 - **Dual-source capture** — select Windows system output and microphone devices.
 - **Chinese, Japanese, and English** — select one recognition language before each meeting; the choice is locked while recording.
 - **Focused meeting workflow** — separate Live Meeting, Meeting Records, and Settings views keep session controls and the transcript visible without mixing in administration tools.
-- **Stable live transcript** — final rows are reconciled by stable keys, scroll independently, follow the latest line by default, and preserve the reading position when the user reviews earlier content.
+- **Responsive live transcript** — chunked recognition refreshes interim text about once per second and hard-finalizes continuous speech at about four seconds; final rows are reconciled by stable keys, follow the latest line by default, and preserve the reading position when the user reviews earlier content.
 - **Selectable transcript presentation** — keep the default original-plus-translation view, or persist a translation-only live view across the transcript, latest-line dock, and caption overlay.
-- **Adjustable caption overlay** — show only the live caption, retain the last final between utterances, drag or resize the native window, and persist A-/A+ font sizing.
+- **Adjustable caption overlay** — show up to three recent captions with the current line emphasized, hide the overlay from its close control, drag or resize the native window, and persist A-/A+ font sizing.
 - **Predictable Provider checks** — connection feedback remains visible in place, uses a bounded 15-second probe, and does not flash PowerShell console windows.
 - **Persistence first** — the original transcript is committed to SQLite/WAL before it is shown as saved or submitted for translation.
 - **Optional AI translation** — supports local and third-party OpenAI-compatible Chat Completions services.
@@ -372,10 +372,17 @@ Earlier Phase 0, attestation, benchmark, candidate-engine, and experiment code i
   switch models after an inference failure.
 - Cohere Transcribe is not a native streaming decoder. MeetingRelay feeds
   endpointed/partial PCM chunks to the persistent model worker, so the UI gets
-  chunked live updates rather than token-level true streaming. The model path
+  chunked live updates rather than token-level true streaming. The current
+  endpoint budget publishes an interim about every second and hard-finalizes
+  continuous speech at about four seconds. If a matching interim was already
+  published and the successful final decode contains only low-information
+  text, that interim may enter the normal SQLite-first final path; ASR errors
+  and mismatched segment boundaries never use this fallback. The model path
   also does not provide word timestamps, diarization, or automatic language
-  detection; MeetingRelay fixes the meeting language and owns the segment
-  timeline.
+  detection; MeetingRelay fixes the meeting language and owns the segment timeline.
+- System output and microphone audio are still mixed into one mono recognition
+  stream. Shorter chunks reduce visible delay but do not separate genuinely
+  overlapping speakers, so the quieter speaker can still be missed.
 - Audio/final queue capacity, short-speech acceptance, and bounded final-queue
   backpressure have been hardened to reduce loss under bursty speech. A
   representative fast-speech real-device meeting is still required; this does

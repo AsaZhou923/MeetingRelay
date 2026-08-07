@@ -1103,12 +1103,24 @@ test("wires R5 export to an explicit selected speaker version", () => {
 
 test("uses Tauri window API for compact overlay controls", () => {
   const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+  const overlaySource = readFileSync(new URL("./caption-overlay.ts", import.meta.url), "utf8");
   assert.match(mainSource, /import \{ Window \} from "@tauri-apps\/api\/window"/);
+  assert.match(mainSource, /import \{ listen \} from "@tauri-apps\/api\/event"/);
   assert.match(mainSource, /Window\.getByLabel\(CAPTION_OVERLAY_WINDOW_LABEL\)/);
   assert.match(mainSource, /CAPTION_OVERLAY_WINDOW_MISSING/);
   assert.match(mainSource, /overlayWindow\.isVisible\(\)/);
   assert.match(mainSource, /overlayWindow\.show\(\)/);
   assert.match(mainSource, /overlayWindow\.hide\(\)/);
+  assert.match(mainSource, /await syncOverlayState\(\);\s*await setOverlayVisible\(!overlayVisible\)/);
+  assert.match(mainSource, /listen\(CAPTION_OVERLAY_HIDDEN_EVENT/);
+  assert.match(mainSource, /syncOverlayState\(\)/);
+  assert.match(mainSource, /beforeunload[\s\S]*unlisten\(\)/);
+  assert.match(overlaySource, /import \{ emitTo \} from "@tauri-apps\/api\/event"/);
+  assert.match(overlaySource, /aria-label="关闭悬浮字幕"/);
+  assert.match(overlaySource, /renderedCaptionSignature/);
+  assert.match(overlaySource, /overlayWindow\.hide\(\)/);
+  assert.match(overlaySource, /emitTo\(MAIN_WINDOW_LABEL, OVERLAY_HIDDEN_EVENT/);
+  assert.doesNotMatch(overlaySource, /overlayWindow\.close\(\)|destroy\(\)/);
   assert.doesNotMatch(mainSource, /mvp_overlay_(?:show|hide|state)/);
 });
 
@@ -1121,6 +1133,7 @@ test("pauses compact overlay snapshot polling while the native window is hidden"
   );
   assert.match(overlaySource, /refreshInFlight/);
   assert.match(overlaySource, /visibilitychange/);
+  assert.match(overlaySource, /setInterval\(\(\) => void refreshWhenVisible\(\), 250\)/);
 });
 
 test("restricts application IPC commands by window capability", () => {
@@ -1146,11 +1159,17 @@ test("restricts application IPC commands by window capability", () => {
     .map((permission) => permission.slice("allow-".length).replaceAll("-", "_"));
   assert.deepEqual(new Set(manifestCommands), new Set(registeredCommands));
   assert.deepEqual(new Set(mainCommands), new Set(registeredCommands));
+  assert.ok(mainCapability.permissions.includes("core:event:allow-listen"));
+  assert.ok(mainCapability.permissions.includes("core:event:allow-unlisten"));
   assert.ok(overlayCapability.permissions.includes("allow-mvp-snapshot"));
+  assert.ok(overlayCapability.permissions.includes("core:window:allow-hide"));
+  assert.ok(overlayCapability.permissions.includes("core:event:allow-emit-to"));
   assert.equal(
     overlayCapability.permissions.filter((permission) => permission.startsWith("allow-mvp-")).length,
     1,
   );
+  assert.ok(!overlayCapability.permissions.includes("core:window:allow-close"));
+  assert.ok(!overlayCapability.permissions.includes("core:window:allow-destroy"));
   assert.doesNotMatch(libSource, /mvp::mvp_test_translation/);
   assert.doesNotMatch(modSource, /pub fn mvp_test_translation/);
 });

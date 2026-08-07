@@ -8,86 +8,165 @@ import {
   OVERLAY_MIN_FONT_SIZE_PX,
   nextOverlayFontSize,
   parseOverlayFontSize,
-  selectOverlayCaption,
+  selectOverlayCaptions,
 } from "./caption-overlay-state.ts";
 import { translationOnlyText } from "./frontend-state.ts";
 
 function segment(overrides = {}) {
+  const sequence = String(overrides.sequence ?? "1");
   return {
-    sequence: 1,
+    segmentId: overrides.segmentId ?? `segment-${sequence}`,
+    sequence,
     revision: 1,
+    isFinal: true,
+    saved: true,
     timelineRevision: 1,
     text: "confirmed source",
-    speakerId: null,
-    speakerLabel: null,
+    startedAtMs: "0",
+    endedAtMs: "100",
+    committedAt: "100",
+    commitId: `commit-${sequence}`,
     translationStatus: "disabled",
+    translationTarget: null,
     translationText: null,
-    meetingSampleStart: 0,
-    meetingSampleEnd: 100,
+    translationError: null,
+    meetingSampleStart: "0",
+    meetingSampleEnd: "100",
     ...overrides,
+    sequence,
   };
 }
 
-test("overlay source display prefers interim then keeps the newest final", () => {
+function interim(text) {
+  return segment({
+    segmentId: "segment-live",
+    sequence: "0",
+    isFinal: false,
+    saved: false,
+    endedAtMs: null,
+    committedAt: null,
+    commitId: null,
+    text,
+  });
+}
+
+test("overlay source display returns oldest-to-newest finals plus current interim", () => {
   assert.deepEqual(
-    selectOverlayCaption(
+    selectOverlayCaptions(
       {
-        interim: segment({ text: " live words " }),
-        finals: [segment({ text: "older" }), segment({ text: "newest final" })],
+        interim: interim(" live words "),
+        finals: [
+          segment({ sequence: "1", text: "oldest" }),
+          segment({ sequence: "2", text: " older " }),
+          segment({ sequence: "3", text: "newest final" }),
+        ],
       },
       "source_and_translation",
     ),
-    { text: "live words", kind: "interim" },
+    [
+      { text: "older", kind: "final", key: "final:segment-2", current: false },
+      { text: "newest final", kind: "final", key: "final:segment-3", current: false },
+      { text: "live words", kind: "interim", key: "interim:segment-live", current: true },
+    ],
   );
+});
 
+test("overlay source display returns the last three meaningful finals", () => {
   assert.deepEqual(
-    selectOverlayCaption(
+    selectOverlayCaptions(
       {
         interim: null,
-        finals: [segment({ text: "older" }), segment({ text: " newest final " })],
+        finals: [
+          segment({ sequence: "1", text: "first" }),
+          segment({ sequence: "2", text: " " }),
+          segment({ sequence: "3", text: "second" }),
+          segment({ sequence: "4", text: "third" }),
+          segment({ sequence: "5", text: " fourth " }),
+        ],
       },
       "source_and_translation",
     ),
-    { text: "newest final", kind: "final" },
+    [
+      { text: "second", kind: "final", key: "final:segment-3", current: false },
+      { text: "third", kind: "final", key: "final:segment-4", current: false },
+      { text: "fourth", kind: "final", key: "final:segment-5", current: true },
+    ],
   );
 });
 
 test("overlay source display stays empty without interim or finals", () => {
   assert.deepEqual(
-    selectOverlayCaption({ interim: null, finals: [] }, "source_and_translation"),
-    { text: "", kind: "empty" },
+    selectOverlayCaptions({ interim: null, finals: [] }, "source_and_translation"),
+    [{ text: "", kind: "empty", key: "empty", current: true }],
   );
 });
 
-test("overlay translation-only display matches frontend-state and never shows interim source", () => {
+test("overlay translation-only display maps latest finals through frontend-state without interim source", () => {
   const completedFinal = segment({
+    sequence: "2",
     text: "final source must stay hidden",
     translationStatus: "completed",
     translationText: "翻訳だけ",
   });
+  const pendingFinal = segment({
+    sequence: "3",
+    text: "pending source must stay hidden",
+    translationStatus: "pending",
+    translationText: null,
+  });
+  const failedFinal = segment({
+    sequence: "4",
+    text: "failed source must stay hidden",
+    translationStatus: "failed",
+    translationText: null,
+  });
 
   assert.deepEqual(
-    selectOverlayCaption(
+    selectOverlayCaptions(
       {
-        interim: segment({ text: "interim source must stay hidden" }),
-        finals: [completedFinal],
+        interim: interim("interim source must stay hidden"),
+        finals: [
+          segment({ sequence: "1", text: "ignored source", translationText: "ignored" }),
+          completedFinal,
+          pendingFinal,
+          failedFinal,
+        ],
       },
       "translation_only",
     ),
-    translationOnlyText(completedFinal),
+    [
+      { ...translationOnlyText(completedFinal), key: "final:segment-2", current: false },
+      { ...translationOnlyText(pendingFinal), key: "final:segment-3", current: false },
+      { ...translationOnlyText(failedFinal), key: "final:segment-4", current: true },
+    ],
+  );
+});
+
+test("overlay translation-only status lines never fall back to skipped or disabled source text", () => {
+  const skippedFinal = segment({
+    sequence: "1",
+    text: "skipped source must stay hidden",
+    translationStatus: "skipped",
+  });
+  const disabledFinal = segment({
+    sequence: "2",
+    text: "disabled source must stay hidden",
+    translationStatus: "disabled",
+  });
+
+  const captions = selectOverlayCaptions(
+    {
+      interim: interim("interim source must stay hidden"),
+      finals: [skippedFinal, disabledFinal],
+    },
+    "translation_only",
   );
 
-  const pendingFinal = segment({ translationStatus: "pending", translationText: null });
-  assert.deepEqual(
-    selectOverlayCaption(
-      {
-        interim: null,
-        finals: [pendingFinal],
-      },
-      "translation_only",
-    ),
-    translationOnlyText(pendingFinal),
-  );
+  assert.deepEqual(captions, [
+    { ...translationOnlyText(skippedFinal), key: "final:segment-1", current: false },
+    { ...translationOnlyText(disabledFinal), key: "final:segment-2", current: true },
+  ]);
+  assert.ok(captions.every((caption) => !caption.text.includes("source must stay hidden")));
 });
 
 test("overlay font size parsing is persisted as a bounded pixel value", () => {
@@ -118,11 +197,21 @@ test("overlay exposes only live captions plus bounded native window controls", (
   );
 
   assert.match(overlaySource, />实时字幕<\/span>/);
+  assert.match(overlaySource, /aria-label="关闭悬浮字幕"/);
+  assert.match(overlaySource, /<ul id="overlay-caption-list"/);
+  assert.match(overlaySource, /renderedCaptionSignature/);
+  assert.match(overlaySource, /if \(nextCaptionSignature !== renderedCaptionSignature\)/);
   assert.match(overlaySource, /overlayWindow\.startDragging\(\)/);
   assert.match(overlaySource, /overlayWindow\.startResizeDragging\("SouthEast"\)/);
-  assert.doesNotMatch(overlaySource, /State|Time|Finals|revision|timeline|samples|等待实时字幕/);
+  assert.match(overlaySource, /overlayWindow\.hide\(\)/);
+  assert.match(overlaySource, /emitTo\(MAIN_WINDOW_LABEL, OVERLAY_HIDDEN_EVENT/);
+  assert.doesNotMatch(overlaySource, /overlayWindow\.close\(\)|State|Time|Finals|revision|timeline|samples|等待实时字幕/);
   assert.ok(capability.permissions.includes("core:window:allow-start-dragging"));
   assert.ok(capability.permissions.includes("core:window:allow-start-resize-dragging"));
+  assert.ok(capability.permissions.includes("core:window:allow-hide"));
+  assert.ok(capability.permissions.includes("core:event:allow-emit-to"));
   const overlayWindow = tauriConfig.app.windows.find((window) => window.label === "caption-overlay");
   assert.equal(overlayWindow?.minWidth, 320);
+  assert.equal(overlayWindow?.minHeight, 120);
+  assert.equal(overlayWindow?.height, 280);
 });
