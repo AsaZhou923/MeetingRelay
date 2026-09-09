@@ -129,9 +129,13 @@ powershell -ExecutionPolicy Bypass -File tools/cohere-transcribe/setup.ps1
 
 脚本把锁定的 Python/CUDA 依赖安装到
 `%LOCALAPPDATA%\MeetingRelay\runtimes\cohere-transcribe-03-2026`，并把精确
-revision 下载到 Hugging Face 缓存。MeetingRelay 只有在模型文件大小匹配时
-才允许选择；常驻 worker 在加载前还会校验完整 SHA-256。推理通过本机管道
-完成，模型加载后不需要联网。
+revision 下载到仓库内已被 Git 忽略的
+`target\cohere-transcribe\models\cohere-transcribe-03-2026\<revision>`。
+可用 `-ModelDir` 改到其他位置。安装脚本会校验锁定的大小和 SHA-256，并把
+所选目录保存为用户级 `MEETINGRELAY_COHERE_MODEL_DIR`；重启 MeetingRelay
+后生效。MeetingRelay 只有在模型文件大小匹配时才允许选择；常驻 worker
+在加载前还会校验完整 SHA-256。推理通过本机管道完成，模型加载后不需要
+联网。
 
 | 项目 | 值 |
 | --- | --- |

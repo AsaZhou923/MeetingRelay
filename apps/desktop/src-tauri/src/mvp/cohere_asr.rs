@@ -354,11 +354,19 @@ fn worker_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+fn project_model_dir() -> PathBuf {
+    workspace_root()
+        .join("target/cohere-transcribe/models")
+        .join(MODEL_ID)
+        .join(MODEL_REVISION)
+}
+
 fn model_candidates() -> Vec<PathBuf> {
     let mut candidates = env::var_os("MEETINGRELAY_COHERE_MODEL_DIR")
         .map(PathBuf::from)
         .into_iter()
         .collect::<Vec<_>>();
+    candidates.push(project_model_dir());
     let hub = if let Some(cache) = env::var_os("HF_HUB_CACHE") {
         PathBuf::from(cache)
     } else if let Some(home) = env::var_os("HF_HOME") {
@@ -444,6 +452,14 @@ mod tests {
         ));
         drop(file);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_the_project_local_locked_model() {
+        let expected = workspace_root()
+            .join("target/cohere-transcribe/models/cohere-transcribe-03-2026")
+            .join(MODEL_REVISION);
+        assert!(model_candidates().contains(&expected));
     }
 
     #[test]

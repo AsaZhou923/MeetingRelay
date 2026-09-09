@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RuntimeRoot = (Join-Path $env:LOCALAPPDATA 'MeetingRelay\runtimes\cohere-transcribe-03-2026'),
-    [string]$ModelDir = (Join-Path $env:USERPROFILE '.cache\huggingface\hub\models--CohereLabs--cohere-transcribe-03-2026\snapshots\b1eacc2686a3d08ceaae5f24a88b1d519620bc09'),
+    [string]$ModelDir = (Join-Path $PSScriptRoot '..\..\target\cohere-transcribe\models\cohere-transcribe-03-2026\b1eacc2686a3d08ceaae5f24a88b1d519620bc09'),
     [string]$OutputRoot = 'target/mvp/acceptance/cohere-smoke',
     [double]$MaxCer = 0.10
 )
@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$ModelDir = [IO.Path]::GetFullPath($ModelDir)
 $python = Join-Path $RuntimeRoot 'Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Cohere runtime is missing: $python"

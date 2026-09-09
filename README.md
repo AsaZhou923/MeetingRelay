@@ -131,8 +131,12 @@ powershell -ExecutionPolicy Bypass -File tools/cohere-transcribe/setup.ps1
 
 The setup script installs the pinned Python/CUDA dependencies under
 `%LOCALAPPDATA%\MeetingRelay\runtimes\cohere-transcribe-03-2026` and downloads
-the exact model revision into the Hugging Face cache. MeetingRelay verifies the
-expected model file size before offering it in the selector; the persistent
+the exact model revision under the repository's ignored
+`target\cohere-transcribe\models\cohere-transcribe-03-2026\<revision>`
+directory. Pass `-ModelDir` to choose another location. The setup script verifies
+the locked model size and SHA-256 and saves the selected directory as the user-level
+`MEETINGRELAY_COHERE_MODEL_DIR`; restart MeetingRelay afterward. MeetingRelay
+verifies the expected model file size before offering it in the selector; the persistent
 worker verifies the full SHA-256 digest before loading it. Inference then runs
 offline over a local pipe.
 
