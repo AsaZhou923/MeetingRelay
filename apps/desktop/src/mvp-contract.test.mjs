@@ -750,6 +750,7 @@ test("parses R3 meeting library pages details and tags with bounded shapes", () 
   assert.equal(
     parseMeetingDetail({
       meeting,
+      transcriptComplete: true,
       segments: [finalSegment(1), finalSegment(2)],
       summary: null,
     }).segments[1].sequence,
@@ -777,6 +778,45 @@ test("parses R3 meeting library pages details and tags with bounded shapes", () 
       }),
     /duplicates/,
   );
+});
+
+test("requires explicit durable transcript completeness in meeting details", () => {
+  const detail = {
+    meeting: {
+      meetingId: "meeting-20260725-001",
+      title: "Design sync",
+      status: "completed",
+      startedAt: "2026-07-25T01:00:00Z",
+      updatedAt: "2026-07-25T02:00:00Z",
+      durationMs: "3600000",
+      language: "zh",
+      savedFinalCount: "1",
+      translationFailedCount: 0,
+      summaryStatus: "idle",
+      tags: [],
+    },
+    segments: [finalSegment(1)],
+    summary: null,
+  };
+  for (const status of ["completed", "interrupted", "error"]) {
+    for (const transcriptComplete of [true, false]) {
+      assert.equal(
+        parseMeetingDetail({
+          ...detail,
+          meeting: { ...detail.meeting, status },
+          transcriptComplete,
+        }).transcriptComplete,
+        transcriptComplete,
+      );
+    }
+  }
+  assert.throws(() => parseMeetingDetail(detail), /detail\.transcriptComplete/);
+  for (const transcriptComplete of [undefined, null, "true", "false", 0, 1, {}]) {
+    assert.throws(
+      () => parseMeetingDetail({ ...detail, transcriptComplete }),
+      /detail\.transcriptComplete/,
+    );
+  }
 });
 
 test("parses R3 full text search hits with scope and exact jump targets", () => {
