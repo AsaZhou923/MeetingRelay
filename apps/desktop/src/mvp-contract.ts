@@ -236,6 +236,7 @@ export type MeetingListPage = {
 
 export type MeetingDetail = {
   meeting: MeetingListItem;
+  transcriptComplete: boolean;
   segments: TranscriptSegment[];
   summary: SummaryResult | null;
 };
@@ -1283,6 +1284,7 @@ export function parseMeetingDetail(value: unknown): MeetingDetail {
   }
   return {
     meeting: meetingListItem(detail.meeting, "detail.meeting"),
+    transcriptComplete: boolean(detail.transcriptComplete, "detail.transcriptComplete"),
     segments: detail.segments.map((item) => transcript(item, true)),
     summary: detail.summary === null ? null : summaryResult(detail.summary),
   };

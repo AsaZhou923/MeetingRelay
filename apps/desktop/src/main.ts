@@ -80,6 +80,7 @@ import {
   type SpeakerIdentity,
   type SpeakerVersion,
   type SummaryJob,
+  type SummaryResult,
   type TranscriptSegment,
   type TranslationConfig,
   type TranslationPreference,
@@ -474,6 +475,11 @@ element<HTMLElement>(".transcript-stage").insertAdjacentHTML(
             </form>
             <button id="speaker-undo" class="secondary-button" type="button" disabled>撤销上次编辑</button>
           </section>
+          <div class="console-heading" aria-label="会议文字分页">
+            <button id="detail-previous" class="secondary-button" type="button" disabled>上一页</button>
+            <span id="detail-page-status" aria-live="polite"></span>
+            <button id="detail-next" class="secondary-button" type="button" disabled>下一页</button>
+          </div>
           <ol id="detail-segments" class="detail-segments"></ol>
         </section>
 
@@ -681,6 +687,9 @@ const controls = {
   speakerMerge: element<HTMLButtonElement>("#speaker-merge"),
   speakerUndo: element<HTMLButtonElement>("#speaker-undo"),
   detailSegments: element<HTMLOListElement>("#detail-segments"),
+  detailPrevious: element<HTMLButtonElement>("#detail-previous"),
+  detailNext: element<HTMLButtonElement>("#detail-next"),
+  detailPageStatus: element<HTMLElement>("#detail-page-status"),
   providerRefresh: element<HTMLButtonElement>("#provider-refresh"),
   providerList: element<HTMLElement>("#provider-list"),
   providerBaseUrl: element<HTMLInputElement>("#provider-base-url"),
@@ -797,13 +806,21 @@ let audioPreview: HTMLAudioElement | null = null;
 let meetingPage: MeetingListPage | null = null;
 let searchPage: SegmentSearchPage | null = null;
 let meetingDetail: MeetingDetail | null = null;
+let selectedRecordId: string | null = null;
+let detailRequestVersion = 0;
+let detailLoading = false;
+let detailPage = 0;
 let latestSpeakerVersion: SpeakerVersion | null = null;
+let speakerRequestVersion = 0;
 let speakerVersion: SpeakerVersion | null = null;
 let providerProfiles: ProviderProfile[] = [];
 let selectedProviderId: string | null = null;
 let preferredProviderProfileId: string | null = null;
 let deletePreviewState: DeletePreview | null = null;
-let summaryJob: SummaryJob | null = null;
+const summaryJobs = new Map<string, SummaryJob>();
+const summaryRequestVersions = new Map<string, number>();
+const pendingSummaryMeetings = new Set<string>();
+let summaryPollGeneration = 0;
 let summaryPollTimer: number | null = null;
 let startUiState: StartUiState = { phase: "idle", message: "" };
 let transcriptFollowState: TranscriptFollowState = returnToLatest();
@@ -811,6 +828,7 @@ let providerProbeStates = new Map<string, ProbeUiState>();
 const MVP_EXPORT_TARGET_DIR = "MeetingRelayExports";
 const ASR_MODEL_PREFERENCE_KEY = "meetingrelay.asr-model.v1";
 const R3_PAGE_SIZE = 50;
+const DETAIL_PAGE_SIZE = 200;
 const CAPTION_OVERLAY_WINDOW_LABEL = "caption-overlay";
 const CAPTION_OVERLAY_HIDDEN_EVENT = "meetingrelay://caption-overlay-hidden";
 
@@ -1468,10 +1486,7 @@ function renderExports(snapshot: MvpSnapshot): void {
   controls.exportResults.replaceChildren(
     ...(lastExport?.artifacts.map(renderExportArtifact) ?? []),
   );
-  controls.deletePreview.disabled = snapshot.meetingId === null || isActive(snapshot);
-  controls.summaryStart.disabled =
-    snapshot.meetingId === null || isActive(snapshot) || controls.summaryProvider.value === "";
-  controls.exportSelected.disabled = !canExport(snapshot);
+  renderRecordActions(snapshot);
 }
 
 function renderOverlayToggle(snapshot: MvpSnapshot): void {
@@ -1488,7 +1503,64 @@ function tagFilters(): string[] {
 }
 
 function selectedMeetingId(): string | null {
-  return meetingDetail?.meeting.meetingId ?? latest?.meetingId ?? null;
+  // An explicit selection must never fall back to an unrelated live meeting while loading.
+  if (selectedRecordId !== null) {
+    return meetingDetail?.meeting.meetingId === selectedRecordId ? selectedRecordId : null;
+  }
+  return latest?.meetingId ?? null;
+}
+
+function canUseSelectedTranscript(snapshot: MvpSnapshot): boolean {
+  if (isActive(snapshot) || selectedMeetingId() === null) return false;
+  if (meetingDetail !== null && !meetingDetail.transcriptComplete) return false;
+  // The live snapshot remains authoritative when this record is still changing.
+  if (meetingDetail === null || meetingDetail.meeting.meetingId === snapshot.meetingId) {
+    return canCopyTranscript(snapshot);
+  }
+  const { meeting, segments, transcriptComplete } = meetingDetail;
+  return (
+    transcriptComplete &&
+    ["ready", "completed", "interrupted"].includes(meeting.status) &&
+    BigInt(meeting.savedFinalCount) > 0n &&
+    BigInt(segments.length) === BigInt(meeting.savedFinalCount) &&
+    segments.every((segment) => segment.saved && segment.translationStatus !== "pending")
+  );
+}
+
+function renderRecordActions(snapshot: MvpSnapshot): void {
+  const meetingId = selectedMeetingId();
+  const available = meetingId !== null && !isActive(snapshot);
+  const usable = canUseSelectedTranscript(snapshot);
+  controls.deletePreview.disabled =
+    !available || (meetingDetail !== null && meetingDetail.meeting.meetingId !== snapshot.meetingId &&
+      ["recording", "paused"].includes(meetingDetail.meeting.status));
+  controls.summaryStart.disabled =
+    !usable || controls.summaryProvider.value === "" ||
+    (meetingId !== null && pendingSummaryMeetings.has(meetingId)) ||
+    isSummaryRunning(selectedSummaryJob());
+  controls.exportSelected.disabled =
+    !usable || ((meetingDetail === null || meetingDetail.meeting.meetingId === snapshot.meetingId) &&
+      !canExport(snapshot));
+  const job = selectedSummaryJob();
+  const pending = meetingId !== null && pendingSummaryMeetings.has(meetingId);
+  controls.summaryCancel.disabled = job === null || !job.canCancel || pending;
+  controls.summaryRetry.disabled =
+    job === null || !job.canRetry || pending || !usable || controls.summaryProvider.value === "";
+}
+
+function selectedSummaryJob(): SummaryJob | null {
+  const meetingId = selectedMeetingId();
+  return meetingId === null ? null : summaryJobs.get(meetingId) ?? null;
+}
+
+function selectedSummaryResult(): SummaryResult | null {
+  const saved = meetingDetail?.meeting.meetingId === selectedMeetingId() ? meetingDetail.summary : null;
+  const result = selectedSummaryJob()?.result ?? null;
+  return result !== null && (saved === null || result.version >= saved.version) ? result : saved;
+}
+
+function isSummaryRunning(job: SummaryJob | null): boolean {
+  return job !== null && ["queued", "chunking", "combining"].includes(job.status);
 }
 
 function idempotencyKey(operation: string): string {
@@ -1664,8 +1736,14 @@ function renderSearchResults(): void {
 
 function renderMeetingDetail(): void {
   const detail = meetingDetail;
+  const pageCount = Math.ceil((detail?.segments.length ?? 0) / DETAIL_PAGE_SIZE);
+  detailPage = Math.max(0, Math.min(detailPage, pageCount - 1));
+  controls.detailPrevious.disabled = detailPage === 0;
+  controls.detailNext.disabled = detailPage + 1 >= pageCount;
+  controls.detailPageStatus.textContent = pageCount === 0 ? "" :
+    `第 ${detailPage + 1}/${pageCount} 页 · 共 ${detail?.segments.length} 条`;
   if (detail === null) {
-    controls.detailSummary.textContent = "尚未选择会议。";
+    controls.detailSummary.textContent = detailLoading ? "正在读取会议…" : "尚未选择会议。";
     controls.detailTags.value = "";
     controls.detailSaveTags.disabled = true;
     controls.detailSegments.replaceChildren();
@@ -1679,7 +1757,7 @@ function renderMeetingDetail(): void {
   controls.detailSaveTags.disabled = false;
   renderSpeakerWorkspace();
   controls.detailSegments.replaceChildren(
-    ...detail.segments.slice(0, 200).map((segment) => {
+    ...detail.segments.slice(detailPage * DETAIL_PAGE_SIZE, (detailPage + 1) * DETAIL_PAGE_SIZE).map((segment) => {
       const item = document.createElement("li");
       item.id = `detail-segment-${segment.sequence}`;
       item.dataset.sequence = segment.sequence;
@@ -1801,27 +1879,36 @@ function renderDeletePreview(): void {
 }
 
 function renderSummaryJob(): void {
-  const job = summaryJob;
-  controls.summaryCancel.disabled = job === null || !job.canCancel;
+  const job = selectedSummaryJob();
+  const meetingId = selectedMeetingId();
+  const pending = meetingId !== null && pendingSummaryMeetings.has(meetingId);
+  controls.summaryCancel.disabled = job === null || !job.canCancel || pending;
   controls.summaryRetry.disabled =
-    job === null || !job.canRetry || controls.summaryProvider.value === "";
-  if (job === null) {
-    controls.summaryOutput.textContent = "暂无摘要任务。";
+    job === null || !job.canRetry || pending || controls.summaryProvider.value === "" ||
+    latest === null || !canUseSelectedTranscript(latest);
+  if (latest !== null) renderRecordActions(latest);
+  if (detailLoading) {
+    controls.summaryOutput.textContent = "正在读取会议摘要…";
     return;
   }
-  const progress = `${job.completedChunks}/${job.totalChunks}`;
-  if (job.result === null) {
+  if (job !== null && job.result === null) {
+    const progress = `${job.completedChunks}/${job.totalChunks}`;
     controls.summaryOutput.textContent = `${labelFor(SUMMARY_STATUS_LABELS, job.status)} · 版本 ${job.version} · 分段 ${progress}${job.message ? ` · ${job.message}` : ""}`;
     return;
   }
+  const result = selectedSummaryResult();
+  if (result === null) {
+    controls.summaryOutput.textContent = "暂无摘要任务。";
+    return;
+  }
   controls.summaryOutput.replaceChildren(
-    sectionBlock("概览", [job.result.overview]),
-    sectionBlock("行动项", job.result.actions),
-    sectionBlock("决定", job.result.decisions),
-    sectionBlock("待确认问题", job.result.openQuestions),
+    sectionBlock("概览", [result.overview]),
+    sectionBlock("行动项", result.actions),
+    sectionBlock("决定", result.decisions),
+    sectionBlock("待确认问题", result.openQuestions),
     sectionBlock(
       "引用",
-      job.result.citations.map((citation) =>
+      result.citations.map((citation) =>
         citation.sequence === null
           ? `${citation.label}（未关联）`
           : `${citation.label} -> 段落 ${citation.sequence}`,
@@ -2052,6 +2139,7 @@ async function writeClipboardText(text: string): Promise<void> {
 }
 
 function render(snapshot: MvpSnapshot): void {
+  const previousMeetingId = selectedMeetingId();
   latest = snapshot;
   const active = isActive(snapshot);
   const paused = snapshot.lifecycle === "paused";
@@ -2172,6 +2260,10 @@ function render(snapshot: MvpSnapshot): void {
   updateTranscriptFollowControls();
   renderRecent(snapshot);
   renderExports(snapshot);
+  if (selectedMeetingId() !== previousMeetingId) {
+    renderSummaryJob();
+    scheduleSummaryPoll();
+  }
 }
 
 async function call(command: string, args?: Record<string, unknown>): Promise<MvpSnapshot> {
@@ -2247,7 +2339,7 @@ async function exportMeetingWithOptions(): Promise<void> {
     includeSpeaker: controls.exportSpeaker.checked && speakerVersion !== null,
     includeSummary: controls.exportSummary.checked,
     includeTimestamp: controls.exportTimestamp.checked,
-    summaryVersion: meetingDetail?.summary?.version ?? summaryJob?.result?.version ?? null,
+    summaryVersion: selectedSummaryResult()?.version ?? null,
     speakerVersion:
       controls.exportSpeaker.checked && speakerVersion !== null ? speakerVersion.version : null,
   });
@@ -2315,38 +2407,83 @@ async function loadMeetingDetail(
   segmentId: string | null = null,
   sequence: string | null = null,
 ): Promise<void> {
-  meetingDetail = parseMeetingDetail(await invoke<unknown>("mvp_meeting_detail", { meetingId }));
-  latestSpeakerVersion = parseSpeakerVersion(
-    await invoke<unknown>("mvp_speaker_latest", { meetingId }),
-  );
-  speakerVersion = latestSpeakerVersion;
-  controls.speakerStatus.dataset.status = "";
+  const requestVersion = ++detailRequestVersion;
+  let speakerRequest: number | null = null;
+  selectedRecordId = meetingId;
+  detailLoading = true;
+  meetingDetail = null;
+  latestSpeakerVersion = null;
+  speakerVersion = null;
+  detailPage = 0;
   deletePreviewState = null;
+  stopSummaryPoll();
   renderMeetingDetail();
   renderDeletePreview();
-  if (segmentId !== null || sequence !== null) focusDetailSegment(segmentId, sequence);
-  if (latest) render(latest);
+  renderSummaryJob();
+  try {
+    const detail = parseMeetingDetail(await invoke<unknown>("mvp_meeting_detail", { meetingId }));
+    if (requestVersion !== detailRequestVersion) return;
+    if (detail.meeting.meetingId !== meetingId) throw new Error("MEETING_DETAIL_ID_MISMATCH");
+    meetingDetail = detail;
+    speakerRequest = ++speakerRequestVersion;
+    detailLoading = false;
+    renderMeetingDetail();
+    renderSummaryJob();
+    scheduleSummaryPoll();
+    if (segmentId !== null || sequence !== null) focusDetailSegment(segmentId, sequence);
+    const version = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
+    if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion) return;
+    if (version !== null && version.meetingId !== meetingId) throw new Error("SPEAKER_MEETING_ID_MISMATCH");
+    const focusedId = controls.detailSegments.querySelector<HTMLElement>("[data-focused]")?.dataset.segmentId;
+    latestSpeakerVersion = version;
+    speakerVersion = version;
+    controls.speakerStatus.dataset.status = "";
+    renderMeetingDetail();
+    if (focusedId !== undefined) focusDetailSegment(focusedId, null);
+  } catch (error) {
+    if (requestVersion !== detailRequestVersion ||
+        (speakerRequest !== null && speakerRequest !== speakerRequestVersion)) return;
+    controls.libraryStatus.dataset.status = "error";
+    controls.libraryStatus.textContent = `读取会议失败：${message(error)}`;
+  } finally {
+    if (requestVersion === detailRequestVersion) {
+      detailLoading = false;
+      if (meetingDetail === null) renderMeetingDetail();
+      renderSummaryJob();
+      if (latest) renderExports(latest);
+    }
+  }
 }
 
 async function refreshSpeakerVersion(): Promise<void> {
   const meetingId = selectedMeetingId();
+  const requestVersion = detailRequestVersion;
   if (meetingId === null) return;
-  latestSpeakerVersion = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
-  speakerVersion = latestSpeakerVersion;
+  const speakerRequest = ++speakerRequestVersion;
+  const version = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
+  if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+      selectedMeetingId() !== meetingId) return;
+  latestSpeakerVersion = version;
+  speakerVersion = version;
   renderMeetingDetail();
 }
 
 async function loadSpeakerVersion(): Promise<void> {
   const meetingId = selectedMeetingId();
+  const requestVersion = detailRequestVersion;
   const latestVersion = latestSpeakerVersion;
   if (meetingId === null || latestVersion === null) return;
   const requested = Number(controls.speakerVersionInput.value);
   if (!Number.isSafeInteger(requested) || requested < 1 || requested > latestVersion.version) {
     throw new Error(`SPEAKER_VERSION_RANGE_1_TO_${latestVersion.version}`);
   }
-  speakerVersion = parseSpeakerVersion(
+  const speakerRequest = ++speakerRequestVersion;
+  const version = parseSpeakerVersion(
     await invoke<unknown>("mvp_speaker_version", { meetingId, version: requested }),
   );
+  if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+      selectedMeetingId() !== meetingId) return;
+  speakerVersion = version;
   if (speakerVersion === null) throw new Error("SPEAKER_VERSION_NOT_FOUND");
   controls.speakerStatus.dataset.status = "";
   renderMeetingDetail();
@@ -2354,16 +2491,23 @@ async function loadSpeakerVersion(): Promise<void> {
 
 async function runSpeakerDiarization(): Promise<void> {
   const meetingId = selectedMeetingId();
+  const requestVersion = detailRequestVersion;
   if (meetingId === null) return;
   controls.speakerStatus.dataset.status = "loading";
   controls.speakerStatus.textContent = "正在分析说话人...";
   renderSpeakerWorkspace();
+  const speakerRequest = ++speakerRequestVersion;
   const result = parseSpeakerDiarizationResult(
     await invoke<unknown>("mvp_speaker_diarize", { meetingId }),
   );
+  if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+      selectedMeetingId() !== meetingId) return;
   if (result.status === "completed") {
-    latestSpeakerVersion = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
-    speakerVersion = latestSpeakerVersion;
+    const version = parseSpeakerVersion(await invoke<unknown>("mvp_speaker_latest", { meetingId }));
+    if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+        selectedMeetingId() !== meetingId) return;
+    latestSpeakerVersion = version;
+    speakerVersion = version;
     controls.speakerStatus.dataset.status = "completed";
     controls.speakerStatus.textContent = `说话人分析已完成，版本 ${result.version}。`;
   } else {
@@ -2380,11 +2524,13 @@ async function runSpeakerDiarization(): Promise<void> {
 
 async function renameSpeaker(): Promise<void> {
   const meetingId = selectedMeetingId();
+  const requestVersion = detailRequestVersion;
   if (meetingId === null || speakerVersion === null) return;
   if (latestSpeakerVersion === null || speakerVersion.version !== latestSpeakerVersion.version) {
     throw new Error("SPEAKER_EDIT_REQUIRES_LATEST_VERSION");
   }
-  latestSpeakerVersion = parseSpeakerVersion(
+  const speakerRequest = ++speakerRequestVersion;
+  const version = parseSpeakerVersion(
     await invoke<unknown>("mvp_speaker_rename", {
       request: {
         meetingId,
@@ -2395,18 +2541,23 @@ async function renameSpeaker(): Promise<void> {
       },
     }),
   );
-  speakerVersion = latestSpeakerVersion;
+  if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+      selectedMeetingId() !== meetingId) return;
+  latestSpeakerVersion = version;
+  speakerVersion = version;
   controls.speakerRenameName.value = "";
   renderMeetingDetail();
 }
 
 async function mergeSpeakers(): Promise<void> {
   const meetingId = selectedMeetingId();
+  const requestVersion = detailRequestVersion;
   if (meetingId === null || speakerVersion === null) return;
   if (latestSpeakerVersion === null || speakerVersion.version !== latestSpeakerVersion.version) {
     throw new Error("SPEAKER_EDIT_REQUIRES_LATEST_VERSION");
   }
-  latestSpeakerVersion = parseSpeakerVersion(
+  const speakerRequest = ++speakerRequestVersion;
+  const version = parseSpeakerVersion(
     await invoke<unknown>("mvp_speaker_merge", {
       request: {
         meetingId,
@@ -2418,18 +2569,23 @@ async function mergeSpeakers(): Promise<void> {
       },
     }),
   );
-  speakerVersion = latestSpeakerVersion;
+  if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+      selectedMeetingId() !== meetingId) return;
+  latestSpeakerVersion = version;
+  speakerVersion = version;
   controls.speakerMergeName.value = "";
   renderMeetingDetail();
 }
 
 async function undoSpeakerEdit(): Promise<void> {
   const meetingId = selectedMeetingId();
+  const requestVersion = detailRequestVersion;
   if (meetingId === null || speakerVersion === null) return;
   if (latestSpeakerVersion === null || speakerVersion.version !== latestSpeakerVersion.version) {
     throw new Error("SPEAKER_EDIT_REQUIRES_LATEST_VERSION");
   }
-  latestSpeakerVersion = parseSpeakerVersion(
+  const speakerRequest = ++speakerRequestVersion;
+  const version = parseSpeakerVersion(
     await invoke<unknown>("mvp_speaker_undo", {
       request: {
         meetingId,
@@ -2438,25 +2594,38 @@ async function undoSpeakerEdit(): Promise<void> {
       },
     }),
   );
-  speakerVersion = latestSpeakerVersion;
+  if (requestVersion !== detailRequestVersion || speakerRequest !== speakerRequestVersion ||
+      selectedMeetingId() !== meetingId) return;
+  latestSpeakerVersion = version;
+  speakerVersion = version;
   renderMeetingDetail();
 }
 
+function changeDetailPage(delta: number): void {
+  if (meetingDetail === null) return;
+  detailPage += delta;
+  renderMeetingDetail();
+  const first = controls.detailSegments.querySelector<HTMLElement>("li");
+  if (first !== null) focusDetailSegment(first.dataset.segmentId ?? null, null);
+}
+
 function focusDetailSegment(segmentId: string | null, sequence: string | null): void {
-  const selector =
-    segmentId !== null
-      ? `[data-segment-id="${CSS.escape(segmentId)}"]`
-      : sequence !== null
-        ? `[data-sequence="${CSS.escape(sequence)}"]`
-        : "";
-  const target =
-    selector.length === 0 ? null : controls.detailSegments.querySelector<HTMLElement>(selector);
-  target?.scrollIntoView({ block: "center" });
-  if (target !== null) {
+  const index = meetingDetail?.segments.findIndex((segment) =>
+    segmentId !== null ? segment.segmentId === segmentId : segment.sequence === sequence,
+  ) ?? -1;
+  if (index < 0) return;
+  const page = Math.floor(index / DETAIL_PAGE_SIZE);
+  if (page !== detailPage) {
+    detailPage = page;
+    renderMeetingDetail();
+  }
+  const target = controls.detailSegments.children[index % DETAIL_PAGE_SIZE] as HTMLElement | undefined;
+  if (target !== undefined) {
     for (const row of controls.detailSegments.querySelectorAll<HTMLElement>("[data-focused]")) {
       delete row.dataset.focused;
     }
     target.dataset.focused = "true";
+    target.scrollIntoView({ block: "center" });
     target.focus({ preventScroll: true });
   }
 }
@@ -2464,7 +2633,8 @@ function focusDetailSegment(segmentId: string | null, sequence: string | null): 
 async function saveMeetingTags(): Promise<void> {
   const meetingId = selectedMeetingId();
   if (meetingId === null) return;
-  meetingDetail = parseMeetingDetail(
+  const requestVersion = detailRequestVersion;
+  const detail = parseMeetingDetail(
     await invoke<unknown>("mvp_update_meeting_tags", {
       meetingId,
       tags: controls.detailTags.value
@@ -2473,7 +2643,10 @@ async function saveMeetingTags(): Promise<void> {
         .filter((value) => value.length > 0),
     }),
   );
+  if (requestVersion !== detailRequestVersion || selectedMeetingId() !== meetingId) return;
+  meetingDetail = detail;
   renderMeetingDetail();
+  renderSummaryJob();
   await loadMeetingLibrary(null, false).catch(() => undefined);
 }
 
@@ -2589,13 +2762,16 @@ async function testSelectedProvider(): Promise<void> {
 async function previewDelete(): Promise<void> {
   const meetingId = selectedMeetingId();
   if (meetingId === null) return;
-  deletePreviewState = parseDeletePreview(
+  const requestVersion = detailRequestVersion;
+  const preview = parseDeletePreview(
     await invoke<unknown>("mvp_delete_preview", {
       meetingId,
       includeRaw: true,
       includeDerived: true,
     }),
   );
+  if (requestVersion !== detailRequestVersion || selectedMeetingId() !== meetingId) return;
+  deletePreviewState = preview;
   renderDeletePreview();
 }
 
@@ -2646,57 +2822,99 @@ function confirmSummaryProviderEgress(profile: ProviderProfile): boolean {
 
 async function startSummaryJob(): Promise<void> {
   const meetingId = selectedMeetingId();
-  if (meetingId === null) return;
+  if (meetingId === null || latest === null || !canUseSelectedTranscript(latest) ||
+      pendingSummaryMeetings.has(meetingId) || isSummaryRunning(selectedSummaryJob())) return;
   const profile = selectedSummaryProvider();
   if (!confirmSummaryProviderEgress(profile)) return;
-  summaryJob = parseSummaryJob(
-    await invoke<unknown>("mvp_summary_start", {
-      meetingId,
-      providerProfileId: profile.profileId,
-      language: "zh",
-      summaryRiskAccepted: true,
-    }),
-  );
-  renderSummaryJob();
-  scheduleSummaryPoll();
+  await runSummaryCommand(meetingId, "mvp_summary_start", {
+    meetingId,
+    providerProfileId: profile.profileId,
+    language: "zh",
+    summaryRiskAccepted: true,
+  });
 }
 
 async function updateSummaryJob(command: "mvp_summary_cancel" | "mvp_summary_retry"): Promise<void> {
-  if (summaryJob === null) return;
+  const job = selectedSummaryJob();
+  if (job === null || pendingSummaryMeetings.has(job.meetingId)) return;
   if (command === "mvp_summary_retry") {
+    if (!job.canRetry || latest === null || !canUseSelectedTranscript(latest)) return;
     const profile = selectedSummaryProvider();
     if (!confirmSummaryProviderEgress(profile)) return;
-    summaryJob = parseSummaryJob(
-      await invoke<unknown>(command, {
-        jobId: summaryJob.jobId,
-        providerProfileId: profile.profileId,
-        summaryRiskAccepted: true,
-      }),
-    );
-  } else {
-    summaryJob = parseSummaryJob(await invoke<unknown>(command, { jobId: summaryJob.jobId }));
+    await runSummaryCommand(job.meetingId, command, {
+      jobId: job.jobId,
+      providerProfileId: profile.profileId,
+      summaryRiskAccepted: true,
+    });
+  } else if (job.canCancel) {
+    await runSummaryCommand(job.meetingId, command, { jobId: job.jobId });
   }
+}
+
+async function runSummaryCommand(
+  meetingId: string,
+  command: "mvp_summary_start" | "mvp_summary_cancel" | "mvp_summary_retry",
+  args: Record<string, unknown>,
+): Promise<void> {
+  const requestVersion = (summaryRequestVersions.get(meetingId) ?? 0) + 1;
+  const selectionVersion = detailRequestVersion;
+  summaryRequestVersions.set(meetingId, requestVersion);
+  pendingSummaryMeetings.add(meetingId);
+  stopSummaryPoll();
   renderSummaryJob();
-  scheduleSummaryPoll();
+  let failure: string | null = null;
+  try {
+    const job = parseSummaryJob(await invoke<unknown>(command, args));
+    if (summaryRequestVersions.get(meetingId) !== requestVersion) return;
+    if (job.meetingId !== meetingId || (command === "mvp_summary_cancel" && job.jobId !== args.jobId)) {
+      throw new Error("SUMMARY_JOB_ID_MISMATCH");
+    }
+    summaryJobs.set(meetingId, job);
+  } catch (error) {
+    failure = `摘要操作失败：${message(error)}`;
+  } finally {
+    if (summaryRequestVersions.get(meetingId) === requestVersion) {
+      pendingSummaryMeetings.delete(meetingId);
+      if (selectedMeetingId() === meetingId) {
+        renderSummaryJob();
+        scheduleSummaryPoll();
+        if (failure !== null && selectionVersion === detailRequestVersion) {
+          controls.summaryOutput.textContent = failure;
+        }
+      }
+    }
+  }
+}
+
+function stopSummaryPoll(): void {
+  summaryPollGeneration += 1;
+  if (summaryPollTimer !== null) window.clearTimeout(summaryPollTimer);
+  summaryPollTimer = null;
 }
 
 function scheduleSummaryPoll(): void {
-  if (summaryPollTimer !== null) window.clearTimeout(summaryPollTimer);
-  if (
-    summaryJob === null ||
-    !["queued", "chunking", "combining"].includes(summaryJob.status)
-  ) {
-    return;
-  }
+  stopSummaryPoll();
+  const job = selectedSummaryJob();
+  if (!isSummaryRunning(job) || job === null || pendingSummaryMeetings.has(job.meetingId)) return;
+  const generation = summaryPollGeneration;
+  const requestVersion = summaryRequestVersions.get(job.meetingId) ?? 0;
+  const isCurrent = (): boolean =>
+    generation === summaryPollGeneration && selectedMeetingId() === job.meetingId &&
+    selectedSummaryJob()?.jobId === job.jobId &&
+    (summaryRequestVersions.get(job.meetingId) ?? 0) === requestVersion;
   summaryPollTimer = window.setTimeout(async () => {
+    summaryPollTimer = null;
     try {
-      summaryJob = parseSummaryJob(
-        await invoke<unknown>("mvp_summary_status", { jobId: summaryJob?.jobId }),
-      );
+      const updated = parseSummaryJob(await invoke<unknown>("mvp_summary_status", { jobId: job.jobId }));
+      if (!isCurrent()) return;
+      if (updated.meetingId !== job.meetingId || updated.jobId !== job.jobId) {
+        throw new Error("SUMMARY_JOB_ID_MISMATCH");
+      }
+      summaryJobs.set(job.meetingId, updated);
       renderSummaryJob();
       scheduleSummaryPoll();
     } catch (error) {
-      controls.summaryOutput.textContent = `读取摘要状态失败：${message(error)}`;
+      if (isCurrent()) controls.summaryOutput.textContent = `读取摘要状态失败：${message(error)}`;
     }
   }, 750);
 }
@@ -3331,6 +3549,9 @@ controls.detailSaveTags.addEventListener("click", async () => {
     controls.detailSaveTags.disabled = meetingDetail === null;
   }
 });
+
+controls.detailPrevious.addEventListener("click", () => changeDetailPage(-1));
+controls.detailNext.addEventListener("click", () => changeDetailPage(1));
 
 controls.detailSequence.addEventListener("change", () => {
   const sequence = controls.detailSequence.value.trim();

@@ -232,6 +232,7 @@ pub struct MeetingListPageSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct MeetingDetailSnapshot {
     pub meeting: MeetingListItemSnapshot,
+    pub transcript_complete: bool,
     pub segments: Vec<super::contract::TranscriptSegment>,
     pub summary: Option<SummaryResultSnapshot>,
 }
@@ -994,6 +995,7 @@ impl MvpService {
         };
         Ok(MeetingDetailSnapshot {
             meeting: meeting_list_item_snapshot(item),
+            transcript_complete: snapshot.meeting.completion_error.is_none(),
             segments: snapshot.finals.iter().map(segment_from_durable).collect(),
             summary,
         })
@@ -7209,6 +7211,61 @@ mod tests {
             service.snapshot().latest_opened_meeting.as_deref(),
             Some(meeting.id.as_str())
         );
+    }
+
+    #[test]
+    fn meeting_detail_reports_durable_transcript_completeness_independently_of_runtime_errors() {
+        let root = unique_temp_root("meeting-detail-completeness");
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+            let service =
+                MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+            let writer = service.storage_writer.as_ref().unwrap();
+
+            // A runtime error in another session must not determine this record's completeness.
+            service.fail("AUDIO_STREAM_ERROR");
+            for (state, completion_error) in [
+                ("completed", None),
+                ("interrupted", None),
+                ("interrupted", Some("ASR_FINAL_OVERLOAD")),
+                ("completed", Some("ASR_FINAL_OVERLOAD")),
+            ] {
+                let meeting = writer.start_meeting(true, "test model").unwrap();
+                if let Some(error) = completion_error {
+                    writer.incomplete_meeting(&meeting.id, error).unwrap();
+                }
+                if state == "completed" {
+                    writer.complete_meeting(&meeting.id).unwrap();
+                } else {
+                    writer.interrupt_meeting(&meeting.id).unwrap();
+                }
+
+                let detail = service.meeting_detail(&meeting.id).unwrap();
+                assert_eq!(detail.meeting.status, state);
+                assert_eq!(detail.transcript_complete, completion_error.is_none());
+                assert_eq!(
+                    serde_json::to_value(&detail).unwrap()["transcriptComplete"],
+                    serde_json::json!(completion_error.is_none())
+                );
+                if let Some(error) = completion_error {
+                    assert_eq!(
+                        service.transcript_text(&meeting.id).unwrap_err(),
+                        format!("MVP_COPY_INCOMPLETE:{error}")
+                    );
+                    assert_eq!(
+                        service
+                            .export_meeting(&meeting.id, "out".to_owned())
+                            .unwrap_err(),
+                        format!("MVP_EXPORT_INCOMPLETE:{error}")
+                    );
+                }
+            }
+            service
+                .shutdown_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
