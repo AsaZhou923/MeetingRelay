@@ -1948,18 +1948,20 @@ impl MvpService {
             item.retryable || translation_error_retryable(&item.last_error_code)
         };
         let non_retryable = plan.items.iter().filter(|item| !retryable(item)).count();
+        // Each failure is retried toward the target language it failed for, so one
+        // meeting can hold failures for several targets without blocking each other.
         let mut finals = Vec::new();
         for item in plan
             .items
             .iter()
             .filter(retryable)
-            .filter(|item| item.target_language == config.target_language)
+            .filter(|item| matches!(item.target_language.as_str(), "zh" | "ja" | "en"))
         {
             if let Some(final_segment) = meeting.finals.iter().find(|final_segment| {
                 final_segment.segment_id == item.segment_id
                     && final_segment.revision == item.source_revision
             }) {
-                finals.push(final_segment.clone());
+                finals.push((final_segment.clone(), item.target_language.clone()));
             }
         }
         if finals.is_empty() {
@@ -1988,7 +1990,7 @@ impl MvpService {
         let spawn = std::thread::Builder::new()
             .name("meetingrelay-translation-retry".to_owned())
             .spawn(move || {
-                for (index, final_segment) in finals.iter().enumerate() {
+                for (index, (final_segment, target_language)) in finals.iter().enumerate() {
                     if cancelled.load(Ordering::Acquire) {
                         let mut state = lock(&progress);
                         state.cancelled = state.total.saturating_sub(state.progress);
@@ -1996,6 +1998,8 @@ impl MvpService {
                         state.message = Some("Translation retry batch cancelled.".to_owned());
                         return;
                     }
+                    let mut config = config.clone();
+                    config.target_language.clone_from(target_language);
                     let succeeded =
                         retry_one_translation(&writer, final_segment, &source_language, &config)
                             .is_ok();
@@ -8586,6 +8590,94 @@ mod tests {
             .map(|segment| segment.translation_status.as_str())
             .collect::<Vec<_>>();
         assert_eq!(statuses, ["completed", "completed", "completed", "failed"]);
+        service
+            .shutdown_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_retry_sends_each_failure_to_the_target_language_it_failed_for() {
+        let (base_url, provider) = spawn_translation_provider(1);
+        let (root, service, meeting_id, profile_id) = service_with_failed_translations(
+            "retry-batch-mixed-targets",
+            "zh",
+            &base_url,
+            &[
+                ("TRANSLATION_HTTP_STATUS_401", false),
+                ("TRANSLATION_HTTP_STATUS_503", true),
+            ],
+        );
+        // The second segment's latest failure was for Japanese instead.
+        let writer = service.storage_writer.as_ref().unwrap();
+        let attempt = writer
+            .begin_translation(TranslationCandidate {
+                meeting_id: meeting_id.clone(),
+                segment_id: "segment-2".to_owned(),
+                source_revision: 1,
+                target_language: "ja".to_owned(),
+                model: "retry-test-model".to_owned(),
+                provider: "openai-compatible".to_owned(),
+                config_version: "meetingrelay.translation.config.v1".to_owned(),
+                endpoint_origin: None,
+                endpoint_hash: sha256_hex(base_url.as_bytes()),
+                prompt_version: "meetingrelay.translation.prompt.v1".to_owned(),
+                request_schema_version: "openai.chat.completions.v1".to_owned(),
+            })
+            .unwrap();
+        writer
+            .finish_translation(TranslationCompletion {
+                meeting_id: meeting_id.clone(),
+                segment_id: "segment-2".to_owned(),
+                source_revision: 1,
+                target_language: "ja".to_owned(),
+                attempt: attempt.attempt,
+                translated_text: None,
+                error_code: Some("TRANSLATION_HTTP_STATUS_503".to_owned()),
+                retryable: true,
+                skipped_same_language: false,
+            })
+            .unwrap();
+
+        // The requested target ("en") only has a non-retryable failure.
+        let started = service
+            .retry_failed_translations(
+                &meeting_id,
+                "zh",
+                retry_translation_config(),
+                &profile_id,
+                true,
+            )
+            .unwrap();
+        assert_eq!(started.total, 1);
+
+        let requests = provider.join().unwrap();
+        assert!(
+            requests[0].contains("Translate from Simplified Chinese to Japanese"),
+            "{}",
+            requests[0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while service.translation_retry_progress().status == "running" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry batch did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let remaining = service
+            .storage
+            .as_ref()
+            .unwrap()
+            .failed_translation_retry_plan(&meeting_id, true)
+            .unwrap();
+        let remaining = remaining
+            .items
+            .iter()
+            .map(|item| (item.target_language.as_str(), item.last_error_code.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [("en", "TRANSLATION_HTTP_STATUS_401")]);
         service
             .shutdown_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
             .unwrap();

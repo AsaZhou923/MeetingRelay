@@ -7,14 +7,15 @@ decisions, and known acceptance gaps.
 
 - Fixed translation retry for recorded meetings. The retry panel in Meeting
   Records now follows the selected record instead of the live snapshot, names
-  the meeting in the cost confirmation, reuses the failed translation's own
-  target language, and reloads the record when the batch ends. Retries translate
+  the meeting in the cost confirmation, and reloads the record when the batch
+  ends. Each failure is retried toward the target language it failed for,
+  whatever the current Settings selection. Retries translate
   from the language stored with the meeting, so a different live
   recognition-language selection can no longer mislabel the source or persist a
   failed segment as `skipped`; the caller's value is used only for meetings
   recorded before the language was stored. Local backpressure failures
   (`TRANSLATION_QUEUE_FULL`, `TRANSLATION_WORKER_STOPPED`) are now retryable,
-  including rows written by earlier builds. Added 3 service and 6 DOM/IPC
+  including rows written by earlier builds. Added 4 service and 6 DOM/IPC
   regressions. Validated on Linux only: 122 frontend tests, typecheck, and the
   Rust suite minus its Windows-only cases; a real-app WebDriver run against a
   loopback OpenAI-compatible stub retried a selected record's failures.

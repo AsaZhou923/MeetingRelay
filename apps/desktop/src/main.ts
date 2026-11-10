@@ -1533,7 +1533,6 @@ interface TranslationRetryTarget {
   title: string;
   failedCount: number;
   sourceLanguage: MvpRecognitionLanguage;
-  targetLanguage: MvpRecognitionLanguage;
 }
 
 // The retry panel follows the record selected in Meeting Records; without a
@@ -1561,7 +1560,6 @@ function translationRetryTarget(snapshot: MvpSnapshot): TranslationRetryTarget |
       recorded !== null && recorded.language !== "unknown"
         ? recorded.language
         : currentRecognitionLanguage(),
-    targetLanguage: failed[0]?.translationTarget ?? currentTranslationConfig().targetLanguage,
   };
 }
 
@@ -3915,7 +3913,8 @@ controls.retryFailedTranslations.addEventListener("click", async () => {
         await invoke<unknown>("mvp_retry_failed_translations", {
           meetingId: target.meetingId,
           sourceLanguage: target.sourceLanguage,
-          translation: { ...currentTranslationConfig(), targetLanguage: target.targetLanguage },
+          // The backend retries each failure toward the target it failed for.
+          translation: currentTranslationConfig(),
           providerProfileId,
           costRiskAccepted: true,
         }),

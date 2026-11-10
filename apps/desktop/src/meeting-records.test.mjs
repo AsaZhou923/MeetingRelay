@@ -941,7 +941,6 @@ test("#15/#16: batch retry targets the selected record with its own languages, n
   const [call] = retryCalls(h);
   assert.equal(call.args.meetingId, "meeting-a");
   assert.equal(call.args.sourceLanguage, "ja");
-  assert.equal(call.args.translation.targetLanguage, "en");
   assert.equal(call.args.providerProfileId, localProvider.profileId);
   assert.match(confirmations[0], /meeting-a title/);
   assert.match(confirmations[0], /2 条失败原文/);
@@ -977,7 +976,6 @@ test("#16: without a selection the retry panel still follows the live meeting", 
   await h.controls.retryFailedTranslations.dispatch("click");
   const [call] = retryCalls(h);
   assert.equal(call.args.meetingId, "live-meeting");
-  assert.equal(call.args.translation.targetLanguage, "ja");
 });
 
 test("#16: an active recording blocks batch retry for a selected record", async () => {
