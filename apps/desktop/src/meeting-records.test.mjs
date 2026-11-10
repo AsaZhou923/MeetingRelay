@@ -880,3 +880,117 @@ test("#11: selected summary content and export version use the newest completed 
   assert.equal(h.run("selectedSummaryResult()"), null);
   assert.doesNotMatch(h.controls.summaryOutput.textContent, /New completed summary/);
 });
+
+function failedDetail(meetingId, language, failedSequences, target = "en") {
+  const record = detail(meetingId, 3);
+  record.meeting.language = language;
+  record.meeting.title = `${meetingId} title`;
+  record.meeting.translationFailedCount = failedSequences.length;
+  for (const item of record.segments) {
+    if (!failedSequences.includes(Number(item.sequence))) continue;
+    Object.assign(item, {
+      translationStatus: "failed", translationTarget: target,
+      translationText: null, translationError: "TRANSLATION_HTTP_STATUS_503",
+    });
+  }
+  return record;
+}
+function retryProgress(status, total, overrides = {}) {
+  return {
+    batchId: "retry-1", status, total, progress: status === "running" ? 0 : total,
+    succeeded: status === "running" ? 0 : total, failed: 0, cancelled: 0,
+    costRiskAccepted: true, message: null, ...overrides,
+  };
+}
+function retryHarness(records) {
+  const h = recordsHarness(records);
+  h.on("mvp_provider_profiles", () => [localProvider]);
+  h.on("mvp_snapshot", () => ({ ...h.run("latest"), contractVersion: contract.MVP_CONTRACT_VERSION }));
+  h.controls.translationEnabled.checked = true;
+  h.controls.translationBaseUrl.value = localProvider.baseUrl;
+  h.controls.translationModel.value = localProvider.model;
+  return h;
+}
+const retryCalls = (h) => h.calls.filter(({ command }) => command === "mvp_retry_failed_translations");
+
+test("#16: a selected historical record with failed translations enables batch retry", async () => {
+  const h = retryHarness([failedDetail("meeting-a", "ja", [2, 3]), detail("meeting-b")]);
+  h.set("latest", snapshot());
+  h.run("renderExports(latest)");
+  assert.equal(h.controls.retryFailedTranslations.disabled, true, "nothing selected");
+  await load(h, "meeting-a");
+  assert.equal(h.controls.retryFailedTranslations.disabled, false);
+  await load(h, "meeting-b");
+  assert.equal(h.controls.retryFailedTranslations.disabled, true, "B has no failed translations");
+});
+
+test("#15/#16: batch retry targets the selected record with its own languages, not the live selectors", async () => {
+  const h = retryHarness([failedDetail("meeting-a", "ja", [2, 3], "en")]);
+  const liveFailed = { ...segment(1), translationStatus: "failed", translationText: null };
+  h.set("latest", snapshot({ meetingId: "live-meeting", durabilityStatus: "completed", finals: [liveFailed] }));
+  // The live selectors point at another meeting's languages.
+  h.controls.recognitionLanguage.value = "en";
+  h.controls.translationLanguage.value = "zh";
+  const confirmations = [];
+  h.set("__confirmations", confirmations);
+  h.run("window.confirm = (text) => { __confirmations.push(text); return true; }");
+  h.on("mvp_retry_failed_translations", () => retryProgress("running", 2));
+  await load(h, "meeting-a");
+  await h.controls.retryFailedTranslations.dispatch("click");
+
+  const [call] = retryCalls(h);
+  assert.equal(call.args.meetingId, "meeting-a");
+  assert.equal(call.args.sourceLanguage, "ja");
+  assert.equal(call.args.providerProfileId, localProvider.profileId);
+  assert.match(confirmations[0], /meeting-a title/);
+  assert.match(confirmations[0], /2 条失败原文/);
+  assert.equal(h.controls.retryFailedTranslations.disabled, true, "a running batch blocks a second one");
+});
+
+test("#16: a finished batch reloads the selected record so the retried rows are visible", async () => {
+  const records = [failedDetail("meeting-a", "zh", [2])];
+  const h = retryHarness(records);
+  h.set("latest", snapshot());
+  h.on("mvp_retry_failed_translations", () => retryProgress("running", 1));
+  h.on("mvp_translation_retry_progress", () => retryProgress("completed", 1));
+  await load(h, "meeting-a");
+  await h.controls.retryFailedTranslations.dispatch("click");
+  Object.assign(records[0].segments[1], {
+    translationStatus: "completed", translationText: "Retried 2", translationError: null,
+  });
+  const [timerId] = [...h.timers].find(([, timer]) => timer.delay === 500);
+  await h.fireTimer(timerId);
+
+  assert.equal(h.calls.filter(({ command }) => command === "mvp_meeting_detail").length, 2);
+  assert.match(h.controls.detailSegments.children[1].textContent, /Retried 2/);
+  assert.equal(h.controls.retryFailedTranslations.disabled, true, "no failed translations remain");
+  assert.match(h.controls.retryProgress.textContent, /completed/);
+});
+
+test("#16: without a selection the retry panel still follows the live meeting", async () => {
+  const h = retryHarness([]);
+  const liveFailed = { ...segment(1), translationStatus: "failed", translationText: null, translationTarget: "ja" };
+  h.run(`render(${JSON.stringify(snapshot({ meetingId: "live-meeting", durabilityStatus: "completed", finals: [liveFailed] }))})`);
+  assert.equal(h.controls.retryFailedTranslations.disabled, false);
+  h.on("mvp_retry_failed_translations", () => retryProgress("running", 1));
+  await h.controls.retryFailedTranslations.dispatch("click");
+  const [call] = retryCalls(h);
+  assert.equal(call.args.meetingId, "live-meeting");
+});
+
+test("#16: an active recording blocks batch retry for a selected record", async () => {
+  const h = retryHarness([failedDetail("meeting-a", "zh", [1])]);
+  h.set("latest", snapshot({ lifecycle: "recording", meetingId: "live-meeting", durabilityStatus: "recording" }));
+  await load(h, "meeting-a");
+  assert.equal(h.controls.retryFailedTranslations.disabled, true);
+});
+
+test("#16: retry explains that translation must be enabled instead of failing with a code", async () => {
+  const h = retryHarness([failedDetail("meeting-a", "zh", [1])]);
+  h.controls.translationEnabled.checked = false;
+  h.set("latest", snapshot());
+  await load(h, "meeting-a");
+  await h.controls.retryFailedTranslations.dispatch("click");
+  assert.equal(retryCalls(h).length, 0);
+  assert.match(h.controls.retryProgress.textContent, /启用并配置翻译服务/);
+});
