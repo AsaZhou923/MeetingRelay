@@ -801,6 +801,9 @@ pub fn translation_error_retryable(error_code: &str) -> bool {
             | "TRANSLATION_RESPONSE_READ_FAILED"
             | "TRANSLATION_TIMEOUT"
             | "TRANSLATION_INTERRUPTED"
+            // Local backpressure: the provider was never contacted.
+            | "TRANSLATION_QUEUE_FULL"
+            | "TRANSLATION_WORKER_STOPPED"
     ) {
         return true;
     }
@@ -1479,6 +1482,8 @@ mod tests {
             "TRANSLATION_RESPONSE_READ_FAILED",
             "TRANSLATION_TIMEOUT",
             "TRANSLATION_INTERRUPTED",
+            "TRANSLATION_QUEUE_FULL",
+            "TRANSLATION_WORKER_STOPPED",
             "TRANSLATION_HTTP_STATUS_408",
             "TRANSLATION_HTTP_STATUS_429",
             "TRANSLATION_HTTP_STATUS_500",

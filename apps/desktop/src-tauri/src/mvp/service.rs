@@ -30,13 +30,13 @@ use super::{
         SpeakerVersionSnapshot, draft_from_raw_audio, merge_draft, rename_draft, undo_draft,
     },
     storage::{
-        DurableFinal, FinalCandidate, MeetingLibraryItem, MeetingLibraryQuery, MvpStorage,
-        MvpStorageWriter, ProviderProfileInput, ProviderProfileRecord, RecoveryActionKind,
-        SegmentSearchQuery, SummaryChunkInput, SummaryCompletionInput, SummaryJobInput,
-        SummaryJobRecord, SummaryProviderProvenance, SummaryResultInput, SummaryResultRecord,
-        TranslationCandidate, TranslationCompletion, configured_data_root,
-        data_root_has_environment_override, now_ms_string, save_configured_data_root,
-        segment_from_durable, sha256_hex, visible_window_start_sequence,
+        DurableFinal, FailedTranslationRetryItem, FinalCandidate, MeetingLibraryItem,
+        MeetingLibraryQuery, MvpStorage, MvpStorageWriter, ProviderProfileInput,
+        ProviderProfileRecord, RecoveryActionKind, SegmentSearchQuery, SummaryChunkInput,
+        SummaryCompletionInput, SummaryJobInput, SummaryJobRecord, SummaryProviderProvenance,
+        SummaryResultInput, SummaryResultRecord, TranslationCandidate, TranslationCompletion,
+        configured_data_root, data_root_has_environment_override, now_ms_string,
+        save_configured_data_root, segment_from_durable, sha256_hex, visible_window_start_sequence,
     },
     summary::{
         MeetingSummary, SummaryConfig, SummaryOutcome, SummaryProgressSnapshot, SummaryRunRequest,
@@ -1904,6 +1904,7 @@ impl MvpService {
             .storage_writer
             .as_ref()
             .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?;
+        let source_language = retry_source_language(storage, meeting_id, source_language)?;
         let meeting = storage.snapshot(meeting_id)?;
         let final_segment = meeting
             .finals
@@ -1911,7 +1912,7 @@ impl MvpService {
             .find(|item| item.segment_id == segment_id && item.sequence == sequence)
             .cloned()
             .ok_or_else(|| "TRANSLATION_RETRY_SEGMENT_MISSING".to_owned())?;
-        retry_one_translation(writer, &final_segment, source_language, &config)?;
+        retry_one_translation(writer, &final_segment, &source_language, &config)?;
         self.apply_meeting_snapshot(writer.open_meeting(meeting_id)?)
     }
 
@@ -1940,12 +1941,19 @@ impl MvpService {
                 .ok_or_else(|| storage_error_from_snapshot(&self.snapshot))?,
         );
         let plan = storage.failed_translation_retry_plan(meeting_id, cost_risk_accepted)?;
+        let source_language = retry_source_language(&storage, meeting_id, source_language)?;
         let meeting = storage.snapshot(meeting_id)?;
+        // Rows stored before local backpressure became retryable still carry retryable=0.
+        let retryable = |item: &&FailedTranslationRetryItem| {
+            item.retryable || translation_error_retryable(&item.last_error_code)
+        };
+        let non_retryable = plan.items.iter().filter(|item| !retryable(item)).count();
         let mut finals = Vec::new();
         for item in plan
             .items
             .iter()
-            .filter(|item| item.retryable && item.target_language == config.target_language)
+            .filter(retryable)
+            .filter(|item| item.target_language == config.target_language)
         {
             if let Some(final_segment) = meeting.finals.iter().find(|final_segment| {
                 final_segment.segment_id == item.segment_id
@@ -1968,19 +1976,14 @@ impl MvpService {
             failed: 0,
             cancelled: 0,
             cost_risk_accepted: true,
-            message: (plan.non_retryable > 0).then(|| {
-                format!(
-                    "{} non-retryable failures were excluded",
-                    plan.non_retryable
-                )
-            }),
+            message: (non_retryable > 0)
+                .then(|| format!("{non_retryable} non-retryable failures were excluded")),
         };
         *lock(&self.retry_progress) = initial.clone();
         self.retry_cancel.store(false, Ordering::Release);
 
         let progress = Arc::clone(&self.retry_progress);
         let cancelled = Arc::clone(&self.retry_cancel);
-        let source_language = source_language.to_owned();
         let meeting_id = meeting_id.to_owned();
         let spawn = std::thread::Builder::new()
             .name("meetingrelay-translation-retry".to_owned())
@@ -3404,6 +3407,20 @@ fn public_error_priority(code: &str) -> u8 {
         "ASR_FINAL_OVERLOAD" => 3,
         "ASR_WORKER_STOPPED" => 2,
         _ => 1,
+    }
+}
+
+/// Retries translate from the language the meeting was recorded in. The caller's
+/// value is only a fallback for meetings stored before the language was recorded.
+fn retry_source_language(
+    storage: &MvpStorage,
+    meeting_id: &str,
+    requested: &str,
+) -> Result<String, String> {
+    match storage.meeting_language(meeting_id)?.as_deref() {
+        Some(language @ ("zh" | "ja" | "en")) => Ok(language.to_owned()),
+        Some(_) => Ok(requested.to_owned()),
+        None => Err("MVP_STORAGE_MEETING_NOT_FOUND".to_owned()),
     }
 }
 
@@ -8270,6 +8287,310 @@ mod tests {
         interim.meeting_sample_end = 32_000;
         interim.text = "等等等等等等".to_owned();
         assert!(meaningful_final_text_or_interim(final_candidate, "。", Some(&interim)).is_none());
+    }
+
+    /// Answers `responses` chat completions on loopback and returns each request.
+    fn spawn_translation_provider(
+        responses: usize,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4 * 1024];
+                    let read = stream.read(&mut chunk).unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                let body = r#"{"choices":[{"message":{"content":"retried translation"}}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        (base_url, server)
+    }
+
+    /// A completed meeting whose finals all failed translation to English.
+    fn service_with_failed_translations(
+        test_name: &str,
+        meeting_language: &str,
+        provider_base_url: &str,
+        failures: &[(&str, bool)],
+    ) -> (PathBuf, MvpService, String, String) {
+        let root = unique_temp_root(test_name);
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = MvpStorage::open_at(root.join("mvp.sqlite3")).unwrap();
+        let service =
+            MvpService::new_with_dependencies(Ok(storage), Arc::new(MemorySecretStore::new()));
+        let local = service
+            .provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.provider_class == "local")
+            .unwrap();
+        service
+            .save_provider_profile(ProviderProfileUpdate {
+                profile_id: local.profile_id.clone(),
+                label: local.label,
+                provider_class: local.provider_class,
+                base_url: provider_base_url.to_owned(),
+                model: "retry-test-model".to_owned(),
+                policy_url: None,
+                data_flow: local.data_flow,
+            })
+            .unwrap();
+        let writer = service.storage_writer.as_ref().unwrap();
+        let meeting = writer
+            .start_meeting_with_metadata(true, "test model", "Retry test", meeting_language)
+            .unwrap();
+        for (index, (error_code, retryable)) in failures.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            let segment_id = format!("segment-{sequence}");
+            writer
+                .commit_final(FinalCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: segment_id.clone(),
+                    sequence,
+                    revision: 1,
+                    text: format!("第 {sequence} 句原文"),
+                    started_at_ms: (sequence * 1_000).to_string(),
+                    ended_at_ms: (sequence * 1_000 + 900).to_string(),
+                    meeting_sample_start: sequence * 16_000,
+                    meeting_sample_end: sequence * 16_000 + 14_400,
+                    timeline_revision: 1,
+                })
+                .unwrap();
+            let attempt = writer
+                .begin_translation(TranslationCandidate {
+                    meeting_id: meeting.id.clone(),
+                    segment_id: segment_id.clone(),
+                    source_revision: 1,
+                    target_language: "en".to_owned(),
+                    model: "retry-test-model".to_owned(),
+                    provider: "openai-compatible".to_owned(),
+                    config_version: "meetingrelay.translation.config.v1".to_owned(),
+                    endpoint_origin: None,
+                    endpoint_hash: sha256_hex(provider_base_url.as_bytes()),
+                    prompt_version: "meetingrelay.translation.prompt.v1".to_owned(),
+                    request_schema_version: "openai.chat.completions.v1".to_owned(),
+                })
+                .unwrap();
+            writer
+                .finish_translation(TranslationCompletion {
+                    meeting_id: meeting.id.clone(),
+                    segment_id,
+                    source_revision: 1,
+                    target_language: "en".to_owned(),
+                    attempt: attempt.attempt,
+                    translated_text: None,
+                    error_code: Some((*error_code).to_owned()),
+                    retryable: *retryable,
+                    skipped_same_language: false,
+                })
+                .unwrap();
+        }
+        writer.complete_meeting(&meeting.id).unwrap();
+        (root, service, meeting.id, local.profile_id)
+    }
+
+    fn retry_translation_config() -> TranslationConfig {
+        TranslationConfig {
+            enabled: true,
+            base_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            target_language: "en".to_owned(),
+            allow_insecure_http: false,
+        }
+    }
+
+    #[test]
+    fn segment_retry_translates_from_the_recorded_meeting_language() {
+        let (base_url, provider) = spawn_translation_provider(1);
+        let (root, service, meeting_id, profile_id) = service_with_failed_translations(
+            "retry-recorded-language",
+            "zh",
+            &base_url,
+            &[("TRANSLATION_HTTP_STATUS_503", true)],
+        );
+
+        // The live recognition selector may point at another language; "en" here
+        // equals the target and used to persist the segment as skipped.
+        service
+            .retry_translation_segment(
+                &meeting_id,
+                "segment-1",
+                "1",
+                "en",
+                retry_translation_config(),
+                &profile_id,
+            )
+            .unwrap();
+
+        let requests = provider.join().unwrap();
+        assert!(
+            requests[0].contains("Translate from Simplified Chinese to English"),
+            "{}",
+            requests[0]
+        );
+        let stored = service
+            .storage
+            .as_ref()
+            .unwrap()
+            .snapshot(&meeting_id)
+            .unwrap();
+        assert_eq!(stored.finals[0].translation_status, "completed");
+        assert_eq!(
+            stored.finals[0].translation_text.as_deref(),
+            Some("retried translation")
+        );
+        service
+            .shutdown_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_falls_back_to_the_caller_language_only_when_none_was_recorded() {
+        let (base_url, provider) = spawn_translation_provider(1);
+        let (root, service, meeting_id, profile_id) = service_with_failed_translations(
+            "retry-unknown-language",
+            "unknown",
+            &base_url,
+            &[("TRANSLATION_HTTP_STATUS_503", true)],
+        );
+
+        service
+            .retry_translation_segment(
+                &meeting_id,
+                "segment-1",
+                "1",
+                "ja",
+                retry_translation_config(),
+                &profile_id,
+            )
+            .unwrap();
+
+        let requests = provider.join().unwrap();
+        assert!(
+            requests[0].contains("Translate from Japanese to English"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            service.retry_translation_segment(
+                "meeting-missing",
+                "segment-1",
+                "1",
+                "ja",
+                retry_translation_config(),
+                &profile_id,
+            ),
+            Err("MVP_STORAGE_MEETING_NOT_FOUND".to_owned())
+        );
+        service
+            .shutdown_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_retry_includes_local_backpressure_and_uses_the_recorded_language() {
+        let (base_url, provider) = spawn_translation_provider(3);
+        // Queue-full rows written by earlier builds carry retryable=false.
+        let (root, service, meeting_id, profile_id) = service_with_failed_translations(
+            "retry-batch-backpressure",
+            "zh",
+            &base_url,
+            &[
+                ("TRANSLATION_HTTP_STATUS_503", true),
+                ("TRANSLATION_QUEUE_FULL", false),
+                ("TRANSLATION_WORKER_STOPPED", false),
+                ("TRANSLATION_HTTP_STATUS_401", false),
+            ],
+        );
+
+        let started = service
+            .retry_failed_translations(
+                &meeting_id,
+                "en",
+                retry_translation_config(),
+                &profile_id,
+                true,
+            )
+            .unwrap();
+        assert_eq!(started.total, 3);
+        assert_eq!(
+            started.message.as_deref(),
+            Some("1 non-retryable failures were excluded")
+        );
+
+        let requests = provider.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert!(
+                request.contains("Translate from Simplified Chinese to English"),
+                "{request}"
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while service.translation_retry_progress().status == "running" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry batch did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let progress = service.translation_retry_progress();
+        assert_eq!(progress.status, "completed");
+        assert_eq!((progress.succeeded, progress.failed), (3, 0));
+        let stored = service
+            .storage
+            .as_ref()
+            .unwrap()
+            .snapshot(&meeting_id)
+            .unwrap();
+        let statuses = stored
+            .finals
+            .iter()
+            .map(|segment| segment.translation_status.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, ["completed", "completed", "completed", "failed"]);
+        service
+            .shutdown_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

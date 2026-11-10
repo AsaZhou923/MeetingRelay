@@ -849,6 +849,19 @@ impl MvpStorage {
         })
     }
 
+    pub fn meeting_language(&self, meeting_id: &str) -> Result<Option<String>, String> {
+        self.with_read_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT language FROM mvp_meetings WHERE id=?1",
+                    params![meeting_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| "MVP_STORAGE_LIBRARY_QUERY_FAILED".to_owned())
+        })
+    }
+
     pub fn search_segments(&self, query: SegmentSearchQuery) -> Result<SegmentSearchPage, String> {
         let limit = bounded_limit(query.limit, STORAGE_SEARCH_LIMIT_MAX);
         validate_segment_search_query(&query)?;

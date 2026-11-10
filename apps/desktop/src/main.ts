@@ -798,6 +798,7 @@ let localModelDiscovering = false;
 let lastClipboardText: string | null = null;
 let latestRetryProgress: TranslationRetryProgress | null = null;
 let retryProgressTimer: number | null = null;
+let retryBatchMeetingId: string | null = null;
 let diagnosticBundle: DiagnosticBundleResult | null = null;
 let dataDirectorySettings: DataDirectorySettings | null = null;
 let interruptedMeetings: InterruptedMeeting[] = [];
@@ -1527,9 +1528,50 @@ function canUseSelectedTranscript(snapshot: MvpSnapshot): boolean {
   );
 }
 
+interface TranslationRetryTarget {
+  meetingId: string;
+  title: string;
+  failedCount: number;
+  sourceLanguage: MvpRecognitionLanguage;
+  targetLanguage: MvpRecognitionLanguage;
+}
+
+// The retry panel follows the record selected in Meeting Records; without a
+// selection it keeps acting on the live or most recently opened meeting.
+function translationRetryTarget(snapshot: MvpSnapshot): TranslationRetryTarget | null {
+  const meetingId = selectedMeetingId();
+  if (meetingId === null) return null;
+  const detail =
+    meetingDetail !== null && meetingDetail.meeting.meetingId === meetingId &&
+    meetingId !== snapshot.meetingId
+      ? meetingDetail
+      : null;
+  if (detail === null && meetingId !== snapshot.meetingId) return null;
+  const failed = (detail?.segments ?? snapshot.finals).filter(
+    (segment) => segment.translationStatus === "failed",
+  );
+  const recorded = meetingDetail?.meeting.meetingId === meetingId ? meetingDetail.meeting : null;
+  return {
+    meetingId,
+    title: recorded !== null && recorded.title.length > 0 ? recorded.title : meetingId,
+    failedCount: failed.length,
+    // The backend translates from the recorded language; this only covers
+    // meetings stored before the language was recorded.
+    sourceLanguage:
+      recorded !== null && recorded.language !== "unknown"
+        ? recorded.language
+        : currentRecognitionLanguage(),
+    targetLanguage: failed[0]?.translationTarget ?? currentTranslationConfig().targetLanguage,
+  };
+}
+
 function renderRecordActions(snapshot: MvpSnapshot): void {
   const meetingId = selectedMeetingId();
   const available = meetingId !== null && !isActive(snapshot);
+  controls.retryFailedTranslations.disabled =
+    isActive(snapshot) ||
+    (translationRetryTarget(snapshot)?.failedCount ?? 0) === 0 ||
+    latestRetryProgress?.status === "running";
   const usable = canUseSelectedTranscript(snapshot);
   controls.deletePreview.disabled =
     !available || (meetingDetail !== null && meetingDetail.meeting.meetingId !== snapshot.meetingId &&
@@ -2229,11 +2271,6 @@ function render(snapshot: MvpSnapshot): void {
   renderDisk(snapshot);
   renderDataDirectorySettings(active);
   controls.createDiagnosticBundle.disabled = active;
-  controls.retryFailedTranslations.disabled =
-    active ||
-    snapshot.meetingId === null ||
-    !snapshot.finals.some((segment) => segment.translationStatus === "failed") ||
-    latestRetryProgress?.status === "running";
   controls.footerStorage.textContent =
     snapshot.durabilityStatus === "error"
       ? "异常"
@@ -3014,7 +3051,13 @@ function scheduleRetryProgressPoll(): void {
       retryProgressTimer = null;
       return;
     }
-    if (latestRetryProgress?.status === "running") scheduleRetryProgressPoll();
+    if (latestRetryProgress?.status === "running") {
+      scheduleRetryProgressPoll();
+    } else if (retryBatchMeetingId !== null) {
+      const meetingId = retryBatchMeetingId;
+      retryBatchMeetingId = null;
+      if (selectedRecordId === meetingId) await loadMeetingDetail(meetingId);
+    }
     if (latest) render(await call("mvp_snapshot"));
   }, 500);
 }
@@ -3090,13 +3133,18 @@ async function retryTranslationSegment(segment: TranscriptSegment): Promise<void
   if (meetingId === null || meetingId === undefined) return;
   const providerProfileId = await persistTranslationProviderProfile();
   if (providerProfileId === null) throw new Error("TRANSLATION_PROVIDER_PROFILE_REQUIRED");
+  const config = currentTranslationConfig();
   render(
     await call("mvp_retry_translation_segment", {
       meetingId,
       segmentId: segment.segmentId,
       sequence: segment.sequence,
+      // The backend translates from the meeting's recorded language.
       sourceLanguage: currentRecognitionLanguage(),
-      translation: currentTranslationConfig(),
+      translation: {
+        ...config,
+        targetLanguage: segment.translationTarget ?? config.targetLanguage,
+      },
       providerProfileId,
     }),
   );
@@ -3845,12 +3893,15 @@ controls.createDiagnosticBundle.addEventListener("click", async () => {
 });
 
 controls.retryFailedTranslations.addEventListener("click", async () => {
-  const snapshot = latest;
-  if (snapshot?.meetingId === null || snapshot?.meetingId === undefined) return;
-  const failedCount = snapshot.finals.filter((segment) => segment.translationStatus === "failed").length;
-  if (failedCount === 0) return;
+  const target = latest === null || isActive(latest) ? null : translationRetryTarget(latest);
+  if (target === null || target.failedCount === 0) return;
+  if (!currentTranslationConfig().enabled) {
+    controls.retryProgress.dataset.status = "failed";
+    controls.retryProgress.textContent = "请先在“设置”中启用并配置翻译服务，再重试失败译文。";
+    return;
+  }
   const accepted = window.confirm(
-    `将重新发送本场 ${failedCount} 条失败原文到所选翻译服务，可能产生额外费用。确认继续？`,
+    `将重新发送会议“${target.title}”的 ${target.failedCount} 条失败原文到所选翻译服务，可能产生额外费用。确认继续？`,
   );
   if (!accepted) return;
   controls.retryFailedTranslations.disabled = true;
@@ -3862,14 +3913,15 @@ controls.retryFailedTranslations.addEventListener("click", async () => {
     renderRetryProgress(
       parseTranslationRetryProgress(
         await invoke<unknown>("mvp_retry_failed_translations", {
-          meetingId: snapshot.meetingId,
-          sourceLanguage: currentRecognitionLanguage(),
-          translation: currentTranslationConfig(),
+          meetingId: target.meetingId,
+          sourceLanguage: target.sourceLanguage,
+          translation: { ...currentTranslationConfig(), targetLanguage: target.targetLanguage },
           providerProfileId,
           costRiskAccepted: true,
         }),
       ),
     );
+    retryBatchMeetingId = target.meetingId;
     scheduleRetryProgressPoll();
   } catch (error) {
     controls.retryProgress.dataset.status = "failed";
